@@ -6,11 +6,12 @@
 #import <math.h>
 #import <objc/runtime.h>
 
-// Album animated-artwork fallback v5.0 — asset-ready gate / hard artwork floor
+// Album animated-artwork fallback v5.1 — cold-start static gate + stuck-placeholder watchdog
 // Transition policy: never hand SpringBoard an animated-artwork object until its video FILE URL
-// has already been resolved and exists locally. Until then keep the previous animation, the real
-// static cover, or deliberate black. This targets the gray Apple tile at its actual trigger: an
-// animated-artwork container whose media asset is not ready yet.
+// has already been resolved and exists locally. The first track of a fresh session is forced through
+// a short static-only gate (real cover, else black) before animation is allowed. Tracks that begin
+// without a ready animation also get a one-shot static reset watchdog so SpringBoard cannot remain
+// stuck on its gray missing-image tile indefinitely.
 // 1) Keep Spotify's real animated artwork when the current track has it.
 // 2) Reuse real animated artwork already seen on another track of the same album.
 // 3) If the album has no known animation, synthesize a gentle looping Ken Burns animation
@@ -52,6 +53,19 @@ static char sgAnimatedStateKey;
 static char sgAnimatedTrustedSquareKey;
 static char sgAnimatedTrustedTallKey;
 
+// Fresh-session protection. SpringBoard is most fragile on the very first Now Playing item: it can
+// enter the animated-artwork presentation before its internal static container exists. Force that
+// first track through a short static-only phase, then re-run the raw packet once the UI is settled.
+static BOOL sgColdStartGateActive;
+static NSString *sgColdStartTrackKey;
+static CFTimeInterval sgColdStartGateUntil;
+static NSUInteger sgColdStartGateGeneration;
+
+// One-shot recovery for a track that started before an animation asset was ready. If nothing ready
+// supersedes it quickly, republish a static-only packet, then let the normal hook reconsider raw
+// metadata. This deliberately kicks SpringBoard out of a stuck gray animated-artwork container.
+static NSUInteger sgArtworkRecoveryGeneration;
+
 // A native MPMediaItemAnimatedArtwork is not "ready" merely because the object exists.
 // SpringBoard can switch to its animated-artwork container immediately and show Apple's gray
 // missing-image tile while the object's video handler is still resolving the asset. Cache the
@@ -92,6 +106,8 @@ static NSString *SGString(id value) {
 static UIImage *SGAspectFillImage(UIImage *image, CGSize target);
 static id SGSyntheticArtworkForAlbum(NSString *albumKey, UIImage *cover, BOOL tall);
 static NSDictionary *SGInfoWithSafeArtworkFloor(NSDictionary *info);
+static NSDictionary *SGInfoStaticOnly(NSDictionary *info);
+static void SGScheduleArtworkRecovery(NSString *trackKey);
 
 static NSString *SGAlbumArtworkKey(NSDictionary *info) {
     NSString *album = SGString(info[MPMediaItemPropertyAlbumTitle]);
@@ -478,6 +494,64 @@ static NSDictionary *SGInfoWithSafeArtworkFloor(NSDictionary *info) {
     return patched;
 }
 
+static NSDictionary *SGInfoStaticOnly(NSDictionary *info) {
+    if (![info isKindOfClass:NSDictionary.class] || info.count == 0) return info;
+    NSMutableDictionary *patched = [SGInfoWithSafeArtworkFloor(info) mutableCopy];
+    if (@available(iOS 26.0, *)) {
+        [patched removeObjectForKey:MPNowPlayingInfoProperty1x1AnimatedArtwork];
+        [patched removeObjectForKey:MPNowPlayingInfoProperty3x4AnimatedArtwork];
+    }
+    return patched;
+}
+
+static void SGScheduleColdStartRelease(NSString *trackKey, NSUInteger generation) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.38 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (generation != sgColdStartGateGeneration || !sgColdStartGateActive) return;
+        if (![sgColdStartTrackKey isEqualToString:trackKey]) return;
+        NSDictionary *raw = sgLastRawNowPlayingInfo;
+        if (![(SGTrackArtworkKey(raw) ?: @"") isEqualToString:trackKey]) return;
+        sgColdStartGateActive = NO;
+        sgColdStartGateUntil = 0;
+        [MPNowPlayingInfoCenter defaultCenter].nowPlayingInfo = raw;
+    });
+}
+
+static void SGScheduleArtworkRecovery(NSString *trackKey) {
+    if (!trackKey.length) return;
+    NSUInteger generation = ++sgArtworkRecoveryGeneration;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (generation != sgArtworkRecoveryGeneration) return;
+        NSDictionary *raw = sgLastRawNowPlayingInfo;
+        if (![(SGTrackArtworkKey(raw) ?: @"") isEqualToString:trackKey]) return;
+
+        NSString *albumKey = SGAlbumArtworkKey(raw);
+        BOOL ready = NO;
+        if (@available(iOS 26.0, *)) {
+            id square = raw[MPNowPlayingInfoProperty1x1AnimatedArtwork];
+            id tall = raw[MPNowPlayingInfoProperty3x4AnimatedArtwork];
+            ready = SGAnimatedArtworkReady(square, NO) || SGAnimatedArtworkReady(tall, YES);
+            if (!ready && albumKey.length) {
+                id cachedSquare = [sgRealSquareArtwork objectForKey:albumKey] ?: [sgSyntheticSquareArtwork objectForKey:albumKey];
+                id cachedTall = [sgRealTallArtwork objectForKey:albumKey] ?: [sgSyntheticTallArtwork objectForKey:albumKey];
+                ready = SGAnimatedArtworkReady(cachedSquare, NO) || SGAnimatedArtworkReady(cachedTall, YES);
+            }
+        }
+        if (ready) return;
+
+        // Force a real static presentation now. This is intentionally a separate publication from
+        // the animated packet: it resets SpringBoard's artwork presentation state instead of merely
+        // changing keys inside the already-stuck animated container.
+        SGPublishTransitionInfo(SGInfoStaticOnly(raw));
+
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.16 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if (generation != sgArtworkRecoveryGeneration) return;
+            NSDictionary *latest = sgLastRawNowPlayingInfo;
+            if (![(SGTrackArtworkKey(latest) ?: @"") isEqualToString:trackKey]) return;
+            [MPNowPlayingInfoCenter defaultCenter].nowPlayingInfo = latest;
+        });
+    });
+}
+
 static NSString *SGSafeToken(NSString *text) {
     NSData *data = [text dataUsingEncoding:NSUTF8StringEncoding];
     NSString *token = [data base64EncodedStringWithOptions:0];
@@ -816,6 +890,41 @@ static void SGScheduleStrictBackgroundRefresh(void) {
         UIImage *incomingCover = SGStaticCover(info);
         BOOL incomingCoverUsable = SGUsableCover(incomingCover);
         BOOL topLevelTrackChanged = trackKey.length && ![sgCurrentTrackKey isEqualToString:trackKey];
+        BOOL firstTrackOfSession = topLevelTrackChanged && sgCurrentTrackKey.length == 0;
+
+        if (firstTrackOfSession) {
+            sgCurrentTrackKey = [trackKey copy];
+            sgColdStartGateActive = YES;
+            sgColdStartTrackKey = [trackKey copy];
+            sgColdStartGateUntil = CFAbsoluteTimeGetCurrent() + 0.38;
+            NSUInteger generation = ++sgColdStartGateGeneration;
+            ++sgArtworkRecoveryGeneration;
+
+            if (albumKey.length && incomingCoverUsable) {
+                SGRememberStaticArtwork(info, albumKey);
+                SGEnsureFastSyntheticArtwork(albumKey, incomingCover);
+            }
+
+            %orig(SGInfoStaticOnly(info));
+            SGScheduleColdStartRelease(trackKey, generation);
+            SGScheduleArtworkRecovery(trackKey);
+            return;
+        }
+
+        if (sgColdStartGateActive && trackKey.length && [sgColdStartTrackKey isEqualToString:trackKey] &&
+            CFAbsoluteTimeGetCurrent() < sgColdStartGateUntil) {
+            if (albumKey.length && incomingCoverUsable) {
+                SGRememberStaticArtwork(info, albumKey);
+                SGEnsureFastSyntheticArtwork(albumKey, incomingCover);
+            }
+            %orig(SGInfoStaticOnly(info));
+            return;
+        }
+
+        if (sgColdStartGateActive && trackKey.length && [sgColdStartTrackKey isEqualToString:trackKey]) {
+            sgColdStartGateActive = NO;
+            sgColdStartGateUntil = 0;
+        }
 
         if (topLevelTrackChanged) {
             sgCurrentTrackKey = [trackKey copy];
@@ -827,6 +936,7 @@ static void SGScheduleStrictBackgroundRefresh(void) {
             NSDictionary *next = SGInfoWithReadyAnimation(clean, albumKey, YES, &hasReadyAnimation);
 
             if (hasReadyAnimation) {
+                ++sgArtworkRecoveryGeneration;
                 // Best case: B is already ready. Keep A's static preview only for the handoff frame,
                 // while B's animation itself starts immediately.
                 NSDictionary *shown = SGInfoWithHandoffStatic(next);
@@ -843,6 +953,8 @@ static void SGScheduleStrictBackgroundRefresh(void) {
                 SGRememberStaticArtwork(info, albumKey);
                 SGEnsureFastSyntheticArtwork(albumKey, incomingCover);
             }
+
+            SGScheduleArtworkRecovery(trackKey);
 
             if (SGHasPresentedAnimation()) {
                 SGStartPreviousHold(trackKey);
@@ -866,6 +978,7 @@ static void SGScheduleStrictBackgroundRefresh(void) {
             NSDictionary *next = SGInfoWithReadyAnimation(clean, albumKey, YES, &hasReadyAnimation);
 
             if (hasReadyAnimation) {
+                ++sgArtworkRecoveryGeneration;
                 NSDictionary *shown = SGInfoWithHandoffStatic(next);
                 SGRememberPresentedAnimation(shown);
                 SGClearPreviousHold();
@@ -896,6 +1009,7 @@ static void SGScheduleStrictBackgroundRefresh(void) {
             BOOL hasReadyAnimation = NO;
             NSDictionary *next = SGInfoWithReadyAnimation(clean, albumKey, YES, &hasReadyAnimation);
             if (hasReadyAnimation) {
+                ++sgArtworkRecoveryGeneration;
                 NSDictionary *shown = SGInfoWithHandoffStatic(next);
                 SGRememberPresentedAnimation(shown);
                 sgBlackTransitionActive = NO;
@@ -963,6 +1077,7 @@ static void SGScheduleStrictBackgroundRefresh(void) {
         BOOL hasAnimation = (patched[MPNowPlayingInfoProperty1x1AnimatedArtwork] != nil ||
                              patched[MPNowPlayingInfoProperty3x4AnimatedArtwork] != nil);
         if (hasAnimation) {
+            ++sgArtworkRecoveryGeneration;
             // If iOS asks for the static slot while the video opens/restarts, give it a real album
             // cover when available; otherwise last-good cover, then black. Never an empty slot.
             NSDictionary *shown = SGInfoWithSafeArtworkFloor(patched);
@@ -974,7 +1089,8 @@ static void SGScheduleStrictBackgroundRefresh(void) {
         // No animation object is ready yet. A valid real cover is allowed as the waiting frame;
         // black is used only if no usable cover exists. This is the anti-placeholder floor.
         if (cover) SGEnsureFastSyntheticArtwork(albumKey, cover);
-        %orig(SGInfoWithSafeArtworkFloor(info));
+        SGScheduleArtworkRecovery(trackKey);
+        %orig(SGInfoStaticOnly(info));
         return;
     }
 
