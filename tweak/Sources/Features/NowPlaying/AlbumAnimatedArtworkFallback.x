@@ -5,7 +5,7 @@
 #import <CoreImage/CoreImage.h>
 #import <math.h>
 
-// Album animated-artwork fallback v3.9 — previous-animation handoff
+// Album animated-artwork fallback v3.9.1 — previous-animation handoff, compile fix
 // Transition policy: new animation immediately when ready; otherwise keep the previous
 // animation on screen for up to 3 seconds while the new one becomes ready. Never force
 // the new static cover as an intermediate transition frame.
@@ -27,13 +27,10 @@ static id sgLastGoodStaticArtwork;
 static UIImage *sgLastGoodStaticImage;
 static dispatch_queue_t sgArtworkVideoQueue;
 static NSMutableSet<NSString *> *sgSyntheticGenerationInFlight;
-static NSMutableSet<NSString *> *sgDelayedAnimatedReapply;
 static NSString *sgCurrentTrackKey;
-static CFTimeInterval sgFallbackHoldUntil;
 static BOOL sgInternalTransitionUpdate;
 static BOOL sgBlackTransitionActive;
 static NSString *sgBlackTransitionTrackKey;
-static NSUInteger sgBlackTransitionGeneration;
 
 // The animation that is actually being shown. On a skip we can keep it alive briefly
 // instead of exposing the next track's static square while its animation is still loading.
@@ -123,21 +120,6 @@ static UIImage *SGSolidBlackImage(CGSize size) {
     }];
 }
 
-static UIImage *SGImageWithBrightness(UIImage *image, CGFloat brightness) {
-    if (!SGUsableCover(image)) return nil;
-    brightness = MAX(0.0, MIN(1.0, brightness));
-    CGSize size = image.size;
-    UIGraphicsImageRendererFormat *format = [UIGraphicsImageRendererFormat preferredFormat];
-    format.opaque = YES;
-    format.scale = 1.0;
-    UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:size format:format];
-    return [renderer imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
-        [[UIColor blackColor] setFill];
-        [ctx fillRect:(CGRect){CGPointZero, size}];
-        [image drawInRect:(CGRect){CGPointZero, size} blendMode:kCGBlendModeNormal alpha:brightness];
-    }];
-}
-
 static id SGBlackArtwork(void) {
     static id artwork;
     static dispatch_once_t onceToken;
@@ -152,18 +134,6 @@ static void SGPublishTransitionInfo(NSDictionary *info) {
     sgInternalTransitionUpdate = YES;
     [MPNowPlayingInfoCenter defaultCenter].nowPlayingInfo = info;
     sgInternalTransitionUpdate = NO;
-}
-
-static NSDictionary *SGInfoWithStaticImage(NSDictionary *info, UIImage *image) {
-    if (![info isKindOfClass:NSDictionary.class] || !SGUsableCover(image)) return info;
-    NSMutableDictionary *patched = [info mutableCopy];
-    id artwork = SGArtworkFromImage(image);
-    if (artwork) patched[MPMediaItemPropertyArtwork] = artwork;
-    if (@available(iOS 26.0, *)) {
-        [patched removeObjectForKey:MPNowPlayingInfoProperty1x1AnimatedArtwork];
-        [patched removeObjectForKey:MPNowPlayingInfoProperty3x4AnimatedArtwork];
-    }
-    return patched;
 }
 
 static NSDictionary *SGInfoWithBlackArtwork(NSDictionary *info) {
@@ -294,41 +264,6 @@ static void SGStartPreviousHold(NSString *trackKey) {
         sgBlackTransitionTrackKey = [trackKey copy];
         ++sgPreviousHoldGeneration;
         SGPublishTransitionInfo(SGInfoWithBlackArtwork(current));
-    });
-}
-
-static void SGStartBlackToArtworkFade(NSDictionary *finalInfo, NSString *trackKey, UIImage *cover) {
-    if (![finalInfo isKindOfClass:NSDictionary.class] || trackKey.length == 0 || !SGUsableCover(cover)) return;
-
-    NSUInteger generation = ++sgBlackTransitionGeneration;
-    sgBlackTransitionActive = YES;
-    sgBlackTransitionTrackKey = [trackKey copy];
-
-    // Start from a deliberate black frame instead of iOS' generic photo placeholder.
-    SGPublishTransitionInfo(SGInfoWithBlackArtwork(finalInfo));
-
-    NSArray<NSNumber *> *brightnessSteps = @[@0.18, @0.42, @0.70, @0.90];
-    NSArray<NSNumber *> *delaySteps = @[@0.055, @0.110, @0.170, @0.230];
-
-    for (NSUInteger i = 0; i < brightnessSteps.count; i++) {
-        CGFloat brightness = brightnessSteps[i].doubleValue;
-        NSTimeInterval delay = delaySteps[i].doubleValue;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            if (generation != sgBlackTransitionGeneration) return;
-            if (![sgBlackTransitionTrackKey isEqualToString:trackKey]) return;
-            UIImage *frame = SGImageWithBrightness(cover, brightness);
-            if (frame) SGPublishTransitionInfo(SGInfoWithStaticImage(finalInfo, frame));
-        });
-    }
-
-    // Finish on the true artwork, then immediately let the normal hook restore the animation.
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.30 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        if (generation != sgBlackTransitionGeneration) return;
-        if (![sgBlackTransitionTrackKey isEqualToString:trackKey]) return;
-        sgBlackTransitionActive = NO;
-        sgFallbackHoldUntil = CFAbsoluteTimeGetCurrent();
-        MPNowPlayingInfoCenter *center = [MPNowPlayingInfoCenter defaultCenter];
-        center.nowPlayingInfo = finalInfo;
     });
 }
 
@@ -676,26 +611,6 @@ static void SGScheduleSyntheticArtwork(NSString *albumKey, UIImage *seedCover) {
     });
 }
 
-static void SGScheduleAnimatedReapply(NSString *trackKey) {
-    if (trackKey.length == 0) return;
-    @synchronized (sgDelayedAnimatedReapply) {
-        if ([sgDelayedAnimatedReapply containsObject:trackKey]) return;
-        [sgDelayedAnimatedReapply addObject:trackKey];
-    }
-
-    CFTimeInterval now = CFAbsoluteTimeGetCurrent();
-    NSTimeInterval delay = MAX(0.05, sgFallbackHoldUntil - now);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        @synchronized (sgDelayedAnimatedReapply) {
-            [sgDelayedAnimatedReapply removeObject:trackKey];
-        }
-        MPNowPlayingInfoCenter *center = [MPNowPlayingInfoCenter defaultCenter];
-        NSDictionary *current = center.nowPlayingInfo;
-        if (![(SGTrackArtworkKey(current) ?: @"") isEqualToString:trackKey]) return;
-        center.nowPlayingInfo = current;
-    });
-}
-
 %hook MPNowPlayingInfoCenter
 
 - (void)setNowPlayingInfo:(NSDictionary *)info {
@@ -722,7 +637,6 @@ static void SGScheduleAnimatedReapply(NSString *trackKey) {
 
         if (topLevelTrackChanged) {
             sgCurrentTrackKey = [trackKey copy];
-            ++sgBlackTransitionGeneration;
             sgBlackTransitionActive = NO;
 
             // Do not mistake the animation we injected for the previous track for B's own animation.
@@ -863,7 +777,6 @@ static void SGScheduleAnimatedReapply(NSString *trackKey) {
     sgStaticArtworkByAlbum = [NSCache new];
     sgStaticImageByAlbum = [NSCache new];
     sgSyntheticGenerationInFlight = [NSMutableSet set];
-    sgDelayedAnimatedReapply = [NSMutableSet set];
     sgRealSquareArtwork.countLimit = 48;
     sgRealTallArtwork.countLimit = 48;
     sgSyntheticSquareArtwork.countLimit = 12;
