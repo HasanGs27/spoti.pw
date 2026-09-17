@@ -6,11 +6,11 @@
 #import <math.h>
 #import <objc/runtime.h>
 
-// Album animated-artwork fallback v4.3 — hard artwork floor / no Apple placeholder
-// Transition policy: Apple's generic gray missing-artwork tile must never be reachable.
-// Every non-empty Now Playing packet gets a valid static floor: current real cover when usable,
-// otherwise the last good cover, otherwise deliberate black. Keep the previous animation while
-// the next one becomes ready, and re-assert the protected packet on lock/background handoff.
+// Album animated-artwork fallback v5.0 — asset-ready gate / hard artwork floor
+// Transition policy: never hand SpringBoard an animated-artwork object until its video FILE URL
+// has already been resolved and exists locally. Until then keep the previous animation, the real
+// static cover, or deliberate black. This targets the gray Apple tile at its actual trigger: an
+// animated-artwork container whose media asset is not ready yet.
 // 1) Keep Spotify's real animated artwork when the current track has it.
 // 2) Reuse real animated artwork already seen on another track of the same album.
 // 3) If the album has no known animation, synthesize a gentle looping Ken Burns animation
@@ -48,6 +48,42 @@ static NSDictionary *sgLastRawNowPlayingInfo;
 static NSUInteger sgEmptyPacketGeneration;
 static CFTimeInterval sgLastNonEmptyPacketAt;
 static IMP sgOriginalAnimatedArtworkInit;
+static char sgAnimatedStateKey;
+static char sgAnimatedTrustedSquareKey;
+static char sgAnimatedTrustedTallKey;
+
+// A native MPMediaItemAnimatedArtwork is not "ready" merely because the object exists.
+// SpringBoard can switch to its animated-artwork container immediately and show Apple's gray
+// missing-image tile while the object's video handler is still resolving the asset. Cache the
+// actual local file URLs first; only then is that aspect allowed into Now Playing metadata.
+static BOOL SGAnimatedURLIsReady(NSURL *url) {
+    if (![url isKindOfClass:NSURL.class] || !url.isFileURL || url.path.length == 0) return NO;
+    return [[NSFileManager defaultManager] fileExistsAtPath:url.path];
+}
+
+static NSMutableDictionary *SGAnimatedState(id artwork) {
+    return artwork ? objc_getAssociatedObject(artwork, &sgAnimatedStateKey) : nil;
+}
+
+static BOOL SGAnimatedArtworkReady(id artwork, BOOL tall) {
+    if (!artwork) return NO;
+    if (objc_getAssociatedObject(artwork, tall ? &sgAnimatedTrustedTallKey : &sgAnimatedTrustedSquareKey)) return YES;
+    NSMutableDictionary *state = SGAnimatedState(artwork);
+    if (!state) return NO;
+    NSString *key = tall ? @"tallURL" : @"squareURL";
+    NSURL *url = nil;
+    @synchronized (state) { url = state[key]; }
+    return SGAnimatedURLIsReady(url);
+}
+
+static void SGReapplyRawNowPlayingWhenAssetReady(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSDictionary *raw = sgLastRawNowPlayingInfo;
+        if (![raw isKindOfClass:NSDictionary.class] || raw.count == 0) return;
+        MPNowPlayingInfoCenter *center = [MPNowPlayingInfoCenter defaultCenter];
+        center.nowPlayingInfo = raw;
+    });
+}
 
 static NSString *SGString(id value) {
     return [value isKindOfClass:NSString.class] ? (NSString *)value : nil;
@@ -125,24 +161,70 @@ static UIImage *SGSolidBlackImage(CGSize size) {
     }];
 }
 
-static id SGStrictAnimatedArtworkInit(id self, SEL _cmd, id artworkID, id previewHandler, id videoHandler) {
-    // Preserve Spotify's real preview when it works, but NEVER let a nil/broken preview reach
-    // SpringBoard. If Spotify cannot answer the preview request, return a real black UIImage.
-    void (^originalPreview)(CGSize, void (^)(UIImage * _Nullable)) = (void (^)(CGSize, void (^)(UIImage * _Nullable)))previewHandler;
+static id SGStrictAnimatedArtworkInit(id self, SEL _cmd, id artworkID, __unused id previewHandler, id videoHandler) {
+    // Never make SpringBoard wait on Spotify's preview callback. A concrete black UIImage is
+    // returned synchronously; the normal static artwork slot underneath remains the real cover
+    // when we have one. This removes another route to the gray system placeholder.
     void (^safePreview)(CGSize, void (^)(UIImage * _Nullable)) = ^(CGSize requestedSize, void (^handler)(UIImage * _Nullable)) {
         if (!handler) return;
         CGSize size = requestedSize;
         if (size.width < 1.0 || size.height < 1.0) size = CGSizeMake(900, 900);
-        UIImage *black = SGSolidBlackImage(size);
-        if (!originalPreview) {
-            handler(black);
+        handler(SGSolidBlackImage(size));
+    };
+
+    void (^originalVideo)(CGSize, void (^)(NSURL * _Nullable)) =
+        (void (^)(CGSize, void (^)(NSURL * _Nullable)))videoHandler;
+    NSMutableDictionary *state = [NSMutableDictionary dictionary];
+
+    // The handler seen by iOS first serves the pre-resolved local URL. If an unexpected size is
+    // requested, it can still ask Spotify, but a valid result is cached for subsequent requests.
+    void (^safeVideo)(CGSize, void (^)(NSURL * _Nullable)) = ^(CGSize requestedSize, void (^handler)(NSURL * _Nullable)) {
+        if (!handler) return;
+        BOOL tall = requestedSize.height > requestedSize.width * 1.15;
+        NSString *key = tall ? @"tallURL" : @"squareURL";
+        NSURL *cached = nil;
+        @synchronized (state) { cached = state[key]; }
+        if (SGAnimatedURLIsReady(cached)) {
+            handler(cached);
             return;
         }
-        originalPreview(size, ^(UIImage *image) {
-            handler(SGUsableCover(image) ? image : black);
+        if (!originalVideo) {
+            handler(nil);
+            return;
+        }
+        originalVideo(requestedSize, ^(NSURL *url) {
+            if (SGAnimatedURLIsReady(url)) {
+                @synchronized (state) { state[key] = url; }
+            }
+            handler(SGAnimatedURLIsReady(url) ? url : nil);
         });
     };
-    return ((id (*)(id, SEL, id, id, id))sgOriginalAnimatedArtworkInit)(self, _cmd, artworkID, safePreview, videoHandler);
+
+    id animated = ((id (*)(id, SEL, id, id, id))sgOriginalAnimatedArtworkInit)(self, _cmd, artworkID, safePreview, safeVideo);
+    if (!animated) return animated;
+    objc_setAssociatedObject(animated, &sgAnimatedStateKey, state, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    // Prime BOTH known lock-screen aspects before this object is ever allowed into Now Playing.
+    // Native handlers may answer asynchronously; until they do, setNowPlayingInfo strips the
+    // corresponding key and leaves the previous animation / cover / black on screen.
+    if (originalVideo) {
+        void (^prime)(CGSize, NSString *) = ^(CGSize size, NSString *key) {
+            originalVideo(size, ^(NSURL *url) {
+                if (!SGAnimatedURLIsReady(url)) return;
+                BOOL becameReady = NO;
+                @synchronized (state) {
+                    if (!state[key]) {
+                        state[key] = url;
+                        becameReady = YES;
+                    }
+                }
+                if (becameReady) SGReapplyRawNowPlayingWhenAssetReady();
+            });
+        };
+        prime(CGSizeMake(540, 540), @"squareURL");
+        prime(CGSizeMake(540, 720), @"tallURL");
+    }
+    return animated;
 }
 
 static id SGBlackArtwork(void) {
@@ -190,14 +272,28 @@ static NSDictionary *SGInfoWithReadyAnimation(NSDictionary *info, NSString *albu
     if (@available(iOS 26.0, *)) {
         id square = patched[MPNowPlayingInfoProperty1x1AnimatedArtwork];
         id tall = patched[MPNowPlayingInfoProperty3x4AnimatedArtwork];
+        if (square && !SGAnimatedArtworkReady(square, NO)) {
+            [patched removeObjectForKey:MPNowPlayingInfoProperty1x1AnimatedArtwork];
+            square = nil;
+        }
+        if (tall && !SGAnimatedArtworkReady(tall, YES)) {
+            [patched removeObjectForKey:MPNowPlayingInfoProperty3x4AnimatedArtwork];
+            tall = nil;
+        }
 
         if (!square && albumKey.length) {
-            square = [sgRealSquareArtwork objectForKey:albumKey] ?: [sgSyntheticSquareArtwork objectForKey:albumKey];
-            if (square) patched[MPNowPlayingInfoProperty1x1AnimatedArtwork] = square;
+            id candidate = [sgRealSquareArtwork objectForKey:albumKey] ?: [sgSyntheticSquareArtwork objectForKey:albumKey];
+            if (SGAnimatedArtworkReady(candidate, NO)) {
+                square = candidate;
+                patched[MPNowPlayingInfoProperty1x1AnimatedArtwork] = square;
+            }
         }
         if (!tall && albumKey.length) {
-            tall = [sgRealTallArtwork objectForKey:albumKey] ?: [sgSyntheticTallArtwork objectForKey:albumKey];
-            if (tall) patched[MPNowPlayingInfoProperty3x4AnimatedArtwork] = tall;
+            id candidate = [sgRealTallArtwork objectForKey:albumKey] ?: [sgSyntheticTallArtwork objectForKey:albumKey];
+            if (SGAnimatedArtworkReady(candidate, YES)) {
+                tall = candidate;
+                patched[MPNowPlayingInfoProperty3x4AnimatedArtwork] = tall;
+            }
         }
 
         if (hasReadyAnimation) *hasReadyAnimation = (square != nil || tall != nil);
@@ -228,6 +324,8 @@ static void SGRememberPresentedAnimation(NSDictionary *info) {
     if (@available(iOS 26.0, *)) {
         id square = info[MPNowPlayingInfoProperty1x1AnimatedArtwork];
         id tall = info[MPNowPlayingInfoProperty3x4AnimatedArtwork];
+        if (square && !SGAnimatedArtworkReady(square, NO)) square = nil;
+        if (tall && !SGAnimatedArtworkReady(tall, YES)) tall = nil;
         if (!square && !tall) return;
         sgPresentedSquareArtwork = square;
         sgPresentedTallArtwork = tall;
@@ -365,6 +463,18 @@ static NSDictionary *SGInfoWithSafeArtworkFloor(NSDictionary *info) {
     NSString *albumKey = SGAlbumArtworkKey(info);
     id safe = SGBestStaticArtwork(info, albumKey);
     if (safe) patched[MPMediaItemPropertyArtwork] = safe;
+
+    // Crucial v5 rule: an animated-artwork OBJECT is not enough. If its aspect-specific local
+    // video file has not been resolved yet, remove that key entirely so SpringBoard stays in the
+    // normal static-artwork path instead of drawing Apple's animated-artwork placeholder tile.
+    if (@available(iOS 26.0, *)) {
+        id square = patched[MPNowPlayingInfoProperty1x1AnimatedArtwork];
+        id tall = patched[MPNowPlayingInfoProperty3x4AnimatedArtwork];
+        if (square && !SGAnimatedArtworkReady(square, NO))
+            [patched removeObjectForKey:MPNowPlayingInfoProperty1x1AnimatedArtwork];
+        if (tall && !SGAnimatedArtworkReady(tall, YES))
+            [patched removeObjectForKey:MPNowPlayingInfoProperty3x4AnimatedArtwork];
+    }
     return patched;
 }
 
@@ -603,7 +713,10 @@ static id SGSyntheticArtworkForAlbum(NSString *albumKey, UIImage *cover, BOOL ta
                     handler(videoURL);
                 }];
 
-        if (animated) [cache setObject:animated forKey:albumKey];
+        if (animated) {
+            objc_setAssociatedObject(animated, tall ? &sgAnimatedTrustedTallKey : &sgAnimatedTrustedSquareKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            [cache setObject:animated forKey:albumKey];
+        }
         return animated;
     }
     return nil;
@@ -812,13 +925,11 @@ static void SGScheduleStrictBackgroundRefresh(void) {
             if (!packetTall && sgPresentedTallArtwork)
                 patched[MPNowPlayingInfoProperty3x4AnimatedArtwork] = sgPresentedTallArtwork;
 
-            if (patched[MPNowPlayingInfoProperty1x1AnimatedArtwork] ||
-                patched[MPNowPlayingInfoProperty3x4AnimatedArtwork]) {
-                SGRememberPresentedAnimation(patched);
-                %orig(patched);
-            } else {
-                %orig(SGInfoWithSafeArtworkFloor(info));
-            }
+            NSDictionary *safePatched = SGInfoWithSafeArtworkFloor(patched);
+            if (safePatched[MPNowPlayingInfoProperty1x1AnimatedArtwork] ||
+                safePatched[MPNowPlayingInfoProperty3x4AnimatedArtwork])
+                SGRememberPresentedAnimation(safePatched);
+            %orig(safePatched);
             return;
         }
 
@@ -826,13 +937,17 @@ static void SGScheduleStrictBackgroundRefresh(void) {
         // the album fallback exactly as before. There is no artificial animation delay here.
         SGRememberStaticArtwork(info, albumKey);
 
-        id square = info[MPNowPlayingInfoProperty1x1AnimatedArtwork];
-        id tall = info[MPNowPlayingInfoProperty3x4AnimatedArtwork];
-        if (square) [sgRealSquareArtwork setObject:square forKey:albumKey];
-        if (tall) [sgRealTallArtwork setObject:tall forKey:albumKey];
+        id rawSquare = info[MPNowPlayingInfoProperty1x1AnimatedArtwork];
+        id rawTall = info[MPNowPlayingInfoProperty3x4AnimatedArtwork];
+        if (rawSquare) [sgRealSquareArtwork setObject:rawSquare forKey:albumKey];
+        if (rawTall) [sgRealTallArtwork setObject:rawTall forKey:albumKey];
 
-        id fallbackSquare = square ?: [sgRealSquareArtwork objectForKey:albumKey];
-        id fallbackTall = tall ?: [sgRealTallArtwork objectForKey:albumKey];
+        id square = SGAnimatedArtworkReady(rawSquare, NO) ? rawSquare : nil;
+        id tall = SGAnimatedArtworkReady(rawTall, YES) ? rawTall : nil;
+        id cachedSquare = [sgRealSquareArtwork objectForKey:albumKey];
+        id cachedTall = [sgRealTallArtwork objectForKey:albumKey];
+        id fallbackSquare = square ?: (SGAnimatedArtworkReady(cachedSquare, NO) ? cachedSquare : nil);
+        id fallbackTall = tall ?: (SGAnimatedArtworkReady(cachedTall, YES) ? cachedTall : nil);
         UIImage *cover = SGBestStaticImage(info, albumKey);
 
         if (!fallbackSquare && cover) fallbackSquare = SGSyntheticArtworkForAlbum(albumKey, cover, NO);
@@ -840,6 +955,8 @@ static void SGScheduleStrictBackgroundRefresh(void) {
         if ((!fallbackSquare || !fallbackTall) && cover) SGEnsureFastSyntheticArtwork(albumKey, cover);
 
         NSMutableDictionary *patched = [info mutableCopy];
+        if (!square) [patched removeObjectForKey:MPNowPlayingInfoProperty1x1AnimatedArtwork];
+        if (!tall) [patched removeObjectForKey:MPNowPlayingInfoProperty3x4AnimatedArtwork];
         if (!square && fallbackSquare) patched[MPNowPlayingInfoProperty1x1AnimatedArtwork] = fallbackSquare;
         if (!tall && fallbackTall) patched[MPNowPlayingInfoProperty3x4AnimatedArtwork] = fallbackTall;
 
