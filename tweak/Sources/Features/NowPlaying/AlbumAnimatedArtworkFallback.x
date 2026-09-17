@@ -387,7 +387,7 @@ static void SGScheduleAnimatedReapply(NSString *trackKey) {
         }
         MPNowPlayingInfoCenter *center = [MPNowPlayingInfoCenter defaultCenter];
         NSDictionary *current = center.nowPlayingInfo;
-        if (![[SGTrackArtworkKey(current) ?: @""] isEqualToString:trackKey]) return;
+        if (![(SGTrackArtworkKey(current) ?: @"") isEqualToString:trackKey]) return;
         center.nowPlayingInfo = current;
     });
 }
