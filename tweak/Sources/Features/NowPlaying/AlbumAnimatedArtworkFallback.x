@@ -5,7 +5,7 @@
 #import <CoreImage/CoreImage.h>
 #import <math.h>
 
-// Album animated-artwork fallback v3.6 — next-track prefetch + animation-first transition
+// Album animated-artwork fallback v3.6.1 — safe static next-track prefetch on top of v3.5
 // 1) Keep Spotify's real animated artwork when the current track has it.
 // 2) Reuse real animated artwork already seen on another track of the same album.
 // 3) If the album has no known animation, synthesize a gentle looping Ken Burns animation
@@ -32,25 +32,22 @@ static BOOL sgBlackTransitionActive;
 static NSString *sgBlackTransitionTrackKey;
 static NSUInteger sgBlackTransitionGeneration;
 
-// Next-track prefetch. Spotify keeps the upcoming cover rendered in the horizontal
-// now-playing carousel before the user skips. We borrow that already-decoded image,
-// pre-generate our synthetic animated fallback in the background, and keep it attached
-// to the next track until Spotify publishes the real artwork.
+// Safe next-track prefetch. This stays deliberately lightweight: it only remembers a
+// confirmed static cover already rendered by Spotify. It never generates videos from
+// layoutSubviews and never touches the current track until a real track change occurs.
 static UIImage *sgPrefetchedNextCover;
 static id sgPrefetchedNextStaticArtwork;
-static id sgPrefetchedNextSquareArtwork;
-static id sgPrefetchedNextTallArtwork;
 static CFTimeInterval sgPrefetchedNextAt;
-static NSUInteger sgPrefetchedNextGeneration;
+static UIImage *sgPrefetchCandidateCover;
+static NSUInteger sgPrefetchCandidateHits;
+static CFTimeInterval sgPrefetchCandidateAt;
 static NSString *sgPrefetchedTransitionTrackKey;
-static NSUInteger sgMetadataPacketGeneration;
 
 static NSString *SGString(id value) {
     return [value isKindOfClass:NSString.class] ? (NSString *)value : nil;
 }
 
 static UIImage *SGAspectFillImage(UIImage *image, CGSize target);
-static id SGSyntheticArtworkForAlbum(NSString *albumKey, UIImage *cover, BOOL tall);
 
 static NSString *SGAlbumArtworkKey(NSDictionary *info) {
     NSString *album = SGString(info[MPMediaItemPropertyAlbumTitle]);
@@ -172,18 +169,6 @@ static NSDictionary *SGInfoWithBlackArtwork(NSDictionary *info) {
         [patched removeObjectForKey:MPNowPlayingInfoProperty1x1AnimatedArtwork];
         [patched removeObjectForKey:MPNowPlayingInfoProperty3x4AnimatedArtwork];
     }
-    return patched;
-}
-
-// Same black safety image, but deliberately KEEP any animated-artwork keys. This is
-// important when Spotify delivers the animation before its normal cover: animation wins
-// immediately while the hidden/static preview remains valid, so SpringBoard never needs
-// its generic grey placeholder.
-static NSDictionary *SGInfoWithBlackStaticPreviewKeepingAnimation(NSDictionary *info) {
-    if (![info isKindOfClass:NSDictionary.class]) return info;
-    NSMutableDictionary *patched = [info mutableCopy];
-    id black = SGBlackArtwork();
-    if (black) patched[MPMediaItemPropertyArtwork] = black;
     return patched;
 }
 
@@ -435,85 +420,67 @@ static UIImage *SGLargestCoverImageInsideView(UIView *root) {
     return best;
 }
 
-static void SGPreparePrefetchedNextCover(UIImage *cover) {
+static BOOL SGSameUIImage(UIImage *a, UIImage *b) {
+    if (!a || !b) return NO;
+    if (a == b) return YES;
+    return a.CGImage && b.CGImage && a.CGImage == b.CGImage;
+}
+
+static void SGConfirmPrefetchedNextCover(UIImage *cover) {
     if (!SGUsableCover(cover)) return;
-    if ((cover == sgPrefetchedNextCover || (cover.CGImage && cover.CGImage == sgPrefetchedNextCover.CGImage)) &&
-        (CFAbsoluteTimeGetCurrent() - sgPrefetchedNextAt) < 30.0) return;
+    CFTimeInterval now = CFAbsoluteTimeGetCurrent();
+
+    // A single layout pass is not trusted. Spotify can recycle carousel cells while it is
+    // settling after a swipe/track update. Require the same decoded image twice in a short
+    // window before accepting it as the next cover.
+    if (SGSameUIImage(cover, sgPrefetchCandidateCover) && (now - sgPrefetchCandidateAt) < 1.0) {
+        sgPrefetchCandidateHits += 1;
+    } else {
+        sgPrefetchCandidateCover = cover;
+        sgPrefetchCandidateHits = 1;
+    }
+    sgPrefetchCandidateAt = now;
+
+    if (sgPrefetchCandidateHits < 2) return;
+    if (SGSameUIImage(cover, sgPrefetchedNextCover) && (now - sgPrefetchedNextAt) < 8.0) return;
 
     sgPrefetchedNextCover = cover;
     sgPrefetchedNextStaticArtwork = SGArtworkFromImage(cover);
-    sgPrefetchedNextSquareArtwork = nil;
-    sgPrefetchedNextTallArtwork = nil;
-    sgPrefetchedNextAt = CFAbsoluteTimeGetCurrent();
-    NSUInteger generation = ++sgPrefetchedNextGeneration;
-
-    // Build the fallback animation while the current song is still playing. If the user
-    // skips before generation finishes, the prefetched static cover still prevents grey.
-    NSString *prefetchKey = [NSString stringWithFormat:@"prefetch-next-%lu-%0.fx%0.f",
-                             (unsigned long)generation, cover.size.width, cover.size.height];
-    NSString *token = SGSafeToken(prefetchKey);
-    NSURL *squareURL = [SGArtworkVideoDirectory() URLByAppendingPathComponent:
-                        [NSString stringWithFormat:@"%@-1x1.mp4", token]];
-    NSURL *tallURL = [SGArtworkVideoDirectory() URLByAppendingPathComponent:
-                      [NSString stringWithFormat:@"%@-3x4.mp4", token]];
-
-    dispatch_group_t group = dispatch_group_create();
-    dispatch_group_enter(group);
-    SGWriteKenBurnsVideo(cover, CGSizeMake(540, 540), squareURL, ^(NSURL *result) {
-        dispatch_group_leave(group);
-    });
-    dispatch_group_enter(group);
-    SGWriteKenBurnsVideo(cover, CGSizeMake(540, 720), tallURL, ^(NSURL *result) {
-        dispatch_group_leave(group);
-    });
-
-    dispatch_group_notify(group, dispatch_get_main_queue(), ^{
-        if (generation != sgPrefetchedNextGeneration || cover != sgPrefetchedNextCover) return;
-        if (@available(iOS 26.0, *)) {
-            sgPrefetchedNextSquareArtwork = SGSyntheticArtworkForAlbum(prefetchKey, cover, NO);
-            sgPrefetchedNextTallArtwork = SGSyntheticArtworkForAlbum(prefetchKey, cover, YES);
-        }
-    });
+    sgPrefetchedNextAt = now;
 }
 
 static void SGPrefetchNextFromArtworkCarousel(UIScrollView *list) {
     if (!list || list.bounds.size.width < 200.0) return;
     CGFloat middle = list.contentOffset.x + list.bounds.size.width / 2.0;
-    UIView *nextCell = nil;
+    UIImage *next = nil;
     CGFloat nearest = CGFLOAT_MAX;
 
     for (UIView *candidate in list.subviews) {
         CGRect f = candidate.frame;
         if (f.size.width < 120.0 || f.size.height < 120.0) continue;
-        CGFloat center = CGRectGetMidX(f);
-        CGFloat distance = center - middle;
+        CGFloat distance = CGRectGetMidX(f) - middle;
         if (distance <= 40.0 || distance >= nearest) continue;
         UIImage *image = SGLargestCoverImageInsideView(candidate);
         if (!SGUsableCover(image)) continue;
         nearest = distance;
-        nextCell = candidate;
+        next = image;
     }
 
-    UIImage *next = nextCell ? SGLargestCoverImageInsideView(nextCell) : nil;
-    if (SGUsableCover(next)) SGPreparePrefetchedNextCover(next);
+    if (SGUsableCover(next)) SGConfirmPrefetchedNextCover(next);
 }
 
 static BOOL SGPrefetchedNextIsFresh(void) {
     return SGUsableCover(sgPrefetchedNextCover) &&
            sgPrefetchedNextStaticArtwork &&
-           (CFAbsoluteTimeGetCurrent() - sgPrefetchedNextAt) < 45.0;
+           (CFAbsoluteTimeGetCurrent() - sgPrefetchedNextAt) < 8.0;
 }
 
-static NSDictionary *SGInfoWithPrefetchedNext(NSDictionary *info) {
+static NSDictionary *SGInfoWithPrefetchedNextStatic(NSDictionary *info) {
     if (![info isKindOfClass:NSDictionary.class] || !SGPrefetchedNextIsFresh()) return info;
     NSMutableDictionary *patched = [info mutableCopy];
     patched[MPMediaItemPropertyArtwork] = sgPrefetchedNextStaticArtwork;
-    if (@available(iOS 26.0, *)) {
-        if (!patched[MPNowPlayingInfoProperty1x1AnimatedArtwork] && sgPrefetchedNextSquareArtwork)
-            patched[MPNowPlayingInfoProperty1x1AnimatedArtwork] = sgPrefetchedNextSquareArtwork;
-        if (!patched[MPNowPlayingInfoProperty3x4AnimatedArtwork] && sgPrefetchedNextTallArtwork)
-            patched[MPNowPlayingInfoProperty3x4AnimatedArtwork] = sgPrefetchedNextTallArtwork;
-    }
+    // Important: do not invent or pre-generate animated-artwork keys here. Spotify's native
+    // animation and the proven v3.5 album fallback pipeline remain completely untouched.
     return patched;
 }
 
@@ -655,26 +622,9 @@ static void SGScheduleAnimatedReapply(NSString *trackKey) {
     }
 
     if (![info isKindOfClass:NSDictionary.class] || info.count == 0) {
-        // Spotify occasionally emits a transient empty packet between tracks. Passing that through
-        // gives SpringBoard a tiny window to render its grey placeholder. Debounce the clear briefly:
-        // a new track packet cancels it; a genuine stop is still allowed through after the grace time.
-        NSUInteger generation = sgMetadataPacketGeneration;
-        NSDictionary *current = [MPNowPlayingInfoCenter defaultCenter].nowPlayingInfo;
-        if ([current isKindOfClass:NSDictionary.class] && current.count > 0) {
-            %orig(current);
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                if (generation != sgMetadataPacketGeneration) return;
-                sgInternalTransitionUpdate = YES;
-                [MPNowPlayingInfoCenter defaultCenter].nowPlayingInfo = info;
-                sgInternalTransitionUpdate = NO;
-            });
-        } else {
-            %orig(info);
-        }
+        %orig(info);
         return;
     }
-
-    ++sgMetadataPacketGeneration;
 
     if (@available(iOS 26.0, *)) {
         NSString *albumKey = SGAlbumArtworkKey(info);
@@ -688,31 +638,17 @@ static void SGScheduleAnimatedReapply(NSString *trackKey) {
             sgFallbackHoldUntil = CFAbsoluteTimeGetCurrent() + 0.75;
             ++sgBlackTransitionGeneration; // cancel any older scheduled transition frames
 
-            id earlySquare = info[MPNowPlayingInfoProperty1x1AnimatedArtwork];
-            id earlyTall = info[MPNowPlayingInfoProperty3x4AnimatedArtwork];
-            BOOL nativeAnimationAlreadyReady = (earlySquare != nil || earlyTall != nil);
-
             if (!incomingCoverUsable) {
-                // Best case: Spotify already delivered native animation. Let it start on frame one
-                // and only supply black as the static preview safety net.
-                if (nativeAnimationAlreadyReady) {
-                    sgBlackTransitionActive = NO;
-                    sgPrefetchedTransitionTrackKey = nil;
-                    %orig(SGInfoWithBlackStaticPreviewKeepingAnimation(info));
-                    return;
-                }
-
-                // Second best: the player carousel already decoded the next cover while the old
-                // song was playing. Use it immediately (plus our pre-generated animation when ready).
+                // Safe prefetch path: only substitute a confirmed static cover. No background
+                // video generation, no synthetic animated-artwork injection, no metadata debounce.
+                // If prefetch is unavailable we fall back to the exact v3.5 black guard.
                 if (SGPrefetchedNextIsFresh()) {
                     sgBlackTransitionActive = NO;
                     sgPrefetchedTransitionTrackKey = [trackKey copy];
-                    %orig(SGInfoWithPrefetchedNext(info));
+                    %orig(SGInfoWithPrefetchedNextStatic(info));
                     return;
                 }
 
-                // Nothing is ready yet: deliberate black frame. Never hand SpringBoard an empty
-                // artwork slot where it can draw the grey generic-photo placeholder.
                 sgBlackTransitionActive = YES;
                 sgBlackTransitionTrackKey = [trackKey copy];
                 %orig(SGInfoWithBlackArtwork(info));
@@ -720,12 +656,11 @@ static void SGScheduleAnimatedReapply(NSString *trackKey) {
             }
         }
 
-        // While Spotify is still filling metadata for the prefetched next track, keep using the
-        // prefetched cover/animation. Once the real cover arrives, release the prefetch immediately.
+        // Keep the confirmed prefetched static cover only until Spotify's real cover arrives.
         if (sgPrefetchedTransitionTrackKey.length &&
             [sgPrefetchedTransitionTrackKey isEqualToString:trackKey]) {
             if (!incomingCoverUsable) {
-                %orig(SGInfoWithPrefetchedNext(info));
+                %orig(SGInfoWithPrefetchedNextStatic(info));
                 return;
             }
             sgPrefetchedTransitionTrackKey = nil;
@@ -829,8 +764,7 @@ static void SGScheduleAnimatedReapply(NSString *trackKey) {
 
             // If this track has its own native animation, let Spotify/iOS handle it immediately.
             BOOL hasNativeAnimation = (square != nil || tall != nil);
-            BOOL hasReadyFallbackAnimation = (fallbackSquare != nil || fallbackTall != nil);
-            BOOL holdingFallback = !hasNativeAnimation && !hasReadyFallbackAnimation && trackKey.length &&
+            BOOL holdingFallback = !hasNativeAnimation && trackKey.length &&
                                    [sgCurrentTrackKey isEqualToString:trackKey] &&
                                    CFAbsoluteTimeGetCurrent() < sgFallbackHoldUntil;
 
