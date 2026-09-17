@@ -5,7 +5,7 @@
 #import <CoreImage/CoreImage.h>
 #import <math.h>
 
-// Album animated-artwork fallback v3.4 — cinematic black transition
+// Album animated-artwork fallback v3.4.1 — cinematic black transition
 // 1) Keep Spotify's real animated artwork when the current track has it.
 // 2) Reuse real animated artwork already seen on another track of the same album.
 // 3) If the album has no known animation, synthesize a gentle looping Ken Burns animation
@@ -135,8 +135,10 @@ static NSDictionary *SGInfoWithStaticImage(NSDictionary *info, UIImage *image) {
     NSMutableDictionary *patched = [info mutableCopy];
     id artwork = SGArtworkFromImage(image);
     if (artwork) patched[MPMediaItemPropertyArtwork] = artwork;
-    [patched removeObjectForKey:MPNowPlayingInfoProperty1x1AnimatedArtwork];
-    [patched removeObjectForKey:MPNowPlayingInfoProperty3x4AnimatedArtwork];
+    if (@available(iOS 26.0, *)) {
+        [patched removeObjectForKey:MPNowPlayingInfoProperty1x1AnimatedArtwork];
+        [patched removeObjectForKey:MPNowPlayingInfoProperty3x4AnimatedArtwork];
+    }
     return patched;
 }
 
@@ -145,8 +147,10 @@ static NSDictionary *SGInfoWithBlackArtwork(NSDictionary *info) {
     NSMutableDictionary *patched = [info mutableCopy];
     id black = SGBlackArtwork();
     if (black) patched[MPMediaItemPropertyArtwork] = black;
-    [patched removeObjectForKey:MPNowPlayingInfoProperty1x1AnimatedArtwork];
-    [patched removeObjectForKey:MPNowPlayingInfoProperty3x4AnimatedArtwork];
+    if (@available(iOS 26.0, *)) {
+        [patched removeObjectForKey:MPNowPlayingInfoProperty1x1AnimatedArtwork];
+        [patched removeObjectForKey:MPNowPlayingInfoProperty3x4AnimatedArtwork];
+    }
     return patched;
 }
 
