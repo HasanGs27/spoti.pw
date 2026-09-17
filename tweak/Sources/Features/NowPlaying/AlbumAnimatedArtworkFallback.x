@@ -4,12 +4,12 @@
 #import <AVFoundation/AVFoundation.h>
 #import <CoreImage/CoreImage.h>
 #import <math.h>
-#import <objc/runtime.h>
 
-// Album animated-artwork fallback v4.0.1 — strict no-square handoff
-// Transition policy: never expose a static album square or Apple's generic placeholder.
-// Keep the previous animation while the next one becomes ready; if there is no previous
-// animation, use deliberate black. Switch only when an animated-artwork object is ready.
+// Album animated-artwork fallback v4.1 — safe-cover handoff / anti-placeholder
+// Transition policy: keep the previous animation while the next one becomes ready. When no
+// animation is ready, publish a validated real album cover when Spotify has one; otherwise
+// publish deliberate black. Never leave the artwork slot empty for SpringBoard to replace with
+// Apple's generic gray image placeholder.
 // 1) Keep Spotify's real animated artwork when the current track has it.
 // 2) Reuse real animated artwork already seen on another track of the same album.
 // 3) If the album has no known animation, synthesize a gentle looping Ken Burns animation
@@ -22,6 +22,7 @@ static NSCache<NSString *, id> *sgRealSquareArtwork;
 static NSCache<NSString *, id> *sgRealTallArtwork;
 static NSCache<NSString *, id> *sgSyntheticSquareArtwork;
 static NSCache<NSString *, id> *sgSyntheticTallArtwork;
+static NSCache<NSString *, id> *sgStaticArtworkByAlbum;
 static NSCache<NSString *, UIImage *> *sgStaticImageByAlbum;
 static dispatch_queue_t sgArtworkVideoQueue;
 static NSMutableSet<NSString *> *sgSyntheticGenerationInFlight;
@@ -36,6 +37,8 @@ static id sgPresentedSquareArtwork;
 static id sgPresentedTallArtwork;
 static id sgHeldSquareArtwork;
 static id sgHeldTallArtwork;
+static id sgPresentedStaticArtwork;
+static id sgHeldStaticArtwork;
 static BOOL sgHoldingPreviousAnimation;
 static NSString *sgPreviousHoldTrackKey;
 static CFTimeInterval sgPreviousHoldUntil;
@@ -43,7 +46,6 @@ static NSUInteger sgPreviousHoldGeneration;
 static NSDictionary *sgLastRawNowPlayingInfo;
 static NSUInteger sgEmptyPacketGeneration;
 static CFTimeInterval sgLastNonEmptyPacketAt;
-static IMP sgOriginalAnimatedArtworkInit;
 
 static NSString *SGString(id value) {
     return [value isKindOfClass:NSString.class] ? (NSString *)value : nil;
@@ -118,20 +120,6 @@ static UIImage *SGSolidBlackImage(CGSize size) {
         [[UIColor blackColor] setFill];
         [ctx fillRect:(CGRect){CGPointZero, size}];
     }];
-}
-
-static id SGStrictAnimatedArtworkInit(id self, SEL _cmd, id artworkID, id previewHandler, id videoHandler) {
-    (void)previewHandler;
-    // Spotify's/native animated artwork objects normally carry the album cover as their preview.
-    // That preview is exactly the square iOS can flash while a video asset is opening. Replace only
-    // that preview with black; the original video handler is preserved untouched.
-    void (^blackPreview)(CGSize, void (^)(UIImage * _Nullable)) = ^(CGSize requestedSize, void (^handler)(UIImage * _Nullable)) {
-        if (!handler) return;
-        CGSize size = requestedSize;
-        if (size.width < 1.0 || size.height < 1.0) size = CGSizeMake(900, 900);
-        handler(SGSolidBlackImage(size));
-    };
-    return ((id (*)(id, SEL, id, id, id))sgOriginalAnimatedArtworkInit)(self, _cmd, artworkID, blackPreview, videoHandler);
 }
 
 static id SGBlackArtwork(void) {
@@ -211,8 +199,36 @@ static NSDictionary *SGInfoWithoutHeldAnimation(NSDictionary *info) {
     return patched;
 }
 
+static id SGSafeStaticArtwork(NSDictionary *info, NSString *albumKey) {
+    if ([info isKindOfClass:NSDictionary.class]) {
+        UIImage *current = SGStaticCover(info);
+        id original = info[MPMediaItemPropertyArtwork];
+        if (SGUsableCover(current)) {
+            if ([original isKindOfClass:MPMediaItemArtwork.class]) return original;
+            id rebuilt = SGArtworkFromImage(current);
+            if (rebuilt) return rebuilt;
+        }
+    }
+    id albumArtwork = albumKey.length ? [sgStaticArtworkByAlbum objectForKey:albumKey] : nil;
+    return albumArtwork ?: SGBlackArtwork();
+}
+
+static NSDictionary *SGInfoWithSafeStaticArtwork(NSDictionary *info, NSString *albumKey) {
+    if (![info isKindOfClass:NSDictionary.class]) return info;
+    NSMutableDictionary *patched = [info mutableCopy];
+    id safe = SGSafeStaticArtwork(info, albumKey);
+    if (safe) patched[MPMediaItemPropertyArtwork] = safe;
+    return patched;
+}
+
 static void SGRememberPresentedAnimation(NSDictionary *info) {
     if (![info isKindOfClass:NSDictionary.class]) return;
+    UIImage *staticImage = SGStaticCover(info);
+    id staticArtwork = info[MPMediaItemPropertyArtwork];
+    if (SGUsableCover(staticImage)) {
+        sgPresentedStaticArtwork = [staticArtwork isKindOfClass:MPMediaItemArtwork.class]
+            ? staticArtwork : SGArtworkFromImage(staticImage);
+    }
     if (@available(iOS 26.0, *)) {
         id square = info[MPNowPlayingInfoProperty1x1AnimatedArtwork];
         id tall = info[MPNowPlayingInfoProperty3x4AnimatedArtwork];
@@ -226,11 +242,10 @@ static NSDictionary *SGInfoHoldingPreviousAnimation(NSDictionary *info) {
     if (![info isKindOfClass:NSDictionary.class]) return info;
     NSMutableDictionary *patched = [info mutableCopy];
 
-    // Strict no-square rule: the static slot is always black during a handoff. The old
-    // animated object stays alive, so SpringBoard can keep playing it without ever getting
-    // an album-cover frame to flash between videos.
-    id black = SGBlackArtwork();
-    if (black) patched[MPMediaItemPropertyArtwork] = black;
+    // Keep A's own valid preview underneath A's held animation. If A had no usable static
+    // artwork, use black. Either way SpringBoard always receives a valid artwork object.
+    id safe = sgHeldStaticArtwork ?: SGBlackArtwork();
+    if (safe) patched[MPMediaItemPropertyArtwork] = safe;
     if (@available(iOS 26.0, *)) {
         if (sgHeldSquareArtwork) patched[MPNowPlayingInfoProperty1x1AnimatedArtwork] = sgHeldSquareArtwork;
         else [patched removeObjectForKey:MPNowPlayingInfoProperty1x1AnimatedArtwork];
@@ -240,12 +255,8 @@ static NSDictionary *SGInfoHoldingPreviousAnimation(NSDictionary *info) {
     return patched;
 }
 
-static NSDictionary *SGInfoWithHandoffStatic(NSDictionary *info) {
-    if (![info isKindOfClass:NSDictionary.class]) return info;
-    NSMutableDictionary *patched = [info mutableCopy];
-    id black = SGBlackArtwork();
-    if (black) patched[MPMediaItemPropertyArtwork] = black;
-    return patched;
+static NSDictionary *SGInfoWithHandoffStatic(NSDictionary *info, NSString *albumKey) {
+    return SGInfoWithSafeStaticArtwork(info, albumKey);
 }
 
 static void SGClearPreviousHold(void) {
@@ -254,6 +265,7 @@ static void SGClearPreviousHold(void) {
     sgPreviousHoldUntil = 0;
     sgHeldSquareArtwork = nil;
     sgHeldTallArtwork = nil;
+    sgHeldStaticArtwork = nil;
     ++sgPreviousHoldGeneration;
 }
 
@@ -261,6 +273,7 @@ static void SGStartPreviousHold(NSString *trackKey) {
     if (!trackKey.length || !SGHasPresentedAnimation()) return;
     sgHeldSquareArtwork = sgPresentedSquareArtwork;
     sgHeldTallArtwork = sgPresentedTallArtwork;
+    sgHeldStaticArtwork = sgPresentedStaticArtwork;
     sgHoldingPreviousAnimation = YES;
     sgPreviousHoldTrackKey = [trackKey copy];
     sgPreviousHoldUntil = CFAbsoluteTimeGetCurrent() + 6.0;
@@ -272,14 +285,14 @@ static void SGStartPreviousHold(NSString *trackKey) {
         NSDictionary *current = [MPNowPlayingInfoCenter defaultCenter].nowPlayingInfo;
         if (![(SGTrackArtworkKey(current) ?: @"") isEqualToString:trackKey]) return;
 
-        // Failsafe only: if the next animation still did not become ready after six seconds,
-        // stop showing the old track and fall back to black until a real/new animation arrives.
+        // Failsafe only: if B still is not animated after six seconds, release A but keep
+        // a validated B cover if one exists. Black is used only when no usable cover exists.
         sgHoldingPreviousAnimation = NO;
         sgPreviousHoldUntil = 0;
         sgBlackTransitionActive = YES;
         sgBlackTransitionTrackKey = [trackKey copy];
         ++sgPreviousHoldGeneration;
-        SGPublishTransitionInfo(SGInfoWithBlackArtwork(current));
+        SGPublishTransitionInfo(SGInfoWithSafeStaticArtwork(current, SGAlbumArtworkKey(current)));
     });
 }
 
@@ -310,6 +323,9 @@ static void SGRememberStaticArtwork(NSDictionary *info, NSString *albumKey) {
     UIImage *image = SGStaticCover(info);
     if (!SGUsableCover(image)) return;
 
+    id original = info[MPMediaItemPropertyArtwork];
+    id stable = [original isKindOfClass:MPMediaItemArtwork.class] ? original : SGArtworkFromImage(image);
+    if (stable) [sgStaticArtworkByAlbum setObject:stable forKey:albumKey];
     [sgStaticImageByAlbum setObject:image forKey:albumKey];
 }
 
@@ -542,14 +558,16 @@ static id SGSyntheticArtworkForAlbum(NSString *albumKey, UIImage *cover, BOOL ta
         if (![[NSFileManager defaultManager] fileExistsAtPath:videoURL.path]) return nil;
 
         NSString *artworkID = [NSString stringWithFormat:@"spoti.pw.synthetic.%@.%@", token, variant];
-        UIImage *blackPreview = SGSolidBlackImage(target);
+        UIImage *preview = SGAspectFillImage(cover, target);
         MPMediaItemAnimatedArtwork *animated =
             [[MPMediaItemAnimatedArtwork alloc]
                 initWithArtworkID:artworkID
                 previewImageRequestHandler:^(CGSize requestedSize, void (^handler)(UIImage * _Nullable)) {
-                    // Never let iOS use the album square while the video asset is starting.
-                    // The preview is deliberate black; the animation replaces it as soon as ready.
-                    handler(blackPreview);
+                    // A real cover is a much better startup frame than Apple's generic placeholder.
+                    // The video replaces it as soon as the animated asset is ready.
+                    if (!handler) return;
+                    CGSize size = requestedSize;
+                    handler((size.width >= 1.0 && size.height >= 1.0) ? SGAspectFillImage(preview, size) : preview);
                 }
                 videoAssetFileURLRequestHandler:^(CGSize requestedSize, void (^handler)(NSURL * _Nullable)) {
                     handler(videoURL);
@@ -559,6 +577,14 @@ static id SGSyntheticArtworkForAlbum(NSString *albumKey, UIImage *cover, BOOL ta
         return animated;
     }
     return nil;
+}
+
+static void SGRepublishSafeNowPlaying(void) {
+    NSDictionary *raw = sgLastRawNowPlayingInfo;
+    if (![raw isKindOfClass:NSDictionary.class] || raw.count == 0) return;
+    // Re-run our normal setter just before/while Spotify backgrounds. This refreshes the static
+    // fallback (real cover or black) and the animation object before SpringBoard takes ownership.
+    [MPNowPlayingInfoCenter defaultCenter].nowPlayingInfo = raw;
 }
 
 %hook MPNowPlayingInfoCenter
@@ -581,10 +607,7 @@ static id SGSyntheticArtworkForAlbum(NSString *albumKey, UIImage *cover, BOOL ta
 
         // Cold-start guard: if the very first packet is empty there is nothing to preserve.
         // Publish a valid black artwork briefly instead of allowing Apple's gray placeholder.
-        id black = SGBlackArtwork();
-        NSMutableDictionary *guard = [NSMutableDictionary dictionary];
-        if (black) guard[MPMediaItemPropertyArtwork] = black;
-        %orig(guard);
+        %orig(SGInfoWithBlackArtwork(@{}));
         return;
     }
 
@@ -609,12 +632,12 @@ static id SGSyntheticArtworkForAlbum(NSString *albumKey, UIImage *cover, BOOL ta
             // Do not mistake the animation we injected for the previous track for B's own animation.
             NSDictionary *clean = SGInfoWithoutHeldAnimation(info);
             BOOL hasReadyAnimation = NO;
-            NSDictionary *next = SGInfoWithReadyAnimation(clean, albumKey, YES, &hasReadyAnimation);
+            NSDictionary *next = SGInfoWithReadyAnimation(clean, albumKey, NO, &hasReadyAnimation);
 
             if (hasReadyAnimation) {
                 // Best case: B is already ready. Keep A's static preview only for the handoff frame,
                 // while B's animation itself starts immediately.
-                NSDictionary *shown = SGInfoWithHandoffStatic(next);
+                NSDictionary *shown = SGInfoWithHandoffStatic(next, albumKey);
                 SGRememberPresentedAnimation(shown);
                 SGClearPreviousHold();
                 if (albumKey.length && incomingCoverUsable) SGRememberStaticArtwork(info, albumKey);
@@ -622,8 +645,8 @@ static id SGSyntheticArtworkForAlbum(NSString *albumKey, UIImage *cover, BOOL ta
                 return;
             }
 
-            // B is not ready. Cache its real cover for generation, but never publish that square.
-            // The cover is data only; visually we keep A (or black on a cold start).
+            // B is not ready. Cache its real cover for generation. Visually we keep A when possible;
+            // on a cold start the validated B cover is allowed, with black only as a last resort.
             if (albumKey.length && incomingCoverUsable) {
                 SGRememberStaticArtwork(info, albumKey);
                 SGEnsureFastSyntheticArtwork(albumKey, incomingCover);
@@ -635,10 +658,11 @@ static id SGSyntheticArtworkForAlbum(NSString *albumKey, UIImage *cover, BOOL ta
                 return;
             }
 
-            // Cold start: there is no previous animation to hold.
+            // Cold start: there is no previous animation to hold. Use B's real cover when
+            // available; otherwise use black. Never leave the static slot empty.
             sgBlackTransitionActive = YES;
             sgBlackTransitionTrackKey = [trackKey copy];
-            %orig(SGInfoWithBlackArtwork(info));
+            %orig(SGInfoWithSafeStaticArtwork(clean, albumKey));
             return;
         }
 
@@ -647,10 +671,10 @@ static id SGSyntheticArtworkForAlbum(NSString *albumKey, UIImage *cover, BOOL ta
             [sgPreviousHoldTrackKey isEqualToString:trackKey]) {
             NSDictionary *clean = SGInfoWithoutHeldAnimation(info);
             BOOL hasReadyAnimation = NO;
-            NSDictionary *next = SGInfoWithReadyAnimation(clean, albumKey, YES, &hasReadyAnimation);
+            NSDictionary *next = SGInfoWithReadyAnimation(clean, albumKey, NO, &hasReadyAnimation);
 
             if (hasReadyAnimation) {
-                NSDictionary *shown = SGInfoWithHandoffStatic(next);
+                NSDictionary *shown = SGInfoWithHandoffStatic(next, albumKey);
                 SGRememberPresentedAnimation(shown);
                 SGClearPreviousHold();
                 if (albumKey.length && incomingCoverUsable) SGRememberStaticArtwork(info, albumKey);
@@ -669,18 +693,18 @@ static id SGSyntheticArtworkForAlbum(NSString *albumKey, UIImage *cover, BOOL ta
             sgHoldingPreviousAnimation = NO;
             sgBlackTransitionActive = YES;
             sgBlackTransitionTrackKey = [trackKey copy];
-            %orig(SGInfoWithBlackArtwork(clean));
+            %orig(SGInfoWithSafeStaticArtwork(clean, albumKey));
             return;
         }
 
-        // If the hold expired, black stays in place until B's animation is actually ready.
+        // If the hold expired, keep B's validated cover (or black) until its animation is ready.
         if (sgBlackTransitionActive && trackKey.length &&
             [sgBlackTransitionTrackKey isEqualToString:trackKey]) {
             NSDictionary *clean = SGInfoWithoutHeldAnimation(info);
             BOOL hasReadyAnimation = NO;
-            NSDictionary *next = SGInfoWithReadyAnimation(clean, albumKey, YES, &hasReadyAnimation);
+            NSDictionary *next = SGInfoWithReadyAnimation(clean, albumKey, NO, &hasReadyAnimation);
             if (hasReadyAnimation) {
-                NSDictionary *shown = SGInfoWithHandoffStatic(next);
+                NSDictionary *shown = SGInfoWithHandoffStatic(next, albumKey);
                 SGRememberPresentedAnimation(shown);
                 sgBlackTransitionActive = NO;
                 SGClearPreviousHold();
@@ -690,17 +714,17 @@ static id SGSyntheticArtworkForAlbum(NSString *albumKey, UIImage *cover, BOOL ta
             }
 
             if (albumKey.length && incomingCoverUsable) SGEnsureFastSyntheticArtwork(albumKey, incomingCover);
-            %orig(SGInfoWithBlackArtwork(clean));
+            %orig(SGInfoWithSafeStaticArtwork(clean, albumKey));
             return;
         }
 
-        // Transitional packets without album metadata are a common source of the square flash.
-        // Never expose their static artwork. If an animation is already being shown, keep it;
-        // otherwise publish deliberate black until album/animation metadata catches up.
+        // Transitional packets without album metadata are common during skips/locking. Keep an
+        // already-playing animation when possible. Otherwise publish a validated current cover,
+        // or black if Spotify has not supplied a usable cover yet.
         if (!albumKey.length) {
             NSMutableDictionary *patched = [info mutableCopy];
-            id black = SGBlackArtwork();
-            if (black) patched[MPMediaItemPropertyArtwork] = black;
+            id safe = SGSafeStaticArtwork(info, nil);
+            if (safe) patched[MPMediaItemPropertyArtwork] = safe;
 
             id packetSquare = patched[MPNowPlayingInfoProperty1x1AnimatedArtwork];
             id packetTall = patched[MPNowPlayingInfoProperty3x4AnimatedArtwork];
@@ -712,10 +736,8 @@ static id SGSyntheticArtworkForAlbum(NSString *albumKey, UIImage *cover, BOOL ta
             if (patched[MPNowPlayingInfoProperty1x1AnimatedArtwork] ||
                 patched[MPNowPlayingInfoProperty3x4AnimatedArtwork]) {
                 SGRememberPresentedAnimation(patched);
-                %orig(patched);
-            } else {
-                %orig(SGInfoWithBlackArtwork(info));
             }
+            %orig(patched);
             return;
         }
 
@@ -743,19 +765,18 @@ static id SGSyntheticArtworkForAlbum(NSString *albumKey, UIImage *cover, BOOL ta
         BOOL hasAnimation = (patched[MPNowPlayingInfoProperty1x1AnimatedArtwork] != nil ||
                              patched[MPNowPlayingInfoProperty3x4AnimatedArtwork] != nil);
         if (hasAnimation) {
-            // Even steady-state metadata refreshes can make SpringBoard briefly ask for the static
-            // slot again. Keep that slot black so an animation restart can never reveal a square.
-            id black = SGBlackArtwork();
-            if (black) patched[MPMediaItemPropertyArtwork] = black;
+            // Keep a validated real cover underneath the animation. If SpringBoard needs a preview
+            // frame while reopening the video after locking, it sees the cover instead of gray UI.
+            patched = [SGInfoWithSafeStaticArtwork(patched, albumKey) mutableCopy];
             SGRememberPresentedAnimation(patched);
             %orig(patched);
             return;
         }
 
-        // No animation object is ready yet. The raw cover is still retained above for generating
-        // the fallback, but it is never exposed to the lock screen.
+        // No animation object is ready yet. Show the validated cover while the fallback is prepared.
+        // If Spotify has not supplied one, SGSafeStaticArtwork falls back to deliberate black.
         if (cover) SGEnsureFastSyntheticArtwork(albumKey, cover);
-        %orig(SGInfoWithBlackArtwork(info));
+        %orig(SGInfoWithSafeStaticArtwork(info, albumKey));
         return;
     }
 
@@ -770,21 +791,26 @@ static id SGSyntheticArtworkForAlbum(NSString *albumKey, UIImage *cover, BOOL ta
     sgRealTallArtwork = [NSCache new];
     sgSyntheticSquareArtwork = [NSCache new];
     sgSyntheticTallArtwork = [NSCache new];
+    sgStaticArtworkByAlbum = [NSCache new];
     sgStaticImageByAlbum = [NSCache new];
     sgSyntheticGenerationInFlight = [NSMutableSet set];
     sgRealSquareArtwork.countLimit = 48;
     sgRealTallArtwork.countLimit = 48;
     sgSyntheticSquareArtwork.countLimit = 12;
     sgSyntheticTallArtwork.countLimit = 12;
+    sgStaticArtworkByAlbum.countLimit = 64;
     sgStaticImageByAlbum.countLimit = 32;
     sgArtworkVideoQueue = dispatch_queue_create("pw.spoti.synthetic-artwork", DISPATCH_QUEUE_SERIAL);
 
-    if (@available(iOS 26.0, *)) {
-        Class animatedClass = objc_getClass("MPMediaItemAnimatedArtwork");
-        SEL initSelector = NSSelectorFromString(@"initWithArtworkID:previewImageRequestHandler:videoAssetFileURLRequestHandler:");
-        Method initMethod = animatedClass ? class_getInstanceMethod(animatedClass, initSelector) : NULL;
-        if (initMethod) sgOriginalAnimatedArtworkInit = method_setImplementation(initMethod, (IMP)SGStrictAnimatedArtworkInit);
-    }
+    NSNotificationCenter *notifications = [NSNotificationCenter defaultCenter];
+    [notifications addObserverForName:UIApplicationWillResignActiveNotification
+                               object:nil
+                                queue:[NSOperationQueue mainQueue]
+                           usingBlock:^(__unused NSNotification *note) { SGRepublishSafeNowPlaying(); }];
+    [notifications addObserverForName:UIApplicationDidEnterBackgroundNotification
+                               object:nil
+                                queue:[NSOperationQueue mainQueue]
+                           usingBlock:^(__unused NSNotification *note) { SGRepublishSafeNowPlaying(); }];
 
     %init;
 }
