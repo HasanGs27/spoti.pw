@@ -5,7 +5,7 @@
 #import <CoreImage/CoreImage.h>
 #import <math.h>
 
-// Album animated-artwork fallback v3.2
+// Album animated-artwork fallback v3.4 — cinematic black transition
 // 1) Keep Spotify's real animated artwork when the current track has it.
 // 2) Reuse real animated artwork already seen on another track of the same album.
 // 3) If the album has no known animation, synthesize a gentle looping Ken Burns animation
@@ -20,11 +20,17 @@ static NSCache<NSString *, id> *sgSyntheticSquareArtwork;
 static NSCache<NSString *, id> *sgSyntheticTallArtwork;
 static NSCache<NSString *, id> *sgStaticArtworkByAlbum;
 static NSCache<NSString *, UIImage *> *sgStaticImageByAlbum;
+static id sgLastGoodStaticArtwork;
+static UIImage *sgLastGoodStaticImage;
 static dispatch_queue_t sgArtworkVideoQueue;
 static NSMutableSet<NSString *> *sgSyntheticGenerationInFlight;
 static NSMutableSet<NSString *> *sgDelayedAnimatedReapply;
 static NSString *sgCurrentTrackKey;
 static CFTimeInterval sgFallbackHoldUntil;
+static BOOL sgInternalTransitionUpdate;
+static BOOL sgBlackTransitionActive;
+static NSString *sgBlackTransitionTrackKey;
+static NSUInteger sgBlackTransitionGeneration;
 
 static NSString *SGString(id value) {
     return [value isKindOfClass:NSString.class] ? (NSString *)value : nil;
@@ -66,8 +72,10 @@ static NSString *SGTrackArtworkKey(NSDictionary *info) {
     }
     NSString *title = SGString(info[MPMediaItemPropertyTitle]) ?: @"";
     NSString *artist = SGString(info[MPMediaItemPropertyArtist]) ?: @"";
-    NSString *album = SGString(info[MPMediaItemPropertyAlbumTitle]) ?: @"";
-    return [NSString stringWithFormat:@"%@\n%@\n%@", artist.lowercaseString, album.lowercaseString, title.lowercaseString];
+    // Do not include the album in the fallback key: Spotify often publishes title/artist first
+    // and fills the album a few frames later during a skip. Keeping the key stable lets the
+    // black waiting frame fade smoothly into the real cover instead of being treated as a new track.
+    return [NSString stringWithFormat:@"%@\n%@", artist.lowercaseString, title.lowercaseString];
 }
 
 static MPMediaItemArtwork *SGArtworkFromImage(UIImage *image) {
@@ -79,6 +87,104 @@ static MPMediaItemArtwork *SGArtworkFromImage(UIImage *image) {
     }];
 }
 
+static UIImage *SGSolidBlackImage(CGSize size) {
+    if (size.width < 1.0 || size.height < 1.0) size = CGSizeMake(900, 900);
+    UIGraphicsImageRendererFormat *format = [UIGraphicsImageRendererFormat preferredFormat];
+    format.opaque = YES;
+    format.scale = 1.0;
+    UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:size format:format];
+    return [renderer imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+        [[UIColor blackColor] setFill];
+        [ctx fillRect:(CGRect){CGPointZero, size}];
+    }];
+}
+
+static UIImage *SGImageWithBrightness(UIImage *image, CGFloat brightness) {
+    if (!SGUsableCover(image)) return nil;
+    brightness = MAX(0.0, MIN(1.0, brightness));
+    CGSize size = image.size;
+    UIGraphicsImageRendererFormat *format = [UIGraphicsImageRendererFormat preferredFormat];
+    format.opaque = YES;
+    format.scale = 1.0;
+    UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:size format:format];
+    return [renderer imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+        [[UIColor blackColor] setFill];
+        [ctx fillRect:(CGRect){CGPointZero, size}];
+        [image drawInRect:(CGRect){CGPointZero, size} blendMode:kCGBlendModeNormal alpha:brightness];
+    }];
+}
+
+static id SGBlackArtwork(void) {
+    static id artwork;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        artwork = SGArtworkFromImage(SGSolidBlackImage(CGSizeMake(900, 900)));
+    });
+    return artwork;
+}
+
+static void SGPublishTransitionInfo(NSDictionary *info) {
+    if (![info isKindOfClass:NSDictionary.class]) return;
+    sgInternalTransitionUpdate = YES;
+    [MPNowPlayingInfoCenter defaultCenter].nowPlayingInfo = info;
+    sgInternalTransitionUpdate = NO;
+}
+
+static NSDictionary *SGInfoWithStaticImage(NSDictionary *info, UIImage *image) {
+    if (![info isKindOfClass:NSDictionary.class] || !SGUsableCover(image)) return info;
+    NSMutableDictionary *patched = [info mutableCopy];
+    id artwork = SGArtworkFromImage(image);
+    if (artwork) patched[MPMediaItemPropertyArtwork] = artwork;
+    [patched removeObjectForKey:MPNowPlayingInfoProperty1x1AnimatedArtwork];
+    [patched removeObjectForKey:MPNowPlayingInfoProperty3x4AnimatedArtwork];
+    return patched;
+}
+
+static NSDictionary *SGInfoWithBlackArtwork(NSDictionary *info) {
+    if (![info isKindOfClass:NSDictionary.class]) return info;
+    NSMutableDictionary *patched = [info mutableCopy];
+    id black = SGBlackArtwork();
+    if (black) patched[MPMediaItemPropertyArtwork] = black;
+    [patched removeObjectForKey:MPNowPlayingInfoProperty1x1AnimatedArtwork];
+    [patched removeObjectForKey:MPNowPlayingInfoProperty3x4AnimatedArtwork];
+    return patched;
+}
+
+static void SGStartBlackToArtworkFade(NSDictionary *finalInfo, NSString *trackKey, UIImage *cover) {
+    if (![finalInfo isKindOfClass:NSDictionary.class] || trackKey.length == 0 || !SGUsableCover(cover)) return;
+
+    NSUInteger generation = ++sgBlackTransitionGeneration;
+    sgBlackTransitionActive = YES;
+    sgBlackTransitionTrackKey = [trackKey copy];
+
+    // Start from a deliberate black frame instead of iOS' generic photo placeholder.
+    SGPublishTransitionInfo(SGInfoWithBlackArtwork(finalInfo));
+
+    NSArray<NSNumber *> *brightnessSteps = @[@0.18, @0.42, @0.70, @0.90];
+    NSArray<NSNumber *> *delaySteps = @[@0.055, @0.110, @0.170, @0.230];
+
+    for (NSUInteger i = 0; i < brightnessSteps.count; i++) {
+        CGFloat brightness = brightnessSteps[i].doubleValue;
+        NSTimeInterval delay = delaySteps[i].doubleValue;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if (generation != sgBlackTransitionGeneration) return;
+            if (![sgBlackTransitionTrackKey isEqualToString:trackKey]) return;
+            UIImage *frame = SGImageWithBrightness(cover, brightness);
+            if (frame) SGPublishTransitionInfo(SGInfoWithStaticImage(finalInfo, frame));
+        });
+    }
+
+    // Finish on the true artwork, then immediately let the normal hook restore the animation.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.30 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (generation != sgBlackTransitionGeneration) return;
+        if (![sgBlackTransitionTrackKey isEqualToString:trackKey]) return;
+        sgBlackTransitionActive = NO;
+        sgFallbackHoldUntil = CFAbsoluteTimeGetCurrent();
+        MPNowPlayingInfoCenter *center = [MPNowPlayingInfoCenter defaultCenter];
+        center.nowPlayingInfo = finalInfo;
+    });
+}
+
 static void SGRememberStaticArtwork(NSDictionary *info, NSString *albumKey) {
     if (albumKey.length == 0) return;
     UIImage *image = SGStaticCover(info);
@@ -86,14 +192,19 @@ static void SGRememberStaticArtwork(NSDictionary *info, NSString *albumKey) {
 
     id originalArtwork = info[MPMediaItemPropertyArtwork];
     id stableArtwork = [originalArtwork isKindOfClass:MPMediaItemArtwork.class] ? originalArtwork : SGArtworkFromImage(image);
-    if (stableArtwork) [sgStaticArtworkByAlbum setObject:stableArtwork forKey:albumKey];
+    if (stableArtwork) {
+        [sgStaticArtworkByAlbum setObject:stableArtwork forKey:albumKey];
+        sgLastGoodStaticArtwork = stableArtwork;
+    }
     [sgStaticImageByAlbum setObject:image forKey:albumKey];
+    sgLastGoodStaticImage = image;
 }
 
 static UIImage *SGBestStaticImage(NSDictionary *info, NSString *albumKey) {
     UIImage *current = SGStaticCover(info);
     if (SGUsableCover(current)) return current;
-    return albumKey.length ? [sgStaticImageByAlbum objectForKey:albumKey] : nil;
+    UIImage *albumImage = albumKey.length ? [sgStaticImageByAlbum objectForKey:albumKey] : nil;
+    return SGUsableCover(albumImage) ? albumImage : sgLastGoodStaticImage;
 }
 
 static id SGBestStaticArtwork(NSDictionary *info, NSString *albumKey) {
@@ -103,7 +214,8 @@ static id SGBestStaticArtwork(NSDictionary *info, NSString *albumKey) {
         if ([original isKindOfClass:MPMediaItemArtwork.class]) return original;
         return SGArtworkFromImage(current);
     }
-    return albumKey.length ? [sgStaticArtworkByAlbum objectForKey:albumKey] : nil;
+    id albumArtwork = albumKey.length ? [sgStaticArtworkByAlbum objectForKey:albumKey] : nil;
+    return albumArtwork ?: sgLastGoodStaticArtwork;
 }
 
 static NSString *SGSafeToken(NSString *text) {
@@ -395,6 +507,11 @@ static void SGScheduleAnimatedReapply(NSString *trackKey) {
 %hook MPNowPlayingInfoCenter
 
 - (void)setNowPlayingInfo:(NSDictionary *)info {
+    if (sgInternalTransitionUpdate) {
+        %orig(info);
+        return;
+    }
+
     if (![info isKindOfClass:NSDictionary.class] || info.count == 0) {
         %orig(info);
         return;
@@ -403,6 +520,81 @@ static void SGScheduleAnimatedReapply(NSString *trackKey) {
     if (@available(iOS 26.0, *)) {
         NSString *albumKey = SGAlbumArtworkKey(info);
         NSString *trackKey = SGTrackArtworkKey(info);
+        UIImage *incomingCover = SGStaticCover(info);
+        BOOL incomingCoverUsable = SGUsableCover(incomingCover);
+        BOOL topLevelTrackChanged = trackKey.length && ![sgCurrentTrackKey isEqualToString:trackKey];
+
+        if (topLevelTrackChanged) {
+            sgCurrentTrackKey = [trackKey copy];
+            sgFallbackHoldUntil = CFAbsoluteTimeGetCurrent() + 0.75;
+            ++sgBlackTransitionGeneration; // cancel any older scheduled transition frames
+
+            if (!incomingCoverUsable) {
+                // New song metadata arrived before its artwork. Show a deliberate black waiting
+                // frame so iOS never has a reason to draw the generic photo-placeholder icon.
+                sgBlackTransitionActive = YES;
+                sgBlackTransitionTrackKey = [trackKey copy];
+                %orig(SGInfoWithBlackArtwork(info));
+                return;
+            }
+        }
+
+        // The new cover has arrived while the black waiting frame is active. Fade it in over ~300 ms
+        // and only then restore the real/synthetic animated artwork.
+        if (sgBlackTransitionActive && trackKey.length &&
+            [sgBlackTransitionTrackKey isEqualToString:trackKey] && incomingCoverUsable) {
+            if (albumKey.length) SGRememberStaticArtwork(info, albumKey);
+            SGStartBlackToArtworkFade(info, trackKey, incomingCover);
+            return;
+        }
+
+        // If Spotify sends more incomplete packets during the wait, keep black rather than flashing
+        // the system placeholder.
+        if (sgBlackTransitionActive && trackKey.length &&
+            [sgBlackTransitionTrackKey isEqualToString:trackKey] && !incomingCoverUsable) {
+            %orig(SGInfoWithBlackArtwork(info));
+            return;
+        }
+
+        // Spotify can briefly publish only title/artist when skipping, before album metadata and
+        // artwork arrive. Handle that transitional packet too; otherwise iOS flashes its generic
+        // photo placeholder. Keep the previous real cover until the new artwork is available.
+        if (!albumKey.length) {
+            UIImage *currentCover = SGStaticCover(info);
+            if (SGUsableCover(currentCover)) {
+                id originalArtwork = info[MPMediaItemPropertyArtwork];
+                id stableArtwork = [originalArtwork isKindOfClass:MPMediaItemArtwork.class] ? originalArtwork : SGArtworkFromImage(currentCover);
+                if (stableArtwork) sgLastGoodStaticArtwork = stableArtwork;
+                sgLastGoodStaticImage = currentCover;
+            }
+
+            BOOL trackChanged = trackKey.length && ![sgCurrentTrackKey isEqualToString:trackKey];
+            if (trackChanged) {
+                sgCurrentTrackKey = [trackKey copy];
+                sgFallbackHoldUntil = CFAbsoluteTimeGetCurrent() + 0.75;
+            }
+
+            NSMutableDictionary *patched = [info mutableCopy];
+            BOOL changed = NO;
+            if (!SGUsableCover(currentCover) && sgLastGoodStaticArtwork) {
+                patched[MPMediaItemPropertyArtwork] = sgLastGoodStaticArtwork;
+                changed = YES;
+            }
+
+            BOOL holdingTransition = trackKey.length &&
+                                     [sgCurrentTrackKey isEqualToString:trackKey] &&
+                                     CFAbsoluteTimeGetCurrent() < sgFallbackHoldUntil;
+            if (holdingTransition) {
+                [patched removeObjectForKey:MPNowPlayingInfoProperty1x1AnimatedArtwork];
+                [patched removeObjectForKey:MPNowPlayingInfoProperty3x4AnimatedArtwork];
+                changed = YES;
+                SGScheduleAnimatedReapply(trackKey);
+            }
+
+            %orig(changed ? patched : info);
+            return;
+        }
+
         if (albumKey.length) {
             SGRememberStaticArtwork(info, albumKey);
 
@@ -435,7 +627,8 @@ static void SGScheduleAnimatedReapply(NSString *trackKey) {
             BOOL changed = NO;
 
             // Some Spotify updates arrive without static artwork for a few frames. Keep the last
-            // known real cover for this album so iOS never needs to draw its generic photo icon.
+            // known real cover (same album when possible, otherwise the previous track cover)
+            // so iOS never needs to draw its generic photo icon during a skip transition.
             if (!SGUsableCover(SGStaticCover(info)) && staticArtwork) {
                 patched[MPMediaItemPropertyArtwork] = staticArtwork;
                 changed = YES;
