@@ -5,7 +5,7 @@
 #import <CoreImage/CoreImage.h>
 #import <math.h>
 
-// Album animated-artwork fallback v3.4.1 — cinematic black transition
+// Album animated-artwork fallback v3.5 — cinematic black transition
 // 1) Keep Spotify's real animated artwork when the current track has it.
 // 2) Reuse real animated artwork already seen on another track of the same album.
 // 3) If the album has no known animation, synthesize a gentle looping Ken Burns animation
@@ -65,17 +65,24 @@ static BOOL SGUsableCover(UIImage *image) {
 }
 
 static NSString *SGTrackArtworkKey(NSDictionary *info) {
+    NSString *title = SGString(info[MPMediaItemPropertyTitle]) ?: @"";
+    NSString *artist = SGString(info[MPMediaItemPropertyArtist]) ?: @"";
+
+    // Title/artist update before Spotify's persistent ID during some skips. If we key on the
+    // persistent ID first, the tweak can miss the first packet of the new song and iOS briefly
+    // draws its generic photo placeholder. Prefer the visible metadata so the black guard starts
+    // on the very first frame of a track change.
+    if (title.length || artist.length) {
+        return [NSString stringWithFormat:@"meta:%@\n%@", artist.lowercaseString, title.lowercaseString];
+    }
+
+    // Last-resort key for rare packets that do not contain title/artist yet.
     id persistent = info[MPMediaItemPropertyPersistentID];
     if ([persistent respondsToSelector:@selector(stringValue)]) {
         NSString *v = [persistent stringValue];
         if (v.length) return [@"pid:" stringByAppendingString:v];
     }
-    NSString *title = SGString(info[MPMediaItemPropertyTitle]) ?: @"";
-    NSString *artist = SGString(info[MPMediaItemPropertyArtist]) ?: @"";
-    // Do not include the album in the fallback key: Spotify often publishes title/artist first
-    // and fills the album a few frames later during a skip. Keeping the key stable lets the
-    // black waiting frame fade smoothly into the real cover instead of being treated as a new track.
-    return [NSString stringWithFormat:@"%@\n%@", artist.lowercaseString, title.lowercaseString];
+    return nil;
 }
 
 static MPMediaItemArtwork *SGArtworkFromImage(UIImage *image) {
@@ -640,7 +647,8 @@ static void SGScheduleAnimatedReapply(NSString *trackKey) {
 
             // If this track has its own native animation, let Spotify/iOS handle it immediately.
             BOOL hasNativeAnimation = (square != nil || tall != nil);
-            BOOL holdingFallback = !hasNativeAnimation && trackKey.length &&
+            BOOL hasReadyFallbackAnimation = (fallbackSquare != nil || fallbackTall != nil);
+            BOOL holdingFallback = !hasNativeAnimation && !hasReadyFallbackAnimation && trackKey.length &&
                                    [sgCurrentTrackKey isEqualToString:trackKey] &&
                                    CFAbsoluteTimeGetCurrent() < sgFallbackHoldUntil;
 
