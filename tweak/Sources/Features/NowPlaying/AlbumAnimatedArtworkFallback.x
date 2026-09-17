@@ -5,7 +5,7 @@
 #import <CoreImage/CoreImage.h>
 #import <math.h>
 
-// Album animated-artwork fallback v3
+// Album animated-artwork fallback v3.2
 // 1) Keep Spotify's real animated artwork when the current track has it.
 // 2) Reuse real animated artwork already seen on another track of the same album.
 // 3) If the album has no known animation, synthesize a gentle looping Ken Burns animation
@@ -18,11 +18,19 @@ static NSCache<NSString *, id> *sgRealSquareArtwork;
 static NSCache<NSString *, id> *sgRealTallArtwork;
 static NSCache<NSString *, id> *sgSyntheticSquareArtwork;
 static NSCache<NSString *, id> *sgSyntheticTallArtwork;
+static NSCache<NSString *, id> *sgStaticArtworkByAlbum;
+static NSCache<NSString *, UIImage *> *sgStaticImageByAlbum;
 static dispatch_queue_t sgArtworkVideoQueue;
+static NSMutableSet<NSString *> *sgSyntheticGenerationInFlight;
+static NSMutableSet<NSString *> *sgDelayedAnimatedReapply;
+static NSString *sgCurrentTrackKey;
+static CFTimeInterval sgFallbackHoldUntil;
 
 static NSString *SGString(id value) {
     return [value isKindOfClass:NSString.class] ? (NSString *)value : nil;
 }
+
+static UIImage *SGAspectFillImage(UIImage *image, CGSize target);
 
 static NSString *SGAlbumArtworkKey(NSDictionary *info) {
     NSString *album = SGString(info[MPMediaItemPropertyAlbumTitle]);
@@ -44,6 +52,58 @@ static UIImage *SGStaticCover(NSDictionary *info) {
         if (image) return image;
     }
     return nil;
+}
+
+static BOOL SGUsableCover(UIImage *image) {
+    return image && image.size.width >= 96.0 && image.size.height >= 96.0;
+}
+
+static NSString *SGTrackArtworkKey(NSDictionary *info) {
+    id persistent = info[MPMediaItemPropertyPersistentID];
+    if ([persistent respondsToSelector:@selector(stringValue)]) {
+        NSString *v = [persistent stringValue];
+        if (v.length) return [@"pid:" stringByAppendingString:v];
+    }
+    NSString *title = SGString(info[MPMediaItemPropertyTitle]) ?: @"";
+    NSString *artist = SGString(info[MPMediaItemPropertyArtist]) ?: @"";
+    NSString *album = SGString(info[MPMediaItemPropertyAlbumTitle]) ?: @"";
+    return [NSString stringWithFormat:@"%@\n%@\n%@", artist.lowercaseString, album.lowercaseString, title.lowercaseString];
+}
+
+static MPMediaItemArtwork *SGArtworkFromImage(UIImage *image) {
+    if (!SGUsableCover(image)) return nil;
+    CGSize bounds = image.size;
+    return [[MPMediaItemArtwork alloc] initWithBoundsSize:bounds requestHandler:^UIImage * _Nonnull(CGSize requestedSize) {
+        if (requestedSize.width < 1 || requestedSize.height < 1) return image;
+        return SGAspectFillImage(image, requestedSize);
+    }];
+}
+
+static void SGRememberStaticArtwork(NSDictionary *info, NSString *albumKey) {
+    if (albumKey.length == 0) return;
+    UIImage *image = SGStaticCover(info);
+    if (!SGUsableCover(image)) return;
+
+    id originalArtwork = info[MPMediaItemPropertyArtwork];
+    id stableArtwork = [originalArtwork isKindOfClass:MPMediaItemArtwork.class] ? originalArtwork : SGArtworkFromImage(image);
+    if (stableArtwork) [sgStaticArtworkByAlbum setObject:stableArtwork forKey:albumKey];
+    [sgStaticImageByAlbum setObject:image forKey:albumKey];
+}
+
+static UIImage *SGBestStaticImage(NSDictionary *info, NSString *albumKey) {
+    UIImage *current = SGStaticCover(info);
+    if (SGUsableCover(current)) return current;
+    return albumKey.length ? [sgStaticImageByAlbum objectForKey:albumKey] : nil;
+}
+
+static id SGBestStaticArtwork(NSDictionary *info, NSString *albumKey) {
+    UIImage *current = SGStaticCover(info);
+    id original = info[MPMediaItemPropertyArtwork];
+    if (SGUsableCover(current)) {
+        if ([original isKindOfClass:MPMediaItemArtwork.class]) return original;
+        return SGArtworkFromImage(current);
+    }
+    return albumKey.length ? [sgStaticArtworkByAlbum objectForKey:albumKey] : nil;
 }
 
 static NSString *SGSafeToken(NSString *text) {
@@ -217,8 +277,13 @@ static id SGSyntheticArtworkForAlbum(NSString *albumKey, UIImage *cover, BOOL ta
         NSString *token = SGSafeToken(albumKey);
         NSURL *videoURL = [SGArtworkVideoDirectory() URLByAppendingPathComponent:
                            [NSString stringWithFormat:@"%@-%@.mp4", token, variant]];
-        NSString *artworkID = [NSString stringWithFormat:@"spoti.pw.synthetic.%@.%@", token, variant];
 
+        // Important: never publish an animated-artwork object until its video is fully ready.
+        // iOS otherwise replaces the normal cover with its generic broken-image placeholder while
+        // the asset is being rendered in the background.
+        if (![[NSFileManager defaultManager] fileExistsAtPath:videoURL.path]) return nil;
+
+        NSString *artworkID = [NSString stringWithFormat:@"spoti.pw.synthetic.%@.%@", token, variant];
         MPMediaItemAnimatedArtwork *animated =
             [[MPMediaItemAnimatedArtwork alloc]
                 initWithArtworkID:artworkID
@@ -226,13 +291,105 @@ static id SGSyntheticArtworkForAlbum(NSString *albumKey, UIImage *cover, BOOL ta
                     handler(base);
                 }
                 videoAssetFileURLRequestHandler:^(CGSize requestedSize, void (^handler)(NSURL * _Nullable)) {
-                    SGWriteKenBurnsVideo(base, target, videoURL, handler);
+                    handler(videoURL);
                 }];
 
         if (animated) [cache setObject:animated forKey:albumKey];
         return animated;
     }
     return nil;
+}
+
+static void SGScheduleSyntheticArtwork(NSString *albumKey, UIImage *seedCover) {
+    if (albumKey.length == 0) return;
+
+    @synchronized (sgSyntheticGenerationInFlight) {
+        if ([sgSyntheticGenerationInFlight containsObject:albumKey]) return;
+        [sgSyntheticGenerationInFlight addObject:albumKey];
+    }
+
+    // Give Spotify a moment to replace any temporary/placeholder artwork with the real cover.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (@available(iOS 26.0, *)) {
+            MPNowPlayingInfoCenter *center = [MPNowPlayingInfoCenter defaultCenter];
+            NSDictionary *latest = center.nowPlayingInfo;
+            if (![SGAlbumArtworkKey(latest) isEqualToString:albumKey]) {
+                @synchronized (sgSyntheticGenerationInFlight) {
+                    [sgSyntheticGenerationInFlight removeObject:albumKey];
+                }
+                return;
+            }
+
+            UIImage *cover = SGBestStaticImage(latest, albumKey);
+            if (!SGUsableCover(cover)) cover = seedCover;
+            if (!SGUsableCover(cover)) {
+                @synchronized (sgSyntheticGenerationInFlight) {
+                    [sgSyntheticGenerationInFlight removeObject:albumKey];
+                }
+                return;
+            }
+
+            NSString *token = SGSafeToken(albumKey);
+            NSURL *squareURL = [SGArtworkVideoDirectory() URLByAppendingPathComponent:
+                                [NSString stringWithFormat:@"%@-1x1.mp4", token]];
+            NSURL *tallURL = [SGArtworkVideoDirectory() URLByAppendingPathComponent:
+                              [NSString stringWithFormat:@"%@-3x4.mp4", token]];
+
+            dispatch_group_t group = dispatch_group_create();
+            __block BOOL squareOK = [[NSFileManager defaultManager] fileExistsAtPath:squareURL.path];
+            __block BOOL tallOK = [[NSFileManager defaultManager] fileExistsAtPath:tallURL.path];
+
+            if (!squareOK) {
+                dispatch_group_enter(group);
+                SGWriteKenBurnsVideo(cover, CGSizeMake(540, 540), squareURL, ^(NSURL *result) {
+                    squareOK = (result != nil);
+                    dispatch_group_leave(group);
+                });
+            }
+            if (!tallOK) {
+                dispatch_group_enter(group);
+                SGWriteKenBurnsVideo(cover, CGSizeMake(540, 720), tallURL, ^(NSURL *result) {
+                    tallOK = (result != nil);
+                    dispatch_group_leave(group);
+                });
+            }
+
+            dispatch_group_notify(group, dispatch_get_main_queue(), ^{
+                @synchronized (sgSyntheticGenerationInFlight) {
+                    [sgSyntheticGenerationInFlight removeObject:albumKey];
+                }
+
+                // Re-submit the current metadata only after at least one generated video exists.
+                // Until this point iOS keeps Spotify's normal static cover, so there is no goofy
+                // broken-image placeholder during generation.
+                if (!squareOK && !tallOK) return;
+                NSDictionary *current = center.nowPlayingInfo;
+                if ([SGAlbumArtworkKey(current) isEqualToString:albumKey]) {
+                    center.nowPlayingInfo = current;
+                }
+            });
+        }
+    });
+}
+
+static void SGScheduleAnimatedReapply(NSString *trackKey) {
+    if (trackKey.length == 0) return;
+    @synchronized (sgDelayedAnimatedReapply) {
+        if ([sgDelayedAnimatedReapply containsObject:trackKey]) return;
+        [sgDelayedAnimatedReapply addObject:trackKey];
+    }
+
+    CFTimeInterval now = CFAbsoluteTimeGetCurrent();
+    NSTimeInterval delay = MAX(0.05, sgFallbackHoldUntil - now);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        @synchronized (sgDelayedAnimatedReapply) {
+            [sgDelayedAnimatedReapply removeObject:trackKey];
+        }
+        MPNowPlayingInfoCenter *center = [MPNowPlayingInfoCenter defaultCenter];
+        NSDictionary *current = center.nowPlayingInfo;
+        if (![[SGTrackArtworkKey(current) ?: @""] isEqualToString:trackKey]) return;
+        center.nowPlayingInfo = current;
+    });
 }
 
 %hook MPNowPlayingInfoCenter
@@ -245,36 +402,74 @@ static id SGSyntheticArtworkForAlbum(NSString *albumKey, UIImage *cover, BOOL ta
 
     if (@available(iOS 26.0, *)) {
         NSString *albumKey = SGAlbumArtworkKey(info);
+        NSString *trackKey = SGTrackArtworkKey(info);
         if (albumKey.length) {
+            SGRememberStaticArtwork(info, albumKey);
+
             id square = info[MPNowPlayingInfoProperty1x1AnimatedArtwork];
             id tall = info[MPNowPlayingInfoProperty3x4AnimatedArtwork];
 
-            // Real Spotify animation always wins and becomes the album fallback.
+            // Spotify's own animation always wins and is remembered for other tracks on the album.
             if (square) [sgRealSquareArtwork setObject:square forKey:albumKey];
             if (tall) [sgRealTallArtwork setObject:tall forKey:albumKey];
 
             id fallbackSquare = square ?: [sgRealSquareArtwork objectForKey:albumKey];
             id fallbackTall = tall ?: [sgRealTallArtwork objectForKey:albumKey];
 
-            // No real animation known for this album yet: synthesize one from the static cover.
-            UIImage *cover = nil;
-            if (!fallbackSquare || !fallbackTall) cover = SGStaticCover(info);
+            UIImage *cover = SGBestStaticImage(info, albumKey);
+            id staticArtwork = SGBestStaticArtwork(info, albumKey);
+
             if (!fallbackSquare && cover) fallbackSquare = SGSyntheticArtworkForAlbum(albumKey, cover, NO);
             if (!fallbackTall && cover) fallbackTall = SGSyntheticArtworkForAlbum(albumKey, cover, YES);
+            if ((!fallbackSquare || !fallbackTall) && cover) SGScheduleSyntheticArtwork(albumKey, cover);
 
-            if ((!square && fallbackSquare) || (!tall && fallbackTall)) {
-                NSMutableDictionary *patched = [info mutableCopy];
-                if (!square && fallbackSquare) patched[MPNowPlayingInfoProperty1x1AnimatedArtwork] = fallbackSquare;
-                if (!tall && fallbackTall) patched[MPNowPlayingInfoProperty3x4AnimatedArtwork] = fallbackTall;
-                %orig(patched);
-                return;
+            BOOL trackChanged = trackKey.length && ![sgCurrentTrackKey isEqualToString:trackKey];
+            if (trackChanged) {
+                sgCurrentTrackKey = [trackKey copy];
+                // Hold album/synthetic fallbacks briefly so iOS has a real preview image on screen
+                // before it asks for the animation. Spotify-native animated artwork is not delayed.
+                sgFallbackHoldUntil = CFAbsoluteTimeGetCurrent() + 0.75;
             }
+
+            NSMutableDictionary *patched = [info mutableCopy];
+            BOOL changed = NO;
+
+            // Some Spotify updates arrive without static artwork for a few frames. Keep the last
+            // known real cover for this album so iOS never needs to draw its generic photo icon.
+            if (!SGUsableCover(SGStaticCover(info)) && staticArtwork) {
+                patched[MPMediaItemPropertyArtwork] = staticArtwork;
+                changed = YES;
+            }
+
+            // If this track has its own native animation, let Spotify/iOS handle it immediately.
+            BOOL hasNativeAnimation = (square != nil || tall != nil);
+            BOOL holdingFallback = !hasNativeAnimation && trackKey.length &&
+                                   [sgCurrentTrackKey isEqualToString:trackKey] &&
+                                   CFAbsoluteTimeGetCurrent() < sgFallbackHoldUntil;
+
+            if (holdingFallback) {
+                [patched removeObjectForKey:MPNowPlayingInfoProperty1x1AnimatedArtwork];
+                [patched removeObjectForKey:MPNowPlayingInfoProperty3x4AnimatedArtwork];
+                changed = YES;
+                SGScheduleAnimatedReapply(trackKey);
+            } else {
+                if (!square && fallbackSquare) {
+                    patched[MPNowPlayingInfoProperty1x1AnimatedArtwork] = fallbackSquare;
+                    changed = YES;
+                }
+                if (!tall && fallbackTall) {
+                    patched[MPNowPlayingInfoProperty3x4AnimatedArtwork] = fallbackTall;
+                    changed = YES;
+                }
+            }
+
+            %orig(changed ? patched : info);
+            return;
         }
     }
 
     %orig(info);
 }
-
 %end
 
 %ctor {
@@ -282,10 +477,16 @@ static id SGSyntheticArtworkForAlbum(NSString *albumKey, UIImage *cover, BOOL ta
     sgRealTallArtwork = [NSCache new];
     sgSyntheticSquareArtwork = [NSCache new];
     sgSyntheticTallArtwork = [NSCache new];
+    sgStaticArtworkByAlbum = [NSCache new];
+    sgStaticImageByAlbum = [NSCache new];
+    sgSyntheticGenerationInFlight = [NSMutableSet set];
+    sgDelayedAnimatedReapply = [NSMutableSet set];
     sgRealSquareArtwork.countLimit = 48;
     sgRealTallArtwork.countLimit = 48;
     sgSyntheticSquareArtwork.countLimit = 12;
     sgSyntheticTallArtwork.countLimit = 12;
+    sgStaticArtworkByAlbum.countLimit = 64;
+    sgStaticImageByAlbum.countLimit = 32;
     sgArtworkVideoQueue = dispatch_queue_create("pw.spoti.synthetic-artwork", DISPATCH_QUEUE_SERIAL);
     %init;
 }
