@@ -163,7 +163,11 @@ static void prepareLocalPlayback(id originalContext, id originalOptions, id *res
             [usedUIDs addObject:uid];
             id track = [[trackClass alloc] initWithURI:uri albumURI:[old albumURI] artistURI:[old artistURI] andUID:uid];
             if (!track) return;
-            NSMutableDictionary *metadata = [[old metadata] mutableCopy] ?: [NSMutableDictionary dictionary];
+            // UIKit also declares a metadata selector returning LPLinkMetadata.
+            // Keep the dynamic result untyped until its dictionary shape is checked.
+            id originalMetadata = [old metadata];
+            NSMutableDictionary *metadata = [originalMetadata isKindOfClass:NSDictionary.class] ?
+                [(NSDictionary *)originalMetadata mutableCopy] : [NSMutableDictionary dictionary];
             metadata[@"title"] = row[@"title"] ?: @"";
             metadata[@"artist_name"] = row[@"artist"] ?: @"";
             metadata[@"album_title"] = row[@"album"] ?: @"";
