@@ -564,7 +564,10 @@ static void tell(NSString *message) {
     if (![[NSUserDefaults.standardUserDefaults stringForKey:modeKey] isEqual:@"pc"]) { self.pending = nil; [self startDevice:canonical]; return; }
     self.devicePendingURL = nil;
     [NSUserDefaults.standardUserDefaults removeObjectForKey:@"spotifyglass.automaticDownloads.pendingDevice"];
-    self.pending = @{@"url":canonical, @"request_id":NSUUID.UUID.UUIDString};
+    NSMutableDictionary *request = [@{@"url":canonical, @"request_id":NSUUID.UUID.UUIDString} mutableCopy];
+    NSArray *tracks = self.registeredTracks[canonical];
+    if (tracks.count) request[@"track_urls"] = tracks;
+    self.pending = request;
     if (!self.root) { [self update:@"Associe le PC dans Options et nettoyage : la sélection sera ensuite envoyée automatiquement."]; return; }
     [self submitPending];
 }
@@ -951,7 +954,7 @@ static void tell(NSString *message) {
 }
 - (NSString *)tableView:(UITableView *)table titleForFooterInSection:(NSInteger)section {
     if (section == 2 && self.queuedURLs.count) return @"Glisse une sélection vers la gauche pour la retirer de la file.";
-    return section == 1 && [self.displayJob[@"items"] count] && ![self.displayJob[@"completeMetadata"] boolValue] && [self.displayJob[@"engine"] isEqual:@"device"] ? @"La liste accessible peut être incomplète." : nil;
+    return section == 1 && [self.displayJob[@"items"] count] && self.displayJob[@"completeMetadata"] && ![self.displayJob[@"completeMetadata"] boolValue] ? @"La liste accessible peut être incomplète." : nil;
 }
 - (CGFloat)tableView:(UITableView *)table heightForRowAtIndexPath:(NSIndexPath *)path { return path.section == 0 && path.row == 0 ? 142 : 70; }
 - (UITableViewCell *)tableView:(UITableView *)table cellForRowAtIndexPath:(NSIndexPath *)path {
@@ -1235,7 +1238,7 @@ BOOL SGAutomaticDownloadEntity(id entity, UIView *source) {
         NSDictionary *status = SGAutomaticDownloadStatus(url);
         NSString *message = engine.collectionErrors[url] ?: [NSString stringWithFormat:@"%@/%@ morceaux sur l'iPhone", status[@"completed"], status[@"total"]];
         if (queued) message = [message stringByAppendingFormat:@"\nPosition %@ dans la file", status[@"queuePosition"]];
-        if (saved && ![saved[@"completeMetadata"] boolValue] && [saved[@"engine"] isEqual:@"device"])
+        if (saved[@"completeMetadata"] && ![saved[@"completeMetadata"] boolValue])
             message = [message stringByAppendingString:@"\nLa page publique peut ne fournir qu'une partie de la playlist."];
         UIAlertController *sheet = [UIAlertController alertControllerWithTitle:saved[@"name"] ?: @"Téléchargement" message:message preferredStyle:UIAlertControllerStyleActionSheet];
         [sheet addAction:[UIAlertAction actionWithTitle:@"Voir les téléchargements" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
