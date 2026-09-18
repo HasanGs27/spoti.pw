@@ -1,5 +1,5 @@
 // Local files can have an embedded cover visible in the library while Spotify's
-// mini-player shows its missing-image glyph. Read that same cover from Documents.
+// mini/full player shows its missing-image glyph. Read that same cover from Documents.
 // Isolated from MPNowPlayingInfoCenter, Canvas and lock-screen animated artwork.
 // Revert by removing this file, or set SGLocalArtworkFallbackDisabled = YES.
 #import "Core/SGCore.h"
@@ -15,6 +15,79 @@ static NSCache<NSString *, UIImage *> *sg_localCovers;
 static dispatch_queue_t sg_localQueue;
 static __weak UIView *sg_localBar;
 static __weak UIImageView *sg_localOverlay;
+static __weak UIScrollView *sg_localFullList;
+static __weak UIImageView *sg_localFullOverlay;
+static NSString *localNormalized(NSString *value);
+
+static void localRemoveFullOverlay(void) {
+    [sg_localFullOverlay removeFromSuperview];
+    sg_localFullOverlay = nil;
+}
+
+// Reuse the embedded image only inside the full player's artwork collection.
+// Never paint queued/off-centre covers or retain a cover while swiping tracks.
+static void localApplyFullPlayer(UIScrollView *list) {
+    if (!list.window || !sg_localImage || ![sg_localURI hasPrefix:@"spotify:local:"] ||
+        list.dragging || list.decelerating || list.tracking) {
+        localRemoveFullOverlay();
+        return;
+    }
+    // Match the title in this player's controller tree, not the mini-player below.
+    UIResponder *responder = list;
+    while (responder && ![responder isKindOfClass:UIViewController.class]) responder = responder.nextResponder;
+    UIViewController *controller = (UIViewController *)responder;
+    BOOL titleMatches = NO;
+    for (NSUInteger depth = 0; controller && depth < 5; depth++, controller = controller.parentViewController) {
+        __block BOOL found = NO;
+        SGForEachView(controller.viewIfLoaded, ^(UIView *view) {
+            if ([view isKindOfClass:UILabel.class] && !view.hidden && view.alpha > 0 &&
+                [localNormalized(((UILabel *)view).text) isEqualToString:localNormalized(sg_localTitle)]) found = YES;
+        });
+        if (found) { titleMatches = YES; break; }
+    }
+    if (!titleMatches) { localRemoveFullOverlay(); return; }
+
+    CGFloat middle = CGRectGetMidX(list.bounds);
+    __block UIView *host = nil;
+    for (UIView *cell in list.subviews) {
+        if (fabs(CGRectGetMidX(cell.frame) - middle) > 1.0) continue;
+        SGForEachView(cell, ^(UIView *view) {
+            CGSize size = view.bounds.size;
+            if (host || view.hidden || view.alpha <= 0 || size.width < 200 ||
+                fabs(size.width - size.height) > 2 ||
+                ![NSStringFromClass(view.class) containsString:@"CoverArtTiltView"]) return;
+            host = view;
+        });
+    }
+    if (!host) { localRemoveFullOverlay(); return; }
+    __block BOOL nativeCover = NO;
+    SGForEachView(host, ^(UIView *view) {
+        if (view == sg_localFullOverlay || ![view isKindOfClass:UIImageView.class]) return;
+        UIImage *image = ((UIImageView *)view).image;
+        if (!view.hidden && view.alpha > 0 && view.bounds.size.width >= 200 && image &&
+            !image.isSymbolImage && image.size.width * image.scale >= 96 &&
+            image.size.height * image.scale >= 96) nativeCover = YES;
+    });
+    if (nativeCover) { localRemoveFullOverlay(); return; }
+    UIImageView *overlay = sg_localFullOverlay;
+    if (!overlay || overlay.superview != host) {
+        localRemoveFullOverlay();
+        overlay = [[UIImageView alloc] initWithFrame:host.bounds];
+        overlay.userInteractionEnabled = NO;
+        overlay.isAccessibilityElement = NO;
+        overlay.contentMode = UIViewContentModeScaleAspectFit;
+        overlay.clipsToBounds = YES;
+        overlay.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        [host addSubview:overlay];
+        sg_localFullOverlay = overlay;
+        SGLog(@"[SGLocalArtwork] full-player cover applied: %@", sg_localTitle);
+    }
+    overlay.image = sg_localImage;
+    overlay.frame = host.bounds;
+    overlay.layer.cornerRadius = host.layer.cornerRadius > 0 ? host.layer.cornerRadius : 12;
+    overlay.layer.cornerCurve = kCACornerCurveContinuous;
+    [host bringSubviewToFront:overlay];
+}
 
 static NSString *localText(id value) {
     return [value isKindOfClass:NSString.class] ? value : @"";
@@ -182,13 +255,19 @@ static void localObserveState(id state) {
     dispatch_async(dispatch_get_main_queue(), ^{
         if (!localCurrent(generation)) return;
         localRemoveOverlay();
+        localRemoveFullOverlay();
         sg_localURI = uri.copy;
         sg_localTitle = title.copy;
         sg_localImage = nil;
         if (!local || !title.length || !artist.length) return;
         SGLog(@"[SGLocalArtwork] local track: %@ — %@", title, artist);
         UIImage *cached = [sg_localCovers objectForKey:uri];
-        if (cached) { sg_localImage = cached; localApplyBar(sg_localBar); return; }
+        if (cached) {
+            sg_localImage = cached;
+            localApplyBar(sg_localBar);
+            localApplyFullPlayer(sg_localFullList);
+            return;
+        }
         dispatch_async(sg_localQueue, ^{
             if (!localCurrent(generation)) return;
             UIImage *image = localReadCover(title, artist, album, seconds, generation);
@@ -198,6 +277,7 @@ static void localObserveState(id state) {
                 NSUInteger cost = (NSUInteger)(image.size.width * image.scale * image.size.height * image.scale * 4);
                 [sg_localCovers setObject:image forKey:uri cost:cost];
                 localApplyBar(sg_localBar);
+                localApplyFullPlayer(sg_localFullList);
             });
         });
     });
@@ -219,6 +299,31 @@ static void localObserveState(id state) {
 }
 %end
 
+%group SGLocalFullPlayer
+%hook _TtC35NowPlaying_ContentLayerPlatformImpl24AccessibleCollectionView
+- (void)layoutSubviews {
+    %orig;
+    sg_localFullList = (UIScrollView *)self;
+    localApplyFullPlayer(sg_localFullList);
+}
+- (void)setContentOffset:(CGPoint)offset {
+    localRemoveFullOverlay();
+    %orig;
+}
+- (void)didMoveToWindow {
+    %orig;
+    UIScrollView *list = (UIScrollView *)self;
+    if (list.window) {
+        sg_localFullList = list;
+        localApplyFullPlayer(list);
+    } else if (sg_localFullList == list) {
+        localRemoveFullOverlay();
+        sg_localFullList = nil;
+    }
+}
+%end
+%end
+
 %ctor {
     if ([NSUserDefaults.standardUserDefaults boolForKey:@"SGLocalArtworkFallbackDisabled"]) return;
     sg_localLock = [NSObject new];
@@ -227,5 +332,8 @@ static void localObserveState(id state) {
     sg_localCovers.totalCostLimit = 16 * 1024 * 1024;
     sg_localQueue = dispatch_queue_create("spoti.local-artwork", DISPATCH_QUEUE_SERIAL);
     %init;
+    if (![NSUserDefaults.standardUserDefaults boolForKey:@"SGLocalFullPlayerArtworkDisabled"]) {
+        %init(SGLocalFullPlayer);
+    }
     SGRequireClasses(@[@"SPTEsperantoPlayer", @"_TtC18NowPlaying_BarImpl27NowPlayingBarViewController"]);
 }
