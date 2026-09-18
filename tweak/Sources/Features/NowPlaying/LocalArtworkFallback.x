@@ -20,6 +20,9 @@ static __weak UIImageView *sg_localOverlay;
 static __weak UIScrollView *sg_localFullList;
 static __weak UIImageView *sg_localFullOverlay;
 static CGRect sg_localFullViewportFrame;
+static __weak UIScrollView *sg_localMaskedList;
+static CALayer *sg_localPreviousMask;
+static CAShapeLayer *sg_localArtworkMask;
 static NSString *localNormalized(NSString *value);
 
 static UIImage *localBlackCover(void) {
@@ -35,12 +38,31 @@ static UIImage *localBlackCover(void) {
 }
 
 static void localPinFullOverlay(UIScrollView *list) {
-    if (sg_localFullOverlay.superview != list) return;
+    if (!list || !sg_localFullOverlay || sg_localFullOverlay.superview != list) return;
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
     sg_localFullOverlay.frame = CGRectOffset(sg_localFullViewportFrame, list.bounds.origin.x, list.bounds.origin.y);
+    if (sg_localMaskedList == list && list.layer.mask == sg_localArtworkMask) {
+        // Clip the artwork carousel, including its moving native placeholders,
+        // to the existing cover rectangle. The cover itself is not resized.
+        sg_localArtworkMask.frame = list.bounds;
+        sg_localArtworkMask.path = [UIBezierPath bezierPathWithRoundedRect:sg_localFullViewportFrame
+            cornerRadius:sg_localFullOverlay.layer.cornerRadius].CGPath;
+    }
+    [CATransaction commit];
     [list bringSubviewToFront:sg_localFullOverlay];
 }
 
 static void localRemoveFullOverlay(void) {
+    if (sg_localMaskedList && sg_localMaskedList.layer.mask == sg_localArtworkMask) {
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        sg_localMaskedList.layer.mask = sg_localPreviousMask;
+        [CATransaction commit];
+    }
+    sg_localMaskedList = nil;
+    sg_localPreviousMask = nil;
+    sg_localArtworkMask = nil;
     [sg_localFullOverlay removeFromSuperview];
     sg_localFullOverlay = nil;
 }
@@ -101,6 +123,20 @@ static void localApplyFullPlayer(UIScrollView *list) {
     sg_localFullViewportFrame = CGRectOffset(frame, -list.bounds.origin.x, -list.bounds.origin.y);
     overlay.layer.cornerRadius = host.layer.cornerRadius > 0 ? host.layer.cornerRadius : 12;
     overlay.layer.cornerCurve = kCACornerCurveContinuous;
+    if (!sg_localArtworkMask) {
+        sg_localMaskedList = list;
+        sg_localPreviousMask = list.layer.mask;
+        sg_localArtworkMask = [CAShapeLayer layer];
+        sg_localArtworkMask.fillColor = UIColor.blackColor.CGColor;
+        sg_localArtworkMask.frame = list.bounds;
+        sg_localArtworkMask.path = [UIBezierPath bezierPathWithRoundedRect:sg_localFullViewportFrame
+            cornerRadius:overlay.layer.cornerRadius].CGPath;
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        list.layer.mask = sg_localArtworkMask;
+        [CATransaction commit];
+        SGLog(@"[SGLocalArtwork] local carousel edge mask applied");
+    }
     localPinFullOverlay(list);
 }
 
