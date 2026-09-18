@@ -5,8 +5,9 @@
 #import <CoreImage/CoreImage.h>
 #import <math.h>
 #import <objc/runtime.h>
+#import <CommonCrypto/CommonDigest.h>
 
-// Album animated-artwork fallback v4.0.2 — validated vertical handoff experiment.
+// Album animated-artwork fallback v4.0.3-test — refresh synthetic video when its cover changes.
 // Reference: v4.0.1 strict no-square handoff, commit 54d961f.
 // Keep the existing album caches and synthetic generation pipeline. A new item is
 // published only with a locally validated vertical video; preserve the previous
@@ -18,6 +19,8 @@ static NSCache<NSString *, id> *sgRealTallArtwork;
 static NSCache<NSString *, id> *sgSyntheticSquareArtwork;
 static NSCache<NSString *, id> *sgSyntheticTallArtwork;
 static NSCache<NSString *, UIImage *> *sgStaticImageByAlbum;
+static NSCache<NSString *, NSMutableDictionary *> *sgSyntheticCoverStates;
+static char sgCoverFingerprintKey, sgSyntheticSourceKey;
 static dispatch_queue_t sgArtworkVideoQueue;
 static NSMutableSet<NSString *> *sgSyntheticGenerationInFlight;
 static NSString *sgCurrentTrackKey;
@@ -47,6 +50,7 @@ static NSString *SGString(id value) {
 static UIImage *SGAspectFillImage(UIImage *image, CGSize target);
 static id SGSyntheticArtworkForAlbum(NSString *albumKey, UIImage *cover, BOOL tall);
 static NSString *SGTrackArtworkKey(NSDictionary *info);
+static id SGCurrentSyntheticArtwork(id artwork, NSString *albumKey);
 #import "AlbumArtworkDebug.h"
 static UIImage *SGSolidBlackImage(CGSize size);
 #import "AlbumArtworkHandoff.h"
@@ -251,14 +255,14 @@ static NSDictionary *SGInfoWithReadyAnimation(NSDictionary *info, NSString *albu
 
     if (@available(iOS 26.0, *)) {
         // Resolve the vertical variant first. A square-only packet must not collapse the lock screen.
-        id tall = SGReadyArtwork(patched[MPNowPlayingInfoProperty3x4AnimatedArtwork], YES);
-        id square = SGReadyArtwork(patched[MPNowPlayingInfoProperty1x1AnimatedArtwork], NO);
+        id tall = SGReadyArtwork(SGCurrentSyntheticArtwork(patched[MPNowPlayingInfoProperty3x4AnimatedArtwork], albumKey), YES);
+        id square = SGReadyArtwork(SGCurrentSyntheticArtwork(patched[MPNowPlayingInfoProperty1x1AnimatedArtwork], albumKey), NO);
 
         if (!square && albumKey.length) {
-            square = SGReadyArtwork([sgRealSquareArtwork objectForKey:albumKey], NO) ?: SGReadyArtwork([sgSyntheticSquareArtwork objectForKey:albumKey], NO);
+            square = SGReadyArtwork(SGCurrentSyntheticArtwork([sgRealSquareArtwork objectForKey:albumKey], albumKey), NO) ?: SGReadyArtwork(SGCurrentSyntheticArtwork([sgSyntheticSquareArtwork objectForKey:albumKey], albumKey), NO);
         }
         if (!tall && albumKey.length) {
-            tall = SGReadyArtwork([sgRealTallArtwork objectForKey:albumKey], YES) ?: SGReadyArtwork([sgSyntheticTallArtwork objectForKey:albumKey], YES);
+            tall = SGReadyArtwork(SGCurrentSyntheticArtwork([sgRealTallArtwork objectForKey:albumKey], albumKey), YES) ?: SGReadyArtwork(SGCurrentSyntheticArtwork([sgSyntheticTallArtwork objectForKey:albumKey], albumKey), YES);
         }
 
         if (square && tall) patched[MPNowPlayingInfoProperty1x1AnimatedArtwork] = square;
@@ -397,6 +401,60 @@ static NSString *SGSafeToken(NSString *text) {
     token = [token stringByReplacingOccurrencesOfString:@"=" withString:@""];
     if (token.length > 80) token = [token substringToIndex:80];
     return [NSString stringWithFormat:@"%@-%08lx", token, (unsigned long)text.hash];
+}
+
+// Fingerprint image content, not transient UIImage identities. The small RGB sample
+// makes repeated metadata updates cheap and distinguishes provisional/loaded covers.
+static NSString *SGCoverFingerprint(UIImage *image) {
+    if (!SGUsableCover(image) || !image.CGImage) return nil;
+    NSString *cached = objc_getAssociatedObject(image, &sgCoverFingerprintKey);
+    if (cached) return cached;
+    unsigned char pixels[32 * 32 * 4 + 1] = {0};
+    CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
+    CGContextRef context = CGBitmapContextCreate(pixels, 32, 32, 8, 32 * 4, space,
+        kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+    CGColorSpaceRelease(space);
+    if (!context) return nil;
+    CGContextDrawImage(context, CGRectMake(0, 0, 32, 32), image.CGImage);
+    CGContextRelease(context);
+    pixels[sizeof(pixels) - 1] = (unsigned char)image.imageOrientation;
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256(pixels, (CC_LONG)sizeof(pixels), digest);
+    NSMutableString *fingerprint = [NSMutableString string];
+    for (NSUInteger i = 0; i < sizeof(digest); ++i) [fingerprint appendFormat:@"%02x", digest[i]];
+    objc_setAssociatedObject(image, &sgCoverFingerprintKey, fingerprint, OBJC_ASSOCIATION_COPY_NONATOMIC);
+    return fingerprint;
+}
+
+static void SGObserveSyntheticCover(NSString *albumKey, UIImage *image) {
+    if (!albumKey.length) return;
+    NSString *fingerprint = SGCoverFingerprint(image);
+    if (!fingerprint) return;
+    @synchronized (sgSyntheticCoverStates) {
+        NSMutableDictionary *state = [sgSyntheticCoverStates objectForKey:albumKey];
+        if ([state[@"fingerprint"] isEqual:fingerprint]) return;
+        NSString *previous = state[@"fingerprint"];
+        state = [@{@"fingerprint": fingerprint,
+                   @"readyAt": @(NSProcessInfo.processInfo.systemUptime + 0.30)} mutableCopy];
+        [sgSyntheticCoverStates setObject:state forKey:albumKey];
+        [sgStaticImageByAlbum setObject:image forKey:albumKey];
+        // Only evict lookup entries. Presented/held video objects retain their assets.
+        [sgSyntheticSquareArtwork removeObjectForKey:albumKey];
+        [sgSyntheticTallArtwork removeObjectForKey:albumKey];
+        SG_DEBUG_EVENT(@"cover.revision", @"album=%@ previous=%@ next=%@ image=%@ settleMs=300",
+            SGDebugQuote(albumKey), previous ?: @"none", fingerprint, SGDebugImage(image));
+    }
+}
+
+static id SGCurrentSyntheticArtwork(id artwork, NSString *albumKey) {
+    NSString *source = artwork ? objc_getAssociatedObject(artwork, &sgSyntheticSourceKey) : nil;
+    if (!source) return artwork; // Native artwork keeps its existing readiness path.
+    NSString *current = albumKey.length ? [sgSyntheticCoverStates objectForKey:albumKey][@"fingerprint"] : nil;
+    return [source isEqual:current] ? artwork : nil;
+}
+
+static NSString *SGSyntheticVideoToken(NSString *albumKey, NSString *fingerprint) {
+    return [NSString stringWithFormat:@"%@-%@", SGSafeToken(albumKey), fingerprint];
 }
 
 static NSURL *SGArtworkVideoDirectory(void) {
@@ -579,6 +637,25 @@ static void SGWriteKenBurnsVideo(UIImage *sourceImage, CGSize target, NSURL *url
 
 static void SGEnsureFastSyntheticArtwork(NSString *albumKey, UIImage *cover) {
     if (!albumKey.length || !SGUsableCover(cover)) return;
+    NSString *fingerprint = SGCoverFingerprint(cover);
+    NSMutableDictionary *coverState = [sgSyntheticCoverStates objectForKey:albumKey];
+    if (!fingerprint || ![coverState[@"fingerprint"] isEqual:fingerprint]) return;
+    NSTimeInterval settle = [coverState[@"readyAt"] doubleValue] - NSProcessInfo.processInfo.systemUptime;
+    if (settle > 0) {
+        @synchronized (coverState) {
+            if ([coverState[@"scheduled"] boolValue]) return;
+            coverState[@"scheduled"] = @YES;
+        }
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((settle + 0.01) * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if ([sgSyntheticCoverStates objectForKey:albumKey] != coverState ||
+                ![SGAlbumArtworkKey(sgLastRawNowPlayingInfo) isEqualToString:albumKey]) return;
+            // Re-evaluate native readiness too: don't start an encode after native video won.
+            BOOL ready = NO;
+            SGInfoWithReadyAnimation(sgLastRawNowPlayingInfo, albumKey, YES, &ready);
+            if (!ready) SGEnsureFastSyntheticArtwork(albumKey, cover);
+        });
+        return;
+    }
     if (@available(iOS 26.0, *)) {
         // Give a fast native resolution a short head start, avoiding two needless encodes
         // on every video-to-video skip. The already presented video stays in place.
@@ -613,11 +690,11 @@ static void SGEnsureFastSyntheticArtwork(NSString *albumKey, UIImage *cover) {
         [sgSyntheticGenerationInFlight addObject:albumKey];
     }
 
-    NSString *token = SGSafeToken(albumKey);
+    NSString *token = SGSyntheticVideoToken(albumKey, fingerprint);
     NSURL *squareURL = [SGArtworkVideoDirectory() URLByAppendingPathComponent:
-                        [NSString stringWithFormat:@"%@-v402-1x1.mp4", token]];
+                        [NSString stringWithFormat:@"%@-v403-1x1.mp4", token]];
     NSURL *tallURL = [SGArtworkVideoDirectory() URLByAppendingPathComponent:
-                      [NSString stringWithFormat:@"%@-v402-3x4.mp4", token]];
+                      [NSString stringWithFormat:@"%@-v403-3x4.mp4", token]];
 
     __block BOOL squareDone = NO, tallDone = NO;
     void (^finishOne)(void) = ^{
@@ -654,6 +731,11 @@ static void SGEnsureFastSyntheticArtwork(NSString *albumKey, UIImage *cover) {
 static id SGSyntheticArtworkForAlbum(NSString *albumKey, UIImage *cover, BOOL tall) {
     if (albumKey.length == 0 || !cover) return nil;
 
+    NSString *fingerprint = SGCoverFingerprint(cover);
+    if (!fingerprint || ![[sgSyntheticCoverStates objectForKey:albumKey][@"fingerprint"] isEqual:fingerprint]) {
+        SG_DEBUG_EVENT(@"synthetic.staleCompletion", @"album=%@ source=%@", SGDebugQuote(albumKey), fingerprint);
+        return nil;
+    }
     NSCache *cache = tall ? sgSyntheticTallArtwork : sgSyntheticSquareArtwork;
     id existing = [cache objectForKey:albumKey];
     if (existing) return existing;
@@ -661,14 +743,14 @@ static id SGSyntheticArtworkForAlbum(NSString *albumKey, UIImage *cover, BOOL ta
     if (@available(iOS 26.0, *)) {
         CGSize target = tall ? CGSizeMake(540, 720) : CGSizeMake(540, 540);
         NSString *variant = tall ? @"3x4" : @"1x1";
-        NSString *token = SGSafeToken(albumKey);
+        NSString *token = SGSyntheticVideoToken(albumKey, fingerprint);
         NSURL *videoURL = [SGArtworkVideoDirectory() URLByAppendingPathComponent:
-                           [NSString stringWithFormat:@"%@-v402-%@.mp4", token, variant]];
+                           [NSString stringWithFormat:@"%@-v403-%@.mp4", token, variant]];
 
         SG_DEBUG_URL(@"synthetic.fileCheck", [NSString stringWithFormat:@"album=%@ variant=%@", SGDebugQuote(albumKey), variant], videoURL);
         if (![[NSFileManager defaultManager] fileExistsAtPath:videoURL.path]) return nil;
 
-        NSString *artworkID = [NSString stringWithFormat:@"spoti.pw.synthetic.v402.%@.%@", token, variant];
+        NSString *artworkID = [NSString stringWithFormat:@"spoti.pw.synthetic.v403.%@.%@", token, variant];
         UIImage *blackPreview = SGSolidBlackImage(target);
         MPMediaItemAnimatedArtwork *animated =
             [[MPMediaItemAnimatedArtwork alloc]
@@ -680,7 +762,10 @@ static id SGSyntheticArtworkForAlbum(NSString *albumKey, UIImage *cover, BOOL ta
                     handler(videoURL);
                 }];
 
-        if (animated) [cache setObject:animated forKey:albumKey];
+        if (animated) {
+            objc_setAssociatedObject(animated, &sgSyntheticSourceKey, fingerprint, OBJC_ASSOCIATION_COPY_NONATOMIC);
+            [cache setObject:animated forKey:albumKey];
+        }
         SG_DEBUG_EVENT(@"synthetic.cached", @"album=%@ variant=%@ object=%@", SGDebugQuote(albumKey), variant, SGDebugIdentity(animated));
         return animated;
     }
@@ -721,6 +806,8 @@ static id SGSyntheticArtworkForAlbum(NSString *albumKey, UIImage *cover, BOOL ta
         NSString *trackKey = SGTrackArtworkKey(info);
         UIImage *incomingCover = SGStaticCover(info);
         BOOL incomingCoverUsable = SGUsableCover(incomingCover);
+        if (incomingCoverUsable && info[MPMediaItemPropertyArtwork] != SGBlackArtwork())
+            SGObserveSyntheticCover(albumKey, incomingCover);
         BOOL topLevelTrackChanged = trackKey.length && ![sgCurrentTrackKey isEqualToString:trackKey];
         SG_DEBUG_EVENT(@"pipeline.state", @"packet=%lu trackChanged=%d previousTrack=%@ coverUsable=%d albumKey=%@ holding=%d blackActive=%d presentedSquare=%@ presentedTall=%@", (unsigned long)debugPacket, topLevelTrackChanged, SGDebugQuote(sgCurrentTrackKey), incomingCoverUsable, SGDebugQuote(albumKey), sgHoldingPreviousAnimation, sgBlackTransitionActive, SGDebugIdentity(sgPresentedSquareArtwork), SGDebugIdentity(sgPresentedTallArtwork));
 
@@ -823,8 +910,8 @@ static id SGSyntheticArtworkForAlbum(NSString *albumKey, UIImage *cover, BOOL ta
 
         id square = info[MPNowPlayingInfoProperty1x1AnimatedArtwork];
         id tall = info[MPNowPlayingInfoProperty3x4AnimatedArtwork];
-        if (square) [sgRealSquareArtwork setObject:square forKey:albumKey];
-        if (tall) [sgRealTallArtwork setObject:tall forKey:albumKey];
+        if (square && !objc_getAssociatedObject(square, &sgSyntheticSourceKey)) [sgRealSquareArtwork setObject:square forKey:albumKey];
+        if (tall && !objc_getAssociatedObject(tall, &sgSyntheticSourceKey)) [sgRealTallArtwork setObject:tall forKey:albumKey];
 
         UIImage *cover = SGBestStaticImage(info, albumKey);
         BOOL hasAnimation = NO;
@@ -846,11 +933,14 @@ static id SGSyntheticArtworkForAlbum(NSString *albumKey, UIImage *cover, BOOL ta
 
 %ctor {
     SG_DEBUG_START();
+    SG_DEBUG_EVENT(@"handoff.revision", @"patch=v4.0.3-cover-refresh settleMs=300");
     sgRealSquareArtwork = [NSCache new];
     sgRealTallArtwork = [NSCache new];
     sgSyntheticSquareArtwork = [NSCache new];
     sgSyntheticTallArtwork = [NSCache new];
     sgStaticImageByAlbum = [NSCache new];
+    sgSyntheticCoverStates = [NSCache new];
+    sgSyntheticCoverStates.countLimit = 48;
     sgSyntheticGenerationInFlight = [NSMutableSet set];
     sgRealSquareArtwork.countLimit = 48;
     sgRealTallArtwork.countLimit = 48;
