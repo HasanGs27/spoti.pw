@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
+from mutagen import MutagenError
 from mutagen.mp3 import MP3
 from download_metadata import canonical, collection
 
@@ -48,6 +49,7 @@ class Queue:
         self.root.mkdir(parents=True, exist_ok=True)
         self.ffmpeg, self.resolve, self.prepare = ffmpeg, resolve, prepare or self.worker
         self.lock, self.jobs, self.files = threading.RLock(), {}, {}
+        self.reusable = {}
         self.pool = ThreadPoolExecutor(max_workers=1)
         for path in self.root.glob('*/job.json'):
             if not re.fullmatch('[a-f0-9]{32}', path.parent.name) or path.is_symlink(): continue
@@ -59,20 +61,63 @@ class Queue:
                 for item in job.get('items', []):
                     if item['state'] == 'ready':
                         audio = path.parent / str(item['position']) / 'audio.mp3'
-                        if audio.is_file() and audio_record(audio, item)['id'] == item['id']:
+                        record = audio_record(audio, item) if audio.is_file() else None
+                        if record and record['id'] == item['id']:
                             self.register(item['id'], audio)
+                            self.remember_audio(item['spotify'], audio, record)
                         else:
                             item.update(state='error', message='Fichier absent ou modifié sur le PC.')
                             job.update(state='partial', message='Certains fichiers ne sont plus disponibles sur le PC.')
                 self.jobs[job['id']] = job
                 self.save(job)
-            except (ValueError, KeyError, OSError): continue
+            except (ValueError, KeyError, OSError, MutagenError): continue
 
     def register(self, ident, path):
         path = path.resolve(strict=True)
         if not path.is_relative_to(self.root): raise ValueError('Chemin audio invalide.')
         stat = path.stat()
         self.files[ident] = (path, stat.st_size, stat.st_mtime_ns)
+
+    def remember_audio(self, url, path, record):
+        url = canonical(url)
+        if '/track/' not in url: return
+        path = path.resolve(strict=True)
+        if not path.is_relative_to(self.root): raise ValueError('Chemin audio invalide.')
+        self.reusable[url] = (path, dict(record))
+
+    def reuse_audio(self, url, folder):
+        """Reuse only the exact previously verified file for this Spotify identity."""
+        url = canonical(url)
+        with self.lock: cached = self.reusable.get(url)
+        if not cached: return None
+        source, metadata = cached
+        temporary = None
+        try:
+            if (source.is_symlink() or source.resolve(strict=True) != source or
+                not source.is_relative_to(self.root) or source.stat().st_size != metadata['bytes'] or
+                folder.is_symlink() or folder.resolve(strict=True) != folder or not folder.is_relative_to(self.root)):
+                raise ValueError('Copie locale indisponible.')
+            temporary = folder / ('reuse-' + secrets.token_hex(8) + '.tmp')
+            # A separate copy keeps playlist files independent. Bound the copy even if
+            # the source is changed while reading, then verify the destination itself.
+            with source.open('rb') as incoming, temporary.open('xb') as outgoing:
+                copied = 0
+                while chunk := incoming.read(131072):
+                    copied += len(chunk)
+                    if copied > LIMIT: raise ValueError('Fichier audio trop volumineux.')
+                    outgoing.write(chunk)
+            record = audio_record(temporary, metadata)
+            if record['id'] != metadata['id']:
+                raise ValueError('Le fichier audio a changé.')
+            target = folder / 'audio.mp3'
+            temporary.replace(target)
+            return target, record
+        except (OSError, ValueError, KeyError, MutagenError):
+            with self.lock:
+                if self.reusable.get(url) is cached: self.reusable.pop(url, None)
+            return None
+        finally:
+            if temporary is not None: temporary.unlink(missing_ok=True)
 
     def save(self, job):
         path = self.root / job['id']
@@ -145,10 +190,15 @@ class Queue:
                     job['message'] = f"Recherche audio {item['position']}/{len(urls)}."
                     self.save(job)
                 try:
-                    path, metadata = self.prepare(item['spotify'], folder)
-                    record = audio_record(path, metadata)
+                    reused = self.reuse_audio(item['spotify'], folder)
+                    if reused:
+                        path, record = reused
+                    else:
+                        path, metadata = self.prepare(item['spotify'], folder)
+                        record = audio_record(path, metadata)
                     with self.lock:
                         self.register(record['id'], path)
+                        self.remember_audio(item['spotify'], path, record)
                         item.update(record, state='ready')
                         self.save(job)
                 except Exception as error:

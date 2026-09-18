@@ -16,7 +16,7 @@ from http.server import ThreadingHTTPServer
 from PIL import Image
 from mutagen.mp3 import MP3
 from mutagen.id3 import TIT2, TPE1, TALB, APIC
-from automatic_downloads import Queue, handler_for, lan_address
+from automatic_downloads import Queue, handler_for, lan_address, audio_record
 from download_metadata import canonical, collection
 from download_worker import acceptable
 
@@ -72,12 +72,77 @@ class QueueTests(unittest.TestCase):
             if url == OTHER: raise ValueError('Deliberate missing source')
             target=folder/'audio.mp3'; shutil.copyfile(self.fixture,target)
             return target, {'source':'local test fixture'}
-        queue = Queue(self.folder.name,'unused',prepare=prepare,
-                      resolve=lambda url, tracks:('Selection','test',[TRACK,OTHER]), **kwargs)
+        queue = Queue(self.folder.name,'unused',prepare=kwargs.pop('prepare', prepare),
+                      resolve=kwargs.pop('resolve', lambda url, tracks:('Selection','test',[TRACK,OTHER])), **kwargs)
         self.queues.append(queue)
         return queue
     def submit(self, queue):
         return queue.submit({'url':TRACK,'request_id':'test-idempotency-key'})
+    def cached_queue(self, calls):
+        def prepare(url, folder):
+            calls.append(url)
+            target = folder/'audio.mp3'; shutil.copyfile(self.fixture, target)
+            return target, {'source':'verified synthetic fixture', 'quality':'test fixture'}
+        return self.queue(prepare=prepare, resolve=lambda url, tracks:('Selection','test',tracks or [TRACK]))
+    def settled(self, queue, request):
+        job = queue.submit(request)
+        queue.pool.submit(lambda: None).result(timeout=10)
+        return queue.snapshot(job['id'])
+    def test_reuses_duplicates_and_other_playlists_without_crossing_identity(self):
+        calls = []; queue = self.cached_queue(calls)
+        first = self.settled(queue, {'url':TRACK, 'request_id':'reuse-first-request', 'track_urls':[TRACK,TRACK]})
+        self.assertEqual(calls, [TRACK])
+        self.assertEqual(first['state'], 'complete')
+        self.assertEqual([row['position'] for row in first['items']], [1,2])
+        self.assertEqual(first['items'][0]['id'], first['items'][1]['id'])
+        second = self.settled(queue, {'url':OTHER, 'request_id':'reuse-second-request', 'track_urls':[TRACK,OTHER]})
+        # The other Spotify identity still needs preparation even when its test audio happens to be identical.
+        self.assertEqual(calls, [TRACK, OTHER])
+        self.assertEqual(second['state'], 'complete')
+        self.assertEqual(second['items'][0]['source'], 'verified synthetic fixture')
+        one = Path(self.folder.name)/first['id']/'1'/'audio.mp3'
+        duplicate = Path(self.folder.name)/first['id']/'2'/'audio.mp3'
+        original = duplicate.read_bytes()
+        one.write_bytes(one.read_bytes()+b'changed')
+        self.assertEqual(duplicate.read_bytes(), original) # Copies are independent, not hard links.
+        self.assertEqual(hashlib.sha256(original).hexdigest(), first['items'][1]['id'])
+    def test_reuses_verified_audio_after_restart(self):
+        calls = []; queue = self.cached_queue(calls)
+        first = self.settled(queue, {'url':TRACK, 'request_id':'before-restart-request'})
+        queue.pool.shutdown(wait=True)
+        restored = self.cached_queue(calls)
+        second = self.settled(restored, {'url':TRACK, 'request_id':'after-restart-request'})
+        self.assertEqual(calls, [TRACK])
+        self.assertEqual(first['items'][0]['id'], second['items'][0]['id'])
+        self.assertEqual(second['state'], 'complete')
+    def test_modified_cached_audio_is_not_reused(self):
+        calls = []; queue = self.cached_queue(calls)
+        first = self.settled(queue, {'url':TRACK, 'request_id':'before-modified-request'})
+        source = Path(self.folder.name)/first['id']/'1'/'audio.mp3'
+        original = source.read_bytes(); changed = original[:-1]+bytes([original[-1]^1])
+        source.write_bytes(changed) # Same size: checking only a file size would accept the wrong bytes.
+        second = self.settled(queue, {'url':TRACK, 'request_id':'after-modified-request'})
+        self.assertEqual(calls, [TRACK, TRACK])
+        self.assertEqual(source.read_bytes(), changed)
+        self.assertEqual(second['items'][0]['id'], hashlib.sha256(original).hexdigest())
+        self.assertFalse(list((Path(self.folder.name)/second['id']/'1').glob('reuse-*.tmp')))
+    def test_modified_audio_is_not_restored_as_reusable(self):
+        calls = []; queue = self.cached_queue(calls)
+        first = self.settled(queue, {'url':TRACK, 'request_id':'cache-restart-first'})
+        queue.pool.shutdown(wait=True)
+        source = Path(self.folder.name)/first['id']/'1'/'audio.mp3'
+        original = source.read_bytes(); source.write_bytes(original[:-1]+bytes([original[-1]^1]))
+        restored = self.cached_queue(calls)
+        self.assertEqual(restored.snapshot(first['id'])['items'][0]['state'], 'error')
+        second = self.settled(restored, {'url':TRACK, 'request_id':'cache-restart-second'})
+        self.assertEqual(calls, [TRACK, TRACK])
+        self.assertEqual(second['state'], 'complete')
+    def test_reuse_refuses_an_outside_cache_path(self):
+        calls = []; queue = self.cached_queue(calls)
+        queue.reusable[TRACK] = (self.fixture.resolve(), audio_record(self.fixture, {}))
+        done = self.settled(queue, {'url':TRACK, 'request_id':'outside-cache-request'})
+        self.assertEqual(calls, [TRACK])
+        self.assertEqual(done['state'], 'complete')
     def test_partial_idempotency_and_restart(self):
         queue=self.queue(); job=self.submit(queue); queue.pool.shutdown(wait=True)
         done=queue.snapshot(job['id'])

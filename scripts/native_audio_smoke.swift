@@ -3,9 +3,119 @@
 import Foundation
 import Darwin
 
+actor NativeAudioSmokeLog {
+    private(set) var queries: [String] = []
+    private(set) var extracted: [String] = []
+    func search(_ query: String) { queries.append(query) }
+    func extract(_ id: String) -> Int { extracted.append(id); return extracted.count }
+}
+
 @main struct NativeAudioSmoke {
     static func require(_ condition: Bool, _ description: String) {
         guard condition else { fatalError(description) }
+    }
+    static func checkResolverReuse(_ row: [String: Any], featured: SGNativeTrack) async throws {
+        let track = try SGNativeTrack(row)
+        let first = SGNativeCandidate(videoID: "G3na6eXSKtc", title: track.title, artists: track.artists, seconds: 186, audioTrack: true)
+        let alternative = SGNativeCandidate(videoID: "abcdefghijk", title: track.title, artists: track.artists, seconds: 186, audioTrack: true)
+        let cache = SGNativeCandidateCache(capacity: 2, lifetime: 10)
+        await cache.store(first, for: track, now: 1)
+        require(await cache.candidate(for: track, now: 10)?.videoID == first.videoID, "Cached identity unavailable before expiry")
+        require(await cache.candidate(for: track, sourceID: alternative.videoID, now: 10) == nil, "Cache overrode an explicit source choice")
+        require(await cache.candidate(for: track, now: 11) == nil, "Identity cache outlived its TTL")
+        let changed = try SGNativeTrack(["title": track.title, "artist": "Other Artist", "seconds": 186])
+        await cache.store(first, for: changed, now: 12)
+        require(await cache.candidate(for: changed, now: 13) == nil, "Cache stored a mismatched identity")
+        let secondTrack = try SGNativeTrack(["title": "Second", "artist": track.artist, "seconds": 186])
+        let thirdTrack = try SGNativeTrack(["title": "Third", "artist": track.artist, "seconds": 186])
+        await cache.store(first, for: track, now: 20)
+        await cache.store(SGNativeCandidate(videoID: "12345678901", title: "Second", artists: track.artists, seconds: 186, audioTrack: true), for: secondTrack, now: 21)
+        _ = await cache.candidate(for: track, now: 22)
+        await cache.store(SGNativeCandidate(videoID: "12345678902", title: "Third", artists: track.artists, seconds: 186, audioTrack: true), for: thirdTrack, now: 23)
+        require(await cache.candidate(for: secondTrack, now: 24) == nil, "Cache did not evict least recently used identity")
+        require(await cache.candidate(for: track, now: 24) != nil, "Cache evicted recently used identity")
+
+        let correctFeature = SGNativeCandidate(videoID: "9_jLl-ruToA", title: "200 MPH FT Diplo (feat. Diplo)", artists: ["Bad Bunny"], seconds: 171, audioTrack: true)
+        let searchLog = NativeAudioSmokeLog()
+        let fallback = try await SGNativeResolverEngine.candidates(featured) { query in
+            await searchLog.search(query)
+            return query.hasSuffix("Bad Bunny") ? [correctFeature] : [first]
+        }
+        require(fallback.first?.videoID == correctFeature.videoID, "Primary-artist fallback missed verified match")
+        require(await searchLog.queries == ["200 Mph Bad Bunny, Diplo", "200 Mph Bad Bunny"], "Fallback searched redundantly or changed title")
+        let successfulSearch = NativeAudioSmokeLog()
+        _ = try await SGNativeResolverEngine.candidates(featured) { query in
+            await successfulSearch.search(query); return [correctFeature]
+        }
+        require(await successfulSearch.queries.count == 1, "Successful initial search triggered fallback")
+        let singleSearch = NativeAudioSmokeLog()
+        _ = try await SGNativeResolverEngine.candidates(track) { query in
+            await singleSearch.search(query); return []
+        }
+        require(await singleSearch.queries.count == 1, "Identical primary-artist query was repeated")
+
+        let reuseCache = SGNativeCandidateCache()
+        let reuseLog = NativeAudioSmokeLog()
+        let search: SGNativeResolverEngine.Search = { query in await reuseLog.search(query); return [first] }
+        let extract: SGNativeResolverEngine.Extract = { candidate in
+            let generation = await reuseLog.extract(candidate.videoID)
+            return ["sourceID": candidate.videoID, "url": "https://example.invalid/audio-\(generation)"]
+        }
+        let once = try await SGNativeResolverEngine.resolve(row, sourceURL: nil, cache: reuseCache, searcher: search, extractor: extract)
+        let twice = try await SGNativeResolverEngine.resolve(row, sourceURL: nil, cache: reuseCache, searcher: search, extractor: extract)
+        require(await reuseLog.queries.count == 1, "Verified identity did not skip repeated catalogue search")
+        require(await reuseLog.extracted.count == 2, "Resolver reused an expiring audio URL")
+        require(once["url"] as? String != twice["url"] as? String, "Second download did not get fresh URL")
+
+        let replacementLog = NativeAudioSmokeLog()
+        let replaced = try await SGNativeResolverEngine.resolve(row, sourceURL: nil, cache: reuseCache, searcher: { query in
+            await replacementLog.search(query); return [first, alternative]
+        }, extractor: { candidate in
+            _ = await replacementLog.extract(candidate.videoID)
+            if candidate.videoID == first.videoID { throw SGNativeFailure.http(404) }
+            return ["sourceID": candidate.videoID]
+        })
+        require(replaced["sourceID"] as? String == alternative.videoID, "Disappeared cached source did not recover")
+        require(await replacementLog.extracted == [first.videoID, alternative.videoID], "Unavailable cached identity was retried redundantly")
+        require(await reuseCache.candidate(for: track)?.videoID == alternative.videoID, "Recovered identity did not replace stale cache")
+
+        let refusedLog = NativeAudioSmokeLog()
+        do {
+            _ = try await SGNativeResolverEngine.resolve(row, sourceURL: nil, cache: SGNativeCandidateCache(), searcher: { query in
+                await refusedLog.search(query); return [first, alternative]
+            }, extractor: { candidate in
+                _ = await refusedLog.extract(candidate.videoID)
+                throw NSError(domain: "spoti.nativeAudio.player", code: 24, userInfo: ["sourceStatus": "LOGIN_REQUIRED:Sign in to confirm you are not a bot"])
+            })
+            fatalError("Refused source reported success")
+        } catch { require((error as NSError).code == 33, "Source refusal was not actionable") }
+        require(await refusedLog.extracted.count == 1, "Source refusal retried another recording unnecessarily")
+        require(SGNativeFailure.localized(URLError(.notConnectedToInternet)).code == 30, "Offline error not distinguished")
+        require(SGNativeFailure.localized(URLError(.timedOut)).code == 31, "Unreachable source not distinguished")
+        require(SGNativeFailure.http(429).code == 32, "Rate limit not distinguished")
+        require(SGNativeFailure.http(503).code == 34, "Temporary source outage not distinguished")
+        let unknown = SGNativeFailure.localized(NSError(domain: "test", code: 1, userInfo: [NSLocalizedDescriptionKey: "https://example.invalid/private-url"]))
+        require(!unknown.localizedDescription.contains("private-url"), "Failure text leaked request details")
+
+        let cancelled = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            _ = try await SGNativeResolverEngine.candidates(track) { _ in
+                fatalError("Cancelled search contacted source")
+            }
+        }
+        do { try await cancelled.value; fatalError("Cancelled lookup reported success") }
+        catch { require(error is CancellationError, "Cancellation lost its identity") }
+        let paused: Bool = await withCheckedContinuation { continuation in
+            DispatchQueue.main.async {
+                let request = SGNativeAudioRequest()
+                request.finish(["success": true], error: nil) { result, error in
+                    continuation.resume(returning: result == nil && error?.code == NSURLErrorCancelled)
+                }
+                request.cancel()
+                request.finish(["success": true], error: nil) { _, _ in fatalError("Completion delivered twice") }
+            }
+        }
+        require(paused, "Queued success survived cancellation")
     }
     static func main() async throws {
         let expected: [String: Any] = ["expectedTitle": "Bandolero", "expectedArtist": "Moha La Squale", "expectedSeconds": 185.88]
@@ -63,7 +173,8 @@ import Darwin
             let unlinkedGuest = results.first { $0.videoID == "XsgzVmsz4Q0" }
             require(unlinkedGuest?.artists == ["Aries", "Arjan"], "Unlinked guest missing or album/duration parsed as artist")
         }
-        print("Native source URL, identity, duration, variant and resource checks passed.")
+        try await checkResolverReuse(expected, featured: featured)
+        print("Native source identity, cache expiry, fresh streams, fallback search, cancellation and failure checks passed.")
         guard CommandLine.arguments.contains("--live") else { return }
         let result: [String: Any]
         do {
