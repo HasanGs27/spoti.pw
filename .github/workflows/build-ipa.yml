@@ -17,7 +17,10 @@ on:
     branches:
       - HasanGs27-patch-1
     paths:
-      - "tweak/Sources/Features/NowPlaying/AlbumAnimatedArtworkFallback.x"
+      - "tweak/Sources/Features/NowPlaying/**"
+      - "scripts/pipeline.sh"
+      - "docs/app-icon.jpg"
+      - ".github/workflows/build-ipa.yml"
 
 env:
   THEOS: ${{ github.workspace }}/theos
@@ -46,7 +49,7 @@ jobs:
       - name: Install tools
         run: |
           brew install make dpkg ldid
-          python3 -m pip install --break-system-packages git+https://github.com/asdfzxcvbn/pyzule-rw.git
+          python3 -m pip install --break-system-packages Pillow git+https://github.com/asdfzxcvbn/pyzule-rw.git
 
       - name: Download IPA
         run: |
@@ -58,7 +61,10 @@ jobs:
           esac
 
       - name: Build IPA
-        run: make release
+        env:
+          CYAN_PYTHON: python3
+        # Explicit bash also works if a phone upload loses pipeline.sh's executable bit.
+        run: bash scripts/pipeline.sh ipa/spotify.ipa --no-flex
 
       - uses: actions/upload-artifact@v5
         if: github.event_name == 'push' || inputs.upload_method != 'filebin'
