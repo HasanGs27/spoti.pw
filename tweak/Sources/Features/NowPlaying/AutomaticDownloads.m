@@ -385,7 +385,7 @@ static void tell(NSString *message) {
     NSUInteger generation = ++self.generation;
     [self.active cancel];
     [self update:@"Arrêt du transfert iPhone…"];
-    dispatch_async(self.worker, ^{ [self finish:@"Transfert iPhone arrêté. Le PC poursuit la préparation ; Reprendre récupérera la suite." generation:generation]; });
+    dispatch_async(self.worker, ^{ [self finish:@"Transfert arrêté. Les fichiers déjà enregistrés sont conservés." generation:generation]; });
 }
 - (void)play:(NSUInteger)position {
     NSArray *rows = self.job[@"items"];

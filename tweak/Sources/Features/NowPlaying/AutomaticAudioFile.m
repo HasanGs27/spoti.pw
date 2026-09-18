@@ -31,7 +31,12 @@ NSDictionary *SGAutomaticInstallAudio(NSURL *staging, NSDictionary *requested, N
     BOOL mp3 = !memcmp(bytes, "ID3", 3) || (bytes[0] == 0xff && (bytes[1] & 0xe0) == 0xe0);
     BOOL m4a = !memcmp(bytes + 4, "ftyp", 4);
     if (!mp3 && !m4a) return failure(reason, @"Ce lien ne fournit pas un MP3 ou un M4A. Choisis le fichier audio, pas la page du site.");
-    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:staging options:nil];
+    // CDN links often have no extension; give AVFoundation the detected format, not the URL's suffix.
+    NSURL *probe = [staging.URLByDeletingLastPathComponent URLByAppendingPathComponent:
+        [NSUUID.UUID.UUIDString stringByAppendingPathExtension:mp3 ? @"mp3" : @"m4a"]];
+    if (![fm linkItemAtURL:staging toURL:probe error:nil]) return failure(reason, @"Impossible de préparer la vérification du fichier.");
+    @try {
+    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:probe options:nil];
     double seconds = CMTimeGetSeconds(asset.duration);
     if (!asset.playable || ![asset tracksWithMediaType:AVMediaTypeAudio].count ||
         [asset tracksWithMediaType:AVMediaTypeVideo].count || !isfinite(seconds) || seconds < 1)
@@ -97,6 +102,9 @@ NSDictionary *SGAutomaticInstallAudio(NSURL *staging, NSDictionary *requested, N
     [fm setAttributes:@{NSFileProtectionKey:NSFileProtectionCompleteUntilFirstUserAuthentication} ofItemAtPath:target.path error:nil];
     return @{@"position":requested[@"position"], @"spotify":SGAutomaticSpotifyURL(requested[@"spotify"]), @"state":@"ready",
         @"id":hash, @"bytes":@(data.length), @"seconds":@(seconds), @"title":title, @"artist":artist, @"album":album, @"extension":ext};
+    } @finally {
+        [fm removeItemAtURL:probe error:nil];
+    }
 }
 #pragma clang diagnostic pop
 
@@ -127,7 +135,7 @@ int main(void) { @autoreleasepool {
     assert([again[@"id"] isEqual:row[@"id"]]);
     [fm removeItemAtURL:duplicate error:nil]; [fm removeItemAtURL:target error:nil];
     NSData *m4a = [[NSData alloc] initWithBase64EncodedString:m4aFixture options:0];
-    source = testInput(m4a, @"m4a"); row = SGAutomaticInstallAudio(source, request, &reason);
+    source = testInput(m4a, @"download"); row = SGAutomaticInstallAudio(source, request, &reason);
     if (!row) NSLog(@"M4A import failed: %@", reason);
     assert(row && [row[@"extension"] isEqual:@"m4a"]);
     target = [[docs URLByAppendingPathComponent:@"Spoti Downloads"] URLByAppendingPathComponent:[row[@"id"] stringByAppendingPathExtension:@"m4a"]];
