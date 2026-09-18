@@ -38,7 +38,11 @@ static BOOL customButton(id button) {
 - (void)performAction {
     if (customButton(self)) return;
     sg_downloadTapDepth++;
-    @try { %orig; } @finally { sg_downloadTapDepth--; }
+    @try {
+        %orig;
+    } @finally {
+        sg_downloadTapDepth--;
+    }
 }
 %end
 
@@ -46,7 +50,11 @@ static BOOL customButton(id button) {
 - (void)performAction {
     if (customButton(self)) return;
     sg_downloadTapDepth++;
-    @try { %orig; } @finally { sg_downloadTapDepth--; }
+    @try {
+        %orig;
+    } @finally {
+        sg_downloadTapDepth--;
+    }
 }
 %end
 

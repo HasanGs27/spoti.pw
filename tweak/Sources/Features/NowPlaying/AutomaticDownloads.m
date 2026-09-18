@@ -317,6 +317,8 @@ static void tell(NSString *message) {
 @interface SGAutomaticDownloadsPage : SGPage
 @property (nonatomic, strong) UIView *note;
 @property (nonatomic, copy) NSArray *historyURLs;
+@property (nonatomic, copy) NSDictionary *displayJob;
+@property (nonatomic, copy) NSDictionary *displayHistory;
 @end
 @implementation SGAutomaticDownloadsPage
 - (instancetype)init { if ((self = [super initWithStyle:UITableViewStyleInsetGrouped])) self.title = @"Téléchargements automatiques"; return self; }
@@ -328,18 +330,24 @@ static void tell(NSString *message) {
     [self refresh:nil];
 }
 - (void)dealloc { [NSNotificationCenter.defaultCenter removeObserver:self]; }
-- (void)refresh:(NSNotification *)note { self.historyURLs = [SGAutomaticDownloads.shared.history.allKeys sortedArrayUsingSelector:@selector(compare:)]; [self.tableView reloadData]; }
+- (void)refresh:(NSNotification *)note {
+    // A coherent main-thread snapshot prevents row counts changing underneath table callbacks.
+    self.displayJob = SGAutomaticDownloads.shared.job;
+    self.displayHistory = SGAutomaticDownloads.shared.history;
+    self.historyURLs = [self.displayHistory.allKeys sortedArrayUsingSelector:@selector(compare:)];
+    [self.tableView reloadData];
+}
 - (void)viewWillLayoutSubviews { [super viewWillLayoutSubviews]; SGFitNote(self.tableView, self.note, 16, 16); }
 - (void)viewDidLayoutSubviews { [super viewDidLayoutSubviews]; SGInsetForBars(self.tableView); }
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)table { return 3; }
 - (NSInteger)tableView:(UITableView *)table numberOfRowsInSection:(NSInteger)section {
-    return section == 0 ? 5 : section == 1 ? [SGAutomaticDownloads.shared.job[@"items"] count] : self.historyURLs.count;
+    return section == 0 ? 5 : section == 1 ? [self.displayJob[@"items"] count] : self.historyURLs.count;
 }
 - (NSString *)tableView:(UITableView *)table titleForHeaderInSection:(NSInteger)section {
-    return section == 1 ? (SGAutomaticDownloads.shared.job[@"name"] ?: @"Sélection") : section == 2 ? @"Sélections enregistrées" : nil;
+    return section == 1 ? (self.displayJob[@"name"] ?: @"Sélection") : section == 2 ? @"Sélections enregistrées" : nil;
 }
 - (NSString *)tableView:(UITableView *)table titleForFooterInSection:(NSInteger)section {
-    return section == 1 ? SGAutomaticDownloads.shared.job[@"scope"] : nil;
+    return section == 1 ? self.displayJob[@"scope"] : nil;
 }
 - (CGFloat)tableView:(UITableView *)table heightForRowAtIndexPath:(NSIndexPath *)path { return path.section == 0 && path.row == 4 ? 140 : 70; }
 - (UITableViewCell *)tableView:(UITableView *)table cellForRowAtIndexPath:(NSIndexPath *)path {
@@ -349,11 +357,11 @@ static void tell(NSString *message) {
         NSArray *titles = @[@"Connecter le PC", @"Télécharger un lien", engine.busy ? @"Arrêter le transfert iPhone" : @"Reprendre le transfert", @"Réessayer cette sélection", @"État"];
         SGFillCell(cell, titles[path.row], path.row == 4 ? engine.message : nil, nil, nil);
     } else if (path.section == 1) {
-        NSDictionary *row = engine.job[@"items"][path.row];
+        NSDictionary *row = self.displayJob[@"items"][path.row];
         NSString *status = onPhone(row) ? @"Sur l’iPhone — toucher pour lire" : [row[@"state"] isEqual:@"error"] ? @"Source introuvable ou refusée" : [row[@"state"] isEqual:@"ready"] ? @"Prêt sur le PC" : @"Recherche en cours";
         SGFillCell(cell, row[@"title"], [NSString stringWithFormat:@"%@ · %@", row[@"artist"], status], nil, onPhone(row) ? @"play.circle" : @"arrow.down.circle");
     } else {
-        NSDictionary *job = engine.history[self.historyURLs[path.row]];
+        NSDictionary *job = self.displayHistory[self.historyURLs[path.row]];
         SGFillCell(cell, job[@"name"], @"Ouvrir les copies de cette sélection", nil, @"music.note.list");
     }
     cell.detailTextLabel.numberOfLines = 0;
@@ -362,10 +370,14 @@ static void tell(NSString *message) {
 - (void)tableView:(UITableView *)table didSelectRowAtIndexPath:(NSIndexPath *)path {
     [table deselectRowAtIndexPath:path animated:YES];
     SGAutomaticDownloads *engine = SGAutomaticDownloads.shared;
-    if (path.section == 1) { [engine play:path.row]; return; }
+    if (path.section == 1) {
+        if ([engine.job[@"id"] isEqual:self.displayJob[@"id"]]) [engine play:path.row];
+        else [self refresh:nil];
+        return;
+    }
     if (path.section == 2) {
         if (engine.busy) { tell(@"Arrête d’abord le transfert iPhone pour changer de sélection."); return; }
-        engine.job = engine.history[self.historyURLs[path.row]]; [self refresh:nil]; return;
+        engine.job = self.displayHistory[self.historyURLs[path.row]]; [self refresh:nil]; return;
     }
     if (path.row == 2) { if (engine.busy) [engine pause]; else [engine resume]; return; }
     if (path.row == 3) { if (engine.job && !engine.busy) [engine start:engine.job[@"url"]]; return; }
