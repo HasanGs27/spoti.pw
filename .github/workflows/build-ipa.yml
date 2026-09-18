@@ -72,16 +72,6 @@ jobs:
             tweak/Sources/Features/NowPlaying/LocalDownloadManifest.m -o "$RUNNER_TEMP/automatic-download-test"
           "$RUNNER_TEMP/automatic-download-test"
 
-      - name: Test manual audio import
-        # The native import test uses synthetic audio, not a third-party recording.
-        if: success()
-        run: |
-          clang -fobjc-arc -fblocks -framework Foundation -framework AVFoundation -framework CoreMedia -DSG_AUTOMATIC_AUDIO_TEST=1 \
-            tweak/Sources/Features/NowPlaying/AutomaticAudioFile.m \
-            tweak/Sources/Features/NowPlaying/AutomaticDownloadModel.m \
-            tweak/Sources/Features/NowPlaying/LocalDownloadManifest.m -o "$RUNNER_TEMP/manual-audio-test"
-          "$RUNNER_TEMP/manual-audio-test"
-
       - name: Test native collection metadata
         run: |
           clang -fobjc-arc -framework Foundation -DSG_NATIVE_COLLECTION_TEST=1 \
@@ -92,6 +82,15 @@ jobs:
 
       - name: Test native audio resolver
         run: bash scripts/test-native-audio.sh
+
+      - name: Test manual audio import
+        # The native import test uses synthetic audio, not a third-party recording.
+        run: |
+          clang -fobjc-arc -fblocks -framework Foundation -framework AVFoundation -framework CoreMedia -DSG_AUTOMATIC_AUDIO_TEST=1 \
+            tweak/Sources/Features/NowPlaying/AutomaticAudioFile.m \
+            tweak/Sources/Features/NowPlaying/AutomaticDownloadModel.m \
+            tweak/Sources/Features/NowPlaying/LocalDownloadManifest.m -o "$RUNNER_TEMP/manual-audio-test"
+          "$RUNNER_TEMP/manual-audio-test"
 
       - name: Download IPA
         run: |
