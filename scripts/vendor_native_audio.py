@@ -44,6 +44,14 @@ for path in sorted((source / "Sources/YouTubeKit").rglob("*.swift")):
         # responses pairs the wrong videoInfo when one client returned no streams.
         value = value.replace("let allStreamingData = try await self.streamingData", "_ = try await self.streamingData")
         value = value.replace("for (streamingData, videoInfo) in zip(allStreamingData, videoInfos) {\n                        try await process(streamingData: streamingData, videoInfo: videoInfo)\n                    }", "for videoInfo in videoInfos {\n                        if let streamingData = videoInfo.streamingData {\n                            try await process(streamingData: streamingData, videoInfo: videoInfo)\n                        }\n                    }")
+        value = value.replace("            videoInfos = videoInfos.filter { $0.videoDetails?.videoId == videoID }", """            let publicStatuses = videoInfos.map {
+                ($0.playabilityStatus?.status ?? "NO_STATUS") + ":" + String(($0.playabilityStatus?.reason ?? "").prefix(240))
+            }.joined(separator: "; ")
+            videoInfos = videoInfos.filter { $0.videoDetails?.videoId == videoID }""")
+        value = value.replace("throw errors.first ?? YouTubeKitError.extractError", """throw errors.first ?? NSError(domain: "spoti.nativeAudio.player", code: 24, userInfo: [
+                    NSLocalizedDescriptionKey: "Public source player unavailable",
+                    "sourceStatus": publicStatuses
+                ])""")
         # An audio resolver does not need an additional progressive-video request.
         value = value.replace("if !streams.contains(where: { $0.includesVideoAndAudioTrack }) {", "if !streams.contains(where: { $0.includesAudioTrack }) {")
         # Authentication/age-restricted sources remain an explicit unavailable state.

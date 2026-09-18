@@ -1,6 +1,7 @@
 // Compile together with NativeAudioResolver / NativeYouTubeLocal / Resources.
 // Default: offline deterministic checks. --live: one public song, local extraction.
 import Foundation
+import Darwin
 
 @main struct NativeAudioSmoke {
     static func require(_ condition: Bool, _ description: String) {
@@ -40,7 +41,14 @@ import Foundation
         }
         print("Native source URL, identity, duration, variant and resource checks passed.")
         guard CommandLine.arguments.contains("--live") else { return }
-        let result = try await SGNativeResolverEngine.resolve(expected, sourceURL: nil)
+        let result: [String: Any]
+        do {
+            result = try await SGNativeResolverEngine.resolve(expected, sourceURL: nil)
+        } catch {
+            let diagnostic = error as NSError
+            print("Live extraction failed: \(diagnostic.domain):\(diagnostic.code); \(diagnostic.userInfo["sourceFailure"] ?? diagnostic.localizedDescription)")
+            exit(2)
+        }
         guard let url = (result["url"] as? String).flatMap(URL.init(string:)) else { fatalError("Missing stream") }
         var request = URLRequest(url: url)
         request.setValue("bytes=0-4095", forHTTPHeaderField: "Range")
