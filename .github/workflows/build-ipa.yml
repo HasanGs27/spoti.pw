@@ -59,6 +59,12 @@ jobs:
             tweak/Sources/Features/AdBlock/Protobuf.m -o "$RUNNER_TEMP/home-order-test"
           "$RUNNER_TEMP/home-order-test"
 
+      - name: Test local download manifest
+        run: |
+          clang -fobjc-arc -framework Foundation -DSG_LOCAL_DOWNLOAD_MANIFEST_TEST=1 \
+            tweak/Sources/Features/NowPlaying/LocalDownloadManifest.m -o "$RUNNER_TEMP/local-download-test"
+          "$RUNNER_TEMP/local-download-test"
+
       - name: Download IPA
         run: |
           mkdir -p ipa
