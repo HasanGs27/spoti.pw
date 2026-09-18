@@ -103,8 +103,7 @@ static BOOL writeMP3(NSData *data, NSURL *outputURL, NSString *title, NSString *
 }
 static AVMetadataItem *metadataItem(AVMetadataIdentifier identifier, id value, NSString *type) {
     AVMutableMetadataItem *item = [AVMutableMetadataItem new];
-    // Let AVFoundation choose the container's canonical key representation. Assigning the
-    // textual four-character iTunes key can produce an export that silently omits its tags.
+    // Let AVFoundation choose the container's canonical key representation.
     item.identifier = identifier; item.value = value;
     item.dataType = type; return item;
 }
@@ -161,13 +160,11 @@ static BOOL writeM4AItems(AVURLAsset *asset, NSURL *outputURL, NSArray *metadata
 static BOOL writeM4A(AVURLAsset *asset, NSURL *outputURL, NSString *title, NSString *artist, NSString *album,
     NSData *artwork, BOOL (^cancelled)(void)) {
     NSMutableArray *metadata = [NSMutableArray array];
-    for (AVMetadataItem *item in [asset metadataForFormat:AVMetadataFormatiTunesMetadata]) {
-        if (![@[AVMetadataCommonKeyTitle, AVMetadataCommonKeyArtist, AVMetadataCommonKeyAlbumName, AVMetadataCommonKeyArtwork]
-            containsObject:item.commonKey ?: @""]) [metadata addObject:item];
-    }
+    // Materialize only the portable tags we validated. Reusing lazy source metadata and
+    // supplying an empty album can cause a successful export with no readable tags.
     [metadata addObject:metadataItem(AVMetadataIdentifieriTunesMetadataSongName, title, (__bridge NSString *)kCMMetadataBaseDataType_UTF8)];
     [metadata addObject:metadataItem(AVMetadataIdentifieriTunesMetadataArtist, artist, (__bridge NSString *)kCMMetadataBaseDataType_UTF8)];
-    [metadata addObject:metadataItem(AVMetadataIdentifieriTunesMetadataAlbum, album, (__bridge NSString *)kCMMetadataBaseDataType_UTF8)];
+    if (album.length) [metadata addObject:metadataItem(AVMetadataIdentifieriTunesMetadataAlbum, album, (__bridge NSString *)kCMMetadataBaseDataType_UTF8)];
     NSString *mime = pictureType(artwork);
     if (mime) [metadata addObject:metadataItem(AVMetadataIdentifieriTunesMetadataCoverArt, artwork,
         (__bridge NSString *)([mime isEqual:@"image/png"] ? kCMMetadataBaseDataType_PNG : kCMMetadataBaseDataType_JPEG))];
@@ -403,6 +400,13 @@ int main(void) { @autoreleasepool {
     for (AVMetadataItem *metadata in withCover.commonMetadata)
         if ([metadata.commonKey isEqual:AVMetadataCommonKeyArtwork]) foundCover |= [metadata.dataValue isEqual:catalogue[@"artworkData"]];
     assert(foundCover);
+    NSURL *withAlbumURL = temporarySibling(target, @"m4a");
+    assert(writeM4A(withCover, withAlbumURL, catalogue[@"expectedTitle"], catalogue[@"expectedArtist"], @"Synthetic album", catalogue[@"artworkData"], nil));
+    AVURLAsset *withAlbum = [AVURLAsset URLAssetWithURL:withAlbumURL options:nil]; BOOL foundAlbum = NO;
+    for (AVMetadataItem *metadata in withAlbum.commonMetadata)
+        if ([metadata.commonKey isEqual:AVMetadataCommonKeyAlbumName]) foundAlbum |= [metadata.stringValue isEqual:@"Synthetic album"];
+    assert(foundAlbum && [originalPackets isEqual:compressedAudio(withAlbumURL)]);
+    [fm removeItemAtURL:withAlbumURL error:nil];
     [fm removeItemAtURL:before error:nil]; [fm removeItemAtURL:source error:nil]; [fm removeItemAtURL:target error:nil];
     source = testInput(raw, @"mp3");
     assert(!SGAutomaticInstallAudioCancellable(source, request, ^BOOL { return YES; }, &reason));
