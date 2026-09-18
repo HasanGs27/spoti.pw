@@ -1,0 +1,7 @@
+spotdl==4.5.2
+ytmusicapi==1.12.3
+yt-dlp==2026.8.19
+requests==2.34.2
+beautifulsoup4==4.15.0
+mutagen==1.48.1
+Pillow==12.3.0
