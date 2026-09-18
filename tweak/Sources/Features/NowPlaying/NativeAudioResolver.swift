@@ -212,6 +212,9 @@ enum SGNativeResolverEngine {
                 // Keep diagnostics free of ephemeral stream URLs or webpage data.
                 let value = error as NSError
                 lastFailure = "\(value.domain):\(value.code)"
+                if value.domain == "spoti.nativeAudio.player", let status = value.userInfo["sourceStatus"] as? String {
+                    lastFailure! += ":\(status)"
+                }
             }
         }
         throw NSError(domain: "spoti.nativeAudio", code: 23, userInfo: [

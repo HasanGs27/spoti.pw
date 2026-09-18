@@ -3420,10 +3420,16 @@ public class YouTube {
             for (i, videoInfo) in videoInfos.enumerated() where videoInfo.videoDetails?.videoId != videoID {
                 os_log("Skipping player response from client %{public}i. Got player response for %{public}@ instead of %{public}@", log: log, type: .info, i, videoInfo.videoDetails?.videoId ?? "nil", videoID)
             }
+            let publicStatuses = videoInfos.map {
+                ($0.playabilityStatus?.status ?? "NO_STATUS") + ":" + String(($0.playabilityStatus?.reason ?? "").prefix(240))
+            }.joined(separator: "; ")
             videoInfos = videoInfos.filter { $0.videoDetails?.videoId == videoID }
 
             if videoInfos.isEmpty {
-                throw errors.first ?? YouTubeKitError.extractError
+                throw errors.first ?? NSError(domain: "spoti.nativeAudio.player", code: 24, userInfo: [
+                    NSLocalizedDescriptionKey: "Public source player unavailable",
+                    "sourceStatus": publicStatuses
+                ])
             }
 
             _videoInfos = videoInfos

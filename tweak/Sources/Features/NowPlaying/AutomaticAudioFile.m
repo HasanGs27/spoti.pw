@@ -101,9 +101,11 @@ static BOOL writeMP3(NSData *data, NSURL *outputURL, NSString *title, NSString *
     [output close];
     return ok;
 }
-static AVMetadataItem *metadataItem(NSString *key, id value, NSString *type) {
+static AVMetadataItem *metadataItem(AVMetadataIdentifier identifier, id value, NSString *type) {
     AVMutableMetadataItem *item = [AVMutableMetadataItem new];
-    item.keySpace = AVMetadataKeySpaceiTunes; item.key = key; item.value = value;
+    // Let AVFoundation choose the container's canonical key representation. Assigning the
+    // textual four-character iTunes key can produce an export that silently omits its tags.
+    item.identifier = identifier; item.value = value;
     item.dataType = type; return item;
 }
 #pragma clang diagnostic push
@@ -144,11 +146,11 @@ static BOOL writeM4A(AVURLAsset *asset, NSURL *outputURL, NSString *title, NSStr
         if (![@[AVMetadataCommonKeyTitle, AVMetadataCommonKeyArtist, AVMetadataCommonKeyAlbumName, AVMetadataCommonKeyArtwork]
             containsObject:item.commonKey ?: @""]) [metadata addObject:item];
     }
-    [metadata addObject:metadataItem(AVMetadataiTunesMetadataKeySongName, title, (__bridge NSString *)kCMMetadataBaseDataType_UTF8)];
-    [metadata addObject:metadataItem(AVMetadataiTunesMetadataKeyArtist, artist, (__bridge NSString *)kCMMetadataBaseDataType_UTF8)];
-    [metadata addObject:metadataItem(AVMetadataiTunesMetadataKeyAlbum, album, (__bridge NSString *)kCMMetadataBaseDataType_UTF8)];
+    [metadata addObject:metadataItem(AVMetadataIdentifieriTunesMetadataSongName, title, (__bridge NSString *)kCMMetadataBaseDataType_UTF8)];
+    [metadata addObject:metadataItem(AVMetadataIdentifieriTunesMetadataArtist, artist, (__bridge NSString *)kCMMetadataBaseDataType_UTF8)];
+    [metadata addObject:metadataItem(AVMetadataIdentifieriTunesMetadataAlbum, album, (__bridge NSString *)kCMMetadataBaseDataType_UTF8)];
     NSString *mime = pictureType(artwork);
-    if (mime) [metadata addObject:metadataItem(AVMetadataiTunesMetadataKeyCoverArt, artwork,
+    if (mime) [metadata addObject:metadataItem(AVMetadataIdentifieriTunesMetadataCoverArt, artwork,
         (__bridge NSString *)([mime isEqual:@"image/png"] ? kCMMetadataBaseDataType_PNG : kCMMetadataBaseDataType_JPEG))];
     export.metadata = metadata; export.outputURL = outputURL; export.outputFileType = AVFileTypeAppleM4A;
     dispatch_semaphore_t done = dispatch_semaphore_create(0);
@@ -236,8 +238,19 @@ NSDictionary *SGAutomaticInstallAudioCancellable(NSURL *staging, NSDictionary *r
                 if ([item.commonKey isEqual:AVMetadataCommonKeyTitle]) foundTitle |= [item.stringValue isEqual:title];
                 if ([item.commonKey isEqual:AVMetadataCommonKeyArtist]) foundArtist |= [item.stringValue isEqual:artist];
             }
-            if (!check.playable || !isfinite(duration) || fabs(duration - seconds) > 0.5 || !foundTitle || !foundArtist)
+            if (!check.playable || !isfinite(duration) || fabs(duration - seconds) > 0.5 || !foundTitle || !foundArtist) {
+#ifdef SG_AUTOMATIC_AUDIO_TEST
+                NSLog(@"Retag validation: playable=%d duration=%.6f original=%.6f title=%d artist=%d formats=%@",
+                    check.playable, duration, seconds, foundTitle, foundArtist, check.availableMetadataFormats);
+                for (NSString *format in check.availableMetadataFormats)
+                    for (AVMetadataItem *item in [check metadataForFormat:format])
+                        NSLog(@"Retag metadata: id=%@ key=%@ (%@) common=%@ type=%@ value=%@ bytes=%lu",
+                            item.identifier, item.key, [item.key class], item.commonKey, item.dataType,
+                            [item.commonKey isEqual:AVMetadataCommonKeyArtwork] ? @"<artwork>" : item.stringValue,
+                            (unsigned long)item.dataValue.length);
+#endif
                 return failure(reason, @"Les informations audio n'ont pas pu être vérifiées après l'import.");
+            }
         }
         NSNumber *preparedSize = nil; [prepared getResourceValue:&preparedSize forKey:NSURLFileSizeKey error:nil];
         if (preparedSize.unsignedLongLongValue < 1024 || preparedSize.unsignedLongLongValue > audioLimit)
