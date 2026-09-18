@@ -112,7 +112,7 @@ UIViewController *SGNowPlayingSettingsPage(void) {
     return [[SGModPage alloc] initWithTitle:@"Player" intro:@"Changes apply after you restart Spotify. Gestures and Blocked artists apply straight away." sections:@[
         SGSection(nil, @[
             SGWithSymbol(SGPageRow(@"Téléchargements automatiques", ^UIViewController *{ return SGAutomaticDownloadsPageCreate(); }), @"arrow.down.circle.fill"),
-            SGOptionRow(@"Flèche : téléchargement via le PC", @"Utilise le PC associé pour préparer les copies locales", @"SGAutomaticDownloadsEnabled"),
+            SGOptionRow(@"Flèche : téléchargements locaux", @"Prépare et vérifie les copies sur cet iPhone", @"SGAutomaticDownloadsEnabled"),
             SGWithSymbol(SGPageRow(@"Importer des fichiers existants", ^UIViewController *{ return SGLocalDownloadsPageCreate(); }), @"folder"),
             SGWithSymbol(SGActionRow(@"Vitesse native — test", @"Propose uniquement les vitesses autorisées par Spotify pour la lecture actuelle", ^{ SGPresentNativeSpeedTest(); }), @"speedometer"),
             SGWithSymbol(SGPageRow(@"Gestures", ^UIViewController *{ return SGGesturesSettingsPage(); }), @"hand.tap"),

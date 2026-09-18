@@ -1,40 +1,25 @@
 // Only an explicit download-button action can start the custom queue.
-// Unknown page, podcast, album, or unpaired mode: retain the native action.
+// Unknown page, podcast, album, or disabled mode: retain the native action.
 #import "AutomaticDownloads.h"
 #import "AutomaticDownloadModel.h"
+#import "NativeDownloadPresentation.h"
 #import "Core/SGCore.h"
 #import "Settings/SGPageStyle.h"
 #import <objc/message.h>
 
 static __thread NSUInteger sg_downloadTapDepth;
 
-static id objectGetter(id object, NSString *name) {
-    SEL selector = NSSelectorFromString(name);
-    NSMethodSignature *signature = [object methodSignatureForSelector:selector];
-    if (!signature || signature.numberOfArguments != 2 || signature.methodReturnType[0] != '@') return nil;
-    return ((id (*)(id, SEL))objc_msgSend)(object, selector);
-}
 static BOOL customButton(id button) {
-    if (![NSUserDefaults.standardUserDefaults boolForKey:@"SGAutomaticDownloadsEnabled"]) return NO;
-    id candidate = objectGetter(button, @"uiView");
-    if (![candidate isKindOfClass:UIView.class]) return NO;
-    UIView *view = candidate;
-    // Read the page owning this button, never the currently playing song or an unrelated tab.
-    UIResponder *responder = view;
-    for (NSUInteger depth = 0; responder && depth < 24; depth++, responder = responder.nextResponder) {
-        if (![responder isKindOfClass:UIViewController.class]) continue;
-        NSString *url = SGAutomaticSpotifyURL(objectGetter(responder, @"spt_pageURI"));
-        if (!url) url = SGAutomaticSpotifyURL(objectGetter(responder, @"pageURI"));
-        if (url) {
-            SGLog(@"[SGAutoDownloads] download button resolved page=%@", url);
-            return SGAutomaticDownloadEntity(url, view);
-        }
-    }
-    SGLog(@"[SGAutoDownloads] download button page unresolved; native action retained");
-    return NO;
+    if (!SGAutomaticDownloadIsEnabled()) return NO;
+    return SGNativeDownloadActivateWrapper(button);
 }
 
 %hook _TtCOOOE32EncoreConsumerMobile_ElementsKitO19LegacyUI_ECMCoreKit10Components22GranularDownloadButton2UI7Private22GranularDownloadButton
+- (id)uiView {
+    id view = %orig;
+    SGNativeDownloadRegisterView(view);
+    return view;
+}
 - (void)performAction {
     if (customButton(self)) return;
     sg_downloadTapDepth++;
@@ -47,6 +32,11 @@ static BOOL customButton(id button) {
 %end
 
 %hook _TtC28EncoreConsumerMobile_BaseKitP33_B18AD9CFD34D2E2EF5BE4AC1DDAEB28B14DownloadButton
+- (id)uiView {
+    id view = %orig;
+    SGNativeDownloadRegisterView(view);
+    return view;
+}
 - (void)performAction {
     if (customButton(self)) return;
     sg_downloadTapDepth++;
@@ -58,13 +48,55 @@ static BOOL customButton(id button) {
 }
 %end
 
+// These exact hosts exist in the inspected IPA. Scanning only their loaded views
+// catches Swift closure-based buttons that never call the ObjC performAction bridge.
+%hook _TtC35ListUXPlatform_FreeTierPlaylistImpl17FTPViewController
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+    SGNativeDownloadRefreshPage(self);
+}
+- (void)viewWillLayoutSubviews {
+    %orig;
+    SGNativeDownloadRefreshPage(self);
+}
+%end
+
+%hook _TtC33Navigation_PageAPIIntegrationImpl35IdentifiedPageHostingViewController
+- (void)setCurrentPageController:(id)controller {
+    %orig;
+    SGNativeDownloadRefreshPage(self);
+}
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+    SGNativeDownloadRefreshPage(self);
+}
+- (void)viewDidLayoutSubviews {
+    %orig;
+    SGNativeDownloadRefreshPage(self);
+}
+%end
+
+%hook SPTHubViewController
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+    SGNativeDownloadRefreshPage(self);
+}
+- (void)headerView:(id)header componentViewWillAppear:(id)component {
+    %orig;
+    SGNativeDownloadRefreshPage(self);
+}
+%end
+
 %hook SPTOfflineManagerImplementation
 - (void)makeEntityAvailableOfflineWithURL:(id)url {
     if (sg_downloadTapDepth && SGAutomaticDownloadEntity(url, nil)) return;
     %orig;
 }
 - (void)makeEntityAvailableOfflineWithURL:(id)url trackURLs:(id)tracks {
-    if (sg_downloadTapDepth && SGAutomaticDownloadEntity(url, nil)) return;
+    if (sg_downloadTapDepth) {
+        SGAutomaticDownloadRegisterTracks(url, tracks);
+        if (SGAutomaticDownloadEntity(url, nil)) return;
+    }
     %orig;
 }
 %end
