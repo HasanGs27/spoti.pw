@@ -1,6 +1,7 @@
 // Foreground automatic preparation on a paired PC, followed by verified local import.
 #import "AutomaticDownloads.h"
 #import "AutomaticDownloadModel.h"
+#import "AutomaticAudioFile.h"
 #import "LocalDownloadManifest.h"
 #import "Core/SGCore.h"
 #import "Settings/SGPage.h"
@@ -8,6 +9,7 @@
 #import <AVFoundation/AVFoundation.h>
 #import <CommonCrypto/CommonDigest.h>
 #import <math.h>
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
 static NSString *const changed = @"SGAutomaticDownloadsChanged";
 static NSString *const pairKey = @"spotifyglass.automaticDownloads.pair";
@@ -42,7 +44,7 @@ static NSURL *downloadsDirectory(void) {
 }
 static NSURL *rowFile(NSDictionary *row) {
     if (![row[@"state"] isEqual:@"ready"]) return nil;
-    return [downloadsDirectory() URLByAppendingPathComponent:[row[@"id"] stringByAppendingString:@".mp3"]];
+    return [downloadsDirectory() URLByAppendingPathComponent:[row[@"id"] stringByAppendingPathExtension:row[@"extension"] ?: @"mp3"]];
 }
 static BOOL onPhone(NSDictionary *row) {
     NSURL *file = rowFile(row);
@@ -66,9 +68,13 @@ static void tell(NSString *message) {
 @property (atomic, copy) NSDictionary *job;
 @property (atomic, copy) NSDictionary *history;
 @property (atomic, copy) NSDictionary *pending;
+@property (atomic, copy) NSDictionary *localRows;
+@property (atomic, copy) NSDictionary *importErrors;
+@property (atomic, copy) NSString *activeSpotify;
 @property (atomic, strong) NSURL *root;
 @property (atomic, strong) NSURLSessionTask *active;
 @property (nonatomic, strong) NSURLSession *session;
+@property (nonatomic, strong) NSURLSession *audioSession;
 @property (nonatomic, strong) dispatch_queue_t worker;
 @property (nonatomic, strong) id playTask;
 + (instancetype)shared;
@@ -80,6 +86,9 @@ static void tell(NSString *message) {
 - (void)play:(NSUInteger)position;
 - (void)submitPending;
 - (void)follow:(NSDictionary *)initial root:(NSURL *)root generation:(NSUInteger)generation;
+- (void)importAudio:(NSURL *)source row:(NSDictionary *)row selection:(NSDictionary *)selection;
+- (NSDictionary *)merged:(NSDictionary *)job;
+- (void)remember:(NSDictionary *)row;
 @end
 
 @implementation SGAutomaticDownloads
@@ -98,12 +107,27 @@ static void tell(NSString *message) {
             if (job && [key isEqual:job[@"url"]]) valid[key] = job;
         }
         engine.history = valid;
+        engine.importErrors = [NSUserDefaults.standardUserDefaults dictionaryForKey:@"spotifyglass.automaticDownloads.errors"] ?: @{};
+        NSDictionary *savedLocal = [NSUserDefaults.standardUserDefaults dictionaryForKey:@"spotifyglass.automaticDownloads.localRows"];
+        NSMutableDictionary *local = [NSMutableDictionary dictionary];
+        for (NSString *key in savedLocal) {
+            NSDictionary *row = savedLocal[key];
+            NSDictionary *wrapper = @{@"version":@2, @"id":@"00000000000000000000000000000000", @"url":key,
+                @"state":@"complete", @"name":@"Local", @"message":@"", @"scope":@"", @"items":@[row]};
+            NSData *json = [NSJSONSerialization isValidJSONObject:wrapper] ? [NSJSONSerialization dataWithJSONObject:wrapper options:0 error:nil] : nil;
+            NSDictionary *parsed = SGAutomaticJob(json);
+            if (parsed && [parsed[@"items"][0][@"spotify"] isEqual:key] && onPhone(parsed[@"items"][0])) local[key] = parsed[@"items"][0];
+        }
+        engine.localRows = local;
         NSString *last = [NSUserDefaults.standardUserDefaults stringForKey:@"spotifyglass.automaticDownloads.last"];
-        engine.job = last ? valid[last] : nil;
+        engine.job = last ? [engine merged:valid[last]] : nil;
         NSURLSessionConfiguration *config = NSURLSessionConfiguration.ephemeralSessionConfiguration;
         config.timeoutIntervalForRequest = 25; config.timeoutIntervalForResource = 150;
         config.allowsCellularAccess = NO; config.URLCache = nil; config.HTTPCookieStorage = nil;
         engine.session = [NSURLSession sessionWithConfiguration:config delegate:engine delegateQueue:nil];
+        NSURLSessionConfiguration *audioConfig = [config copy];
+        audioConfig.allowsCellularAccess = YES;
+        engine.audioSession = [NSURLSession sessionWithConfiguration:audioConfig delegate:engine delegateQueue:nil];
     });
     return engine;
 }
@@ -112,6 +136,7 @@ static void tell(NSString *message) {
     dispatch_async(dispatch_get_main_queue(), ^{ [NSNotificationCenter.defaultCenter postNotificationName:changed object:self]; });
 }
 - (void)saveJob:(NSDictionary *)job {
+    job = [self merged:job];
     self.job = job;
     NSMutableDictionary *history = [self.history mutableCopy] ?: [NSMutableDictionary dictionary];
     history[job[@"url"]] = job;
@@ -119,8 +144,25 @@ static void tell(NSString *message) {
     [NSUserDefaults.standardUserDefaults setObject:history forKey:@"spotifyglass.automaticDownloads.history"];
     [NSUserDefaults.standardUserDefaults setObject:job[@"url"] forKey:@"spotifyglass.automaticDownloads.last"];
 }
+- (NSDictionary *)merged:(NSDictionary *)job {
+    NSMutableDictionary *available = [NSMutableDictionary dictionary];
+    for (NSString *key in self.localRows) if (onPhone(self.localRows[key])) available[key] = self.localRows[key];
+    return SGAutomaticMergeLocalRows(job, available);
+}
+- (void)remember:(NSDictionary *)row {
+    if (!onPhone(row)) return;
+    NSMutableDictionary *record = [row mutableCopy]; record[@"position"] = @1;
+    NSMutableDictionary *local = [self.localRows mutableCopy] ?: [NSMutableDictionary dictionary];
+    local[SGAutomaticSpotifyURL(row[@"spotify"])] = record; self.localRows = local;
+    [NSUserDefaults.standardUserDefaults setObject:local forKey:@"spotifyglass.automaticDownloads.localRows"];
+    NSMutableDictionary *errors = [self.importErrors mutableCopy]; [errors removeObjectForKey:row[@"spotify"]];
+    self.importErrors = errors; [NSUserDefaults.standardUserDefaults setObject:errors forKey:@"spotifyglass.automaticDownloads.errors"];
+}
 - (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task willPerformHTTPRedirection:(NSHTTPURLResponse *)response
-    newRequest:(NSURLRequest *)request completionHandler:(void (^)(NSURLRequest *))done { done(nil); }
+    newRequest:(NSURLRequest *)request completionHandler:(void (^)(NSURLRequest *))done {
+    // The paired PC stays on its exact endpoint. Audio sources may use an HTTPS CDN redirect.
+    done(session == self.audioSession && SGAutomaticAudioSource(request.URL.absoluteString) ? request : nil);
+}
 - (void)URLSession:(NSURLSession *)session downloadTask:(NSURLSessionDownloadTask *)task didWriteData:(int64_t)bytes
     totalBytesWritten:(int64_t)written totalBytesExpectedToWrite:(int64_t)expected {
     if (written > task.taskDescription.longLongValue || expected > task.taskDescription.longLongValue) [task cancel];
@@ -132,7 +174,8 @@ static void tell(NSString *message) {
     NSURL *staging = [cache URLByAppendingPathComponent:[NSString stringWithFormat:@"sg-auto-%@.mp3", NSUUID.UUID.UUIDString]];
     dispatch_semaphore_t done = dispatch_semaphore_create(0);
     __block BOOL copied = NO;
-    NSURLSessionDownloadTask *task = [self.session downloadTaskWithRequest:request completionHandler:^(NSURL *file, NSURLResponse *response, NSError *error) {
+    NSURLSession *session = [request.URL.scheme.lowercaseString isEqual:@"https"] ? self.audioSession : self.session;
+    NSURLSessionDownloadTask *task = [session downloadTaskWithRequest:request completionHandler:^(NSURL *file, NSURLResponse *response, NSError *error) {
         NSNumber *size = nil; [file getResourceValue:&size forKey:NSURLFileSizeKey error:nil];
         NSInteger code = [response isKindOfClass:NSHTTPURLResponse.class] ? ((NSHTTPURLResponse *)response).statusCode : 0;
         if (!error && generation == self.generation && (code == 200 || code == 202) && size.unsignedIntegerValue > 0 && size.unsignedIntegerValue <= limit)
@@ -158,6 +201,7 @@ static void tell(NSString *message) {
     dispatch_async(dispatch_get_main_queue(), ^{
         if (self.generation != generation) return;
         self.busy = NO; [self update:message];
+        self.activeSpotify = nil;
     });
 }
 - (void)connect:(NSString *)address {
@@ -242,18 +286,31 @@ static void tell(NSString *message) {
     NSDictionary *job = initial;
     NSMutableSet *checked = [NSMutableSet set];
     while (generation == self.generation) {
+        job = [self merged:job];
         [self saveJob:job];
         for (NSDictionary *row in job[@"items"]) {
             if (generation != self.generation) return;
             if (![row[@"state"] isEqual:@"ready"] || [checked containsObject:row[@"id"]]) continue;
+            self.activeSpotify = row[@"spotify"];
             [self update:[@"Enregistrement sur l’iPhone : " stringByAppendingString:row[@"title"]]];
             if (![self importRow:row root:root generation:generation]) {
+                if (generation == self.generation) {
+                    NSMutableDictionary *errors = [self.importErrors mutableCopy] ?: [NSMutableDictionary dictionary];
+                    errors[row[@"spotify"]] = @"Transfert échoué · toucher pour réessayer ou ajouter un fichier";
+                    self.importErrors = errors;
+                    [NSUserDefaults.standardUserDefaults setObject:errors forKey:@"spotifyglass.automaticDownloads.errors"];
+                }
                 [self finish:@"Transfert interrompu ou fichier invalide. Les copies terminées sont conservées ; touche Reprendre." generation:generation]; return;
             }
             [checked addObject:row[@"id"]];
+            [self remember:row];
+            self.activeSpotify = nil;
         }
         NSUInteger local = 0, failures = 0;
-        for (NSDictionary *row in job[@"items"]) { local += onPhone(row); failures += [row[@"state"] isEqual:@"error"]; }
+        for (NSDictionary *row in job[@"items"]) {
+            BOOL exists = onPhone(row); local += exists;
+            failures += !exists && ([row[@"state"] isEqual:@"error"] || self.importErrors[row[@"spotify"]] != nil);
+        }
         NSString *status = [NSString stringWithFormat:@"%lu/%lu sur l’iPhone · %lu introuvables. %@", (unsigned long)local,
             (unsigned long)[job[@"items"] count], (unsigned long)failures, job[@"message"]];
         if (![@[@"queued", @"resolving", @"running"] containsObject:job[@"state"]]) {
@@ -269,6 +326,51 @@ static void tell(NSString *message) {
         }
         job = next;
     }
+}
+- (void)importAudio:(NSURL *)source row:(NSDictionary *)row selection:(NSDictionary *)selection {
+    if (self.busy) { tell(@"Arrête le transfert en cours avant d'ajouter un fichier."); return; }
+    if (!source.isFileURL && !SGAutomaticAudioSource(source.absoluteString)) return;
+    self.busy = YES; self.activeSpotify = row[@"spotify"];
+    NSUInteger generation = ++self.generation;
+    [self update:@"Récupération du fichier audio sur l'iPhone…"];
+    dispatch_async(self.worker, ^{
+        NSURL *staging = nil;
+        NSString *reason = @"Le fichier n'a pas pu être récupéré. Vérifie le lien, la connexion et l'accès au fichier.";
+        if (source.isFileURL) {
+            BOOL scoped = [source startAccessingSecurityScopedResource];
+            NSURL *cache = [NSFileManager.defaultManager URLsForDirectory:NSCachesDirectory inDomains:NSUserDomainMask].firstObject;
+            NSURL *copy = [cache URLByAppendingPathComponent:[NSString stringWithFormat:@"sg-source-%@.%@", NSUUID.UUID.UUIDString, source.pathExtension]];
+            __block BOOL copied = NO;
+            NSFileCoordinator *coordinator = [[NSFileCoordinator alloc] initWithFilePresenter:nil];
+            [coordinator coordinateReadingItemAtURL:source options:0 error:nil byAccessor:^(NSURL *readURL) {
+                NSNumber *size = nil; [readURL getResourceValue:&size forKey:NSURLFileSizeKey error:nil];
+                if (size.unsignedLongLongValue >= 1024 && size.unsignedLongLongValue <= 100 * 1024 * 1024)
+                    copied = [NSFileManager.defaultManager copyItemAtURL:readURL toURL:copy error:nil];
+            }];
+            if (scoped) [source stopAccessingSecurityScopedResource];
+            if (copied) staging = copy;
+        } else {
+            NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:source];
+            [request setValue:@"audio/mpeg, audio/mp4, application/octet-stream;q=0.8" forHTTPHeaderField:@"Accept"];
+            staging = [self fetch:request limit:100 * 1024 * 1024 generation:generation];
+        }
+        if (generation != self.generation) {
+            if (staging) [NSFileManager.defaultManager removeItemAtURL:staging error:nil];
+            return;
+        }
+        NSDictionary *installed = staging ? SGAutomaticInstallAudio(staging, row, &reason) : nil;
+        if (staging) [NSFileManager.defaultManager removeItemAtURL:staging error:nil];
+        if (installed) {
+            [self remember:installed];
+            [self saveJob:selection];
+        } else {
+            NSMutableDictionary *errors = [self.importErrors mutableCopy] ?: [NSMutableDictionary dictionary];
+            errors[row[@"spotify"]] = reason;
+            self.importErrors = errors;
+            [NSUserDefaults.standardUserDefaults setObject:errors forKey:@"spotifyglass.automaticDownloads.errors"];
+        }
+        [self finish:installed ? @"Fichier enregistré sur l'iPhone. La flèche verte confirme la copie locale." : reason generation:generation];
+    });
 }
 - (void)resume {
     if (self.busy) return;
@@ -314,17 +416,19 @@ static void tell(NSString *message) {
 }
 @end
 
-@interface SGAutomaticDownloadsPage : SGPage
+@interface SGAutomaticDownloadsPage : SGPage <UIDocumentPickerDelegate>
 @property (nonatomic, strong) UIView *note;
 @property (nonatomic, copy) NSArray *historyURLs;
 @property (nonatomic, copy) NSDictionary *displayJob;
 @property (nonatomic, copy) NSDictionary *displayHistory;
+@property (nonatomic, copy) NSDictionary *pickedRow;
+@property (nonatomic, copy) NSDictionary *pickedSelection;
 @end
 @implementation SGAutomaticDownloadsPage
 - (instancetype)init { if ((self = [super initWithStyle:UITableViewStyleInsetGrouped])) self.title = @"Téléchargements automatiques"; return self; }
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.note = SGNote(@"Associe le PC une fois. La flèche d’une playlist lance ensuite sa recherche et son transfert. Même Wi-Fi, PC allumé, Spotify ouvert. Les titres sans source fiable restent en échec. Tes copies sont accessibles ici et dans Fichiers locaux.");
+    self.note = SGNote(@"Vert : fichier sur l'iPhone. Rouge : échec, touche le morceau pour le réparer. Tu peux ajouter un MP3/M4A depuis Fichiers ou un lien audio direct, sans PC. La recherche automatique utilise encore le PC associé. Garde Spotify ouvert pendant l'import.");
     self.tableView.tableHeaderView = self.note;
     [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(refresh:) name:changed object:SGAutomaticDownloads.shared];
     [self refresh:nil];
@@ -332,7 +436,7 @@ static void tell(NSString *message) {
 - (void)dealloc { [NSNotificationCenter.defaultCenter removeObserver:self]; }
 - (void)refresh:(NSNotification *)note {
     // A coherent main-thread snapshot prevents row counts changing underneath table callbacks.
-    self.displayJob = SGAutomaticDownloads.shared.job;
+    self.displayJob = [SGAutomaticDownloads.shared merged:SGAutomaticDownloads.shared.job];
     self.displayHistory = SGAutomaticDownloads.shared.history;
     self.historyURLs = [self.displayHistory.allKeys sortedArrayUsingSelector:@selector(compare:)];
     [self.tableView reloadData];
@@ -358,8 +462,22 @@ static void tell(NSString *message) {
         SGFillCell(cell, titles[path.row], path.row == 4 ? engine.message : nil, nil, nil);
     } else if (path.section == 1) {
         NSDictionary *row = self.displayJob[@"items"][path.row];
-        NSString *status = onPhone(row) ? @"Sur l’iPhone — toucher pour lire" : [row[@"state"] isEqual:@"error"] ? @"Source introuvable ou refusée" : [row[@"state"] isEqual:@"ready"] ? @"Prêt sur le PC" : @"Recherche en cours";
-        SGFillCell(cell, row[@"title"], [NSString stringWithFormat:@"%@ · %@", row[@"artist"], status], nil, onPhone(row) ? @"play.circle" : @"arrow.down.circle");
+        BOOL active = engine.busy && ([row[@"spotify"] isEqual:engine.activeSpotify] ||
+            ([engine.job[@"id"] isEqual:self.displayJob[@"id"]] && [row[@"state"] isEqual:@"running"]));
+        NSString *error = engine.importErrors[row[@"spotify"]];
+        NSString *state = SGAutomaticRowState(row, onPhone(row), active, error.length > 0);
+        BOOL ready = [state isEqual:@"ready"], failed = [state isEqual:@"error"], running = [state isEqual:@"running"];
+        NSString *status = ready ? @"Sur l'iPhone · toucher pour lire" : failed ? (error ?: @"Échec · toucher pour ajouter une source") :
+            running ? @"En cours…" : @"En attente · toucher pour ajouter un fichier";
+        SGFillCell(cell, row[@"title"], [NSString stringWithFormat:@"%@ · %@", row[@"artist"], status], nil, ready ? @"arrow.down.circle.fill" : @"arrow.down.circle");
+        UIListContentConfiguration *content = (UIListContentConfiguration *)cell.contentConfiguration;
+        content.imageProperties.tintColor = ready ? SGGreen() : failed ? SGRed() : SGGrey();
+        cell.contentConfiguration = content;
+        cell.accessibilityLabel = [NSString stringWithFormat:@"%@, %@", row[@"title"], status];
+        if (running) {
+            UIActivityIndicatorView *spinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
+            [spinner startAnimating]; cell.accessoryView = spinner;
+        }
     } else {
         NSDictionary *job = self.displayHistory[self.historyURLs[path.row]];
         SGFillCell(cell, job[@"name"], @"Ouvrir les copies de cette sélection", nil, @"music.note.list");
@@ -371,13 +489,17 @@ static void tell(NSString *message) {
     [table deselectRowAtIndexPath:path animated:YES];
     SGAutomaticDownloads *engine = SGAutomaticDownloads.shared;
     if (path.section == 1) {
-        if ([engine.job[@"id"] isEqual:self.displayJob[@"id"]]) [engine play:path.row];
+        if ([engine.job[@"id"] isEqual:self.displayJob[@"id"]]) {
+            NSDictionary *row = self.displayJob[@"items"][path.row];
+            if (onPhone(row)) { engine.job = self.displayJob; [engine play:path.row]; }
+            else [self repair:row selection:self.displayJob cell:[table cellForRowAtIndexPath:path]];
+        }
         else [self refresh:nil];
         return;
     }
     if (path.section == 2) {
         if (engine.busy) { tell(@"Arrête d’abord le transfert iPhone pour changer de sélection."); return; }
-        engine.job = self.displayHistory[self.historyURLs[path.row]]; [self refresh:nil]; return;
+        engine.job = [engine merged:self.displayHistory[self.historyURLs[path.row]]]; [self refresh:nil]; return;
     }
     if (path.row == 2) { if (engine.busy) [engine pause]; else [engine resume]; return; }
     if (path.row == 3) { if (engine.job && !engine.busy) [engine start:engine.job[@"url"]]; return; }
@@ -402,6 +524,51 @@ static void tell(NSString *message) {
     }]];
     [self presentViewController:alert animated:YES completion:nil];
 }
+- (void)repair:(NSDictionary *)row selection:(NSDictionary *)selection cell:(UITableViewCell *)cell {
+    SGAutomaticDownloads *engine = SGAutomaticDownloads.shared;
+    if (engine.busy) { tell(@"Arrête d'abord le transfert en cours. Les fichiers déjà enregistrés seront conservés."); return; }
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:row[@"title"]
+        message:@"Ajoute le fichier correspondant à ce morceau. La flèche passera au vert après vérification et enregistrement."
+        preferredStyle:UIAlertControllerStyleActionSheet];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Choisir un fichier audio" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        self.pickedRow = row; self.pickedSelection = selection;
+        UIDocumentPickerViewController *picker = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeAudio] asCopy:YES];
+        picker.allowsMultipleSelection = NO; picker.delegate = self;
+        [self presentViewController:picker animated:YES completion:nil];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Coller un lien audio direct" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Lien du fichier audio"
+            message:@"Colle un lien HTTPS qui télécharge un MP3 ou un M4A. Une page Spotify ou une page de convertisseur ne contient pas directement le fichier. Le réseau mobile peut être utilisé."
+            preferredStyle:UIAlertControllerStyleAlert];
+        [alert addTextFieldWithConfigurationHandler:^(UITextField *field) {
+            field.keyboardType = UIKeyboardTypeURL; field.autocapitalizationType = UITextAutocapitalizationTypeNone;
+            field.autocorrectionType = UITextAutocorrectionTypeNo; field.placeholder = @"https://…/morceau.mp3";
+        }];
+        [alert addAction:[UIAlertAction actionWithTitle:@"Annuler" style:UIAlertActionStyleCancel handler:nil]];
+        __weak UIAlertController *weak = alert;
+        [alert addAction:[UIAlertAction actionWithTitle:@"Importer" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+            NSURL *url = SGAutomaticAudioSource(weak.textFields.firstObject.text);
+            if (url) [engine importAudio:url row:row selection:selection];
+            else [engine update:@"Lien invalide : utilise l'adresse HTTPS du fichier audio, sans identifiants de connexion."];
+        }]];
+        [self presentViewController:alert animated:YES completion:nil];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Réessayer ce morceau via le PC" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        [engine start:row[@"spotify"]];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Annuler" style:UIAlertActionStyleCancel handler:nil]];
+    sheet.popoverPresentationController.sourceView = cell ?: self.view;
+    sheet.popoverPresentationController.sourceRect = cell ? cell.bounds : self.view.bounds;
+    [self presentViewController:sheet animated:YES completion:nil];
+}
+- (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
+    NSDictionary *row = self.pickedRow, *selection = self.pickedSelection;
+    self.pickedRow = nil; self.pickedSelection = nil;
+    if (urls.count == 1 && row && selection) [SGAutomaticDownloads.shared importAudio:urls.firstObject row:row selection:selection];
+}
+- (void)documentPickerWasCancelled:(UIDocumentPickerViewController *)controller {
+    self.pickedRow = nil; self.pickedSelection = nil;
+}
 @end
 
 UIViewController *SGAutomaticDownloadsPageCreate(void) { return [SGAutomaticDownloadsPage new]; }
@@ -412,7 +579,7 @@ BOOL SGAutomaticDownloadEntity(id entity, UIView *source) {
     dispatch_async(dispatch_get_main_queue(), ^{
         SGAutomaticDownloads *engine = SGAutomaticDownloads.shared;
         NSDictionary *saved = engine.history[url];
-        if (!engine.busy && saved) { engine.job = saved; [engine update:@"Sélection enregistrée. Touche un morceau pour lire, ou Reprendre pour terminer le transfert."]; }
+        if (!engine.busy && saved) { engine.job = [engine merged:saved]; [engine update:@"Sélection enregistrée. Touche une flèche rouge pour réparer un morceau."]; }
         else if (!engine.busy) [engine start:url];
         UIViewController *owner = SGTopController();
         if (![owner isKindOfClass:SGAutomaticDownloadsPage.class]) SGShowPage(owner, SGAutomaticDownloadsPageCreate());

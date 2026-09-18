@@ -47,6 +47,10 @@ NSDictionary *SGAutomaticJob(NSData *data) {
             item[key] = row[key];
         if ([row[@"state"] isEqual:@"ready"])
             for (NSString *key in @[@"id", @"bytes", @"seconds", @"album"]) item[key] = row[key];
+        if (row[@"extension"]) {
+            if (![@[@"mp3", @"m4a"] containsObject:row[@"extension"]]) return nil;
+            item[@"extension"] = row[@"extension"];
+        }
         [items addObject:item];
     }
     // Only property-list-safe validated fields enter UserDefaults. The wire object can contain JSON null.
@@ -64,6 +68,38 @@ NSString *SGAutomaticLocalURI(NSDictionary *row) {
     return [parts componentsJoinedByString:@":"];
 }
 
+NSURL *SGAutomaticAudioSource(id value) {
+    if (![value isKindOfClass:NSString.class] || [value length] > 8192) return nil;
+    NSURLComponents *url = [NSURLComponents componentsWithString:[value stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]];
+    if (![url.scheme.lowercaseString isEqual:@"https"] || !url.host.length || url.user || url.password || url.fragment) return nil;
+    // A Spotify page identifies a track, but is not an audio download.
+    if ([url.host.lowercaseString isEqual:@"open.spotify.com"] || [url.host.lowercaseString hasSuffix:@".spotify.com"]) return nil;
+    return url.URL;
+}
+
+NSDictionary *SGAutomaticMergeLocalRows(NSDictionary *job, NSDictionary *localRows) {
+    if (!job) return nil;
+    NSMutableDictionary *merged = [job mutableCopy];
+    NSMutableArray *items = [NSMutableArray array];
+    for (NSDictionary *row in job[@"items"]) {
+        NSDictionary *local = localRows[SGAutomaticSpotifyURL(row[@"spotify"])];
+        if (local && [local[@"state"] isEqual:@"ready"]) {
+            NSMutableDictionary *copy = [local mutableCopy];
+            copy[@"position"] = row[@"position"];
+            [items addObject:copy];
+        } else [items addObject:row];
+    }
+    merged[@"items"] = items;
+    return merged;
+}
+
+NSString *SGAutomaticRowState(NSDictionary *row, BOOL exists, BOOL active, BOOL failed) {
+    if (exists) return @"ready";
+    if (active) return @"running";
+    if (failed || [row[@"state"] isEqual:@"error"]) return @"error";
+    return @"waiting";
+}
+
 #ifdef SG_AUTOMATIC_DOWNLOAD_TEST
 #include <assert.h>
 static NSData *fixture(id value) { return [NSJSONSerialization dataWithJSONObject:value options:0 error:nil]; }
@@ -75,6 +111,12 @@ int main(void) { @autoreleasepool {
     NSDictionary *row = @{@"state":@"ready",@"artist":@"A+B & C",@"album":@"",@"title":@"T: X",@"seconds":@123.8};
     assert([SGAutomaticLocalURI(row) isEqual:@"spotify:local:A%2BB+%26+C::T%3A+X:123"]);
     assert(!SGAutomaticJob([@"{}" dataUsingEncoding:NSUTF8StringEncoding]));
+    assert(SGAutomaticAudioSource(@" https://example.org/download?id=123 "));
+    for (id bad in @[@"file:///song.mp3", @"javascript:alert(1)", @"http://example.org/song.mp3", @"https://user:secret@example.org/a", @"https://open.spotify.com/track/3DaGnKmAAmyZGIbC0KjmxT", NSNull.null]) assert(!SGAutomaticAudioSource(bad));
+    assert([SGAutomaticRowState(@{@"state":@"ready"}, NO, NO, NO) isEqual:@"waiting"]);
+    assert([SGAutomaticRowState(@{@"state":@"error"}, YES, NO, YES) isEqual:@"ready"]);
+    assert([SGAutomaticRowState(@{@"state":@"error"}, NO, YES, YES) isEqual:@"running"]);
+    assert([SGAutomaticRowState(@{}, NO, NO, YES) isEqual:@"error"]);
     NSMutableDictionary *item = [@{@"position":@1, @"state":@"ready", @"title":@"A", @"artist":@"B", @"album":@"",
         @"seconds":@185.8, @"bytes":@2048, @"id":[@"a" stringByPaddingToLength:64 withString:@"a" startingAtIndex:0],
         @"spotify":@"https://open.spotify.com/track/3DaGnKmAAmyZGIbC0KjmxT"} mutableCopy];
@@ -83,6 +125,13 @@ int main(void) { @autoreleasepool {
     NSDictionary *parsed = SGAutomaticJob(fixture(job));
     assert(parsed && [NSPropertyListSerialization propertyList:parsed isValidForFormat:NSPropertyListBinaryFormat_v1_0]);
     assert([SGAutomaticLocalURI(parsed[@"items"][0]) isEqual:@"spotify:local:B::A:185"]);
+    item[@"extension"] = @"m4a";
+    assert([SGAutomaticJob(fixture(job))[@"items"][0][@"extension"] isEqual:@"m4a"]);
+    item[@"extension"] = @"../mp3"; assert(!SGAutomaticJob(fixture(job))); [item removeObjectForKey:@"extension"];
+    NSMutableDictionary *repair = [item mutableCopy]; repair[@"position"] = @9; repair[@"title"] = @"Repaired";
+    NSDictionary *merged = SGAutomaticMergeLocalRows(parsed, @{item[@"spotify"]:repair});
+    assert([merged[@"items"][0][@"position"] isEqual:@1] && [merged[@"items"][0][@"title"] isEqual:@"Repaired"]);
+    assert([SGAutomaticMergeLocalRows(parsed, @{}) isEqual:parsed]);
     item[@"position"] = @1.5; assert(!SGAutomaticJob(fixture(job))); item[@"position"] = @1;
     item[@"bytes"] = @(-1); assert(!SGAutomaticJob(fixture(job))); item[@"bytes"] = @2048;
     item[@"id"] = @"../test"; assert(!SGAutomaticJob(fixture(job)));
