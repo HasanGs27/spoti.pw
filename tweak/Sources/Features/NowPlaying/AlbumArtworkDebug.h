@@ -5,7 +5,7 @@
 #define SG_ARTWORK_DEBUG 1
 #endif
 #ifndef SG_ARTWORK_DEBUG_IMAGE_PROBES
-#define SG_ARTWORK_DEBUG_IMAGE_PROBES 1
+#define SG_ARTWORK_DEBUG_IMAGE_PROBES 0
 #endif
 
 #if SG_ARTWORK_DEBUG
@@ -176,7 +176,7 @@ static void SGDebugStart(void) {
         }];
     }
     dispatch_async(dispatch_get_main_queue(), ^{
-        SGDebugLog(@"session.start", @"baseline=54d961f7b647b924a9a67f02bcc7c4490784c96d policy=v4.0.1-strict-no-square-handoff diagnostics=1 imageProbes=%d", SG_ARTWORK_DEBUG_IMAGE_PROBES);
+        SGDebugLog(@"session.start", @"baseline=54d961f7b647b924a9a67f02bcc7c4490784c96d policy=v4.0.2-validated-vertical-handoff diagnostics=1 imageProbes=%d", SG_ARTWORK_DEBUG_IMAGE_PROBES);
     });
 }
 
