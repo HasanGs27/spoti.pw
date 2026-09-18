@@ -44,6 +44,33 @@ iPhone. Les pochettes/animations existantes ne sont pas modifiées.
 
 ## Limites et contrôles
 
+### Réparer un morceau depuis l'iPhone
+
+Dans Téléchargements automatiques, une flèche rouge indique un échec. Toucher
+le morceau propose de choisir un fichier MP3/M4A dans Fichiers, de coller un
+lien HTTPS direct vers l'audio, ou de réessayer ce morceau via le PC.
+Les deux imports manuels fonctionnent sans le PC (Spotify doit rester ouvert).
+Les liens de pages Spotify, de vidéos ou de convertisseurs ne sont pas des
+liens audio directs. Une page HTML reçue est refusée avec un message explicite.
+
+Le fichier est contrôlé, puis enregistré sans réencoder l'audio. La copie
+locale est associée à l'identifiant Spotify et réutilisée après une nouvelle
+recherche, y compris dans plusieurs sélections. Vert signifie fichier présent
+sur l'iPhone ; gris signifie en attente, et le cercle animé indique une tâche
+active. Ces états concernent la page de téléchargements personnalisée ; la
+redirection du lecteur et les indicateurs dans la playlist native ne sont pas
+encore implémentés.
+
+Les métadonnées/pochettes existantes sont conservées. Un MP3 sans titre/artiste
+reçoit ceux de la sélection, sans modifier ses trames audio. Un M4A doit déjà
+contenir ces informations. L'utilisateur choisit le fichier correspondant au
+morceau ; aucune reconnaissance acoustique n'est effectuée. Un fichier sans
+pochette intégrée ne reçoit pas automatiquement une pochette.
+
+Les liens directs peuvent utiliser le réseau mobile, contrairement au service
+PC local. Les redirections restent en HTTPS ; aucun cookie Spotify ni lien
+audio saisi n'est enregistré. La limite par fichier est de 100 Mo.
+
 - Maximum 500 entrées par demande et dix demandes en préparation.
 - La page publique Spotify peut ne fournir qu'une partie d'une playlist. Le
   statut le dit explicitement et n'annonce pas que toute la playlist est disponible.
