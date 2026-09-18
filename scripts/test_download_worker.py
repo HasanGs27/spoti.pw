@@ -3,6 +3,7 @@
 Set SG_TEST_FFMPEG to run the MP3/metadata integration cases.
 """
 import io
+import asyncio
 import json
 import os
 import shlex
@@ -12,7 +13,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from PIL import Image
 from mutagen.mp3 import MP3
@@ -153,6 +154,28 @@ class FakeResponse:
 
 
 class CoverAndProgressTests(unittest.TestCase):
+    def test_windows_ffmpeg_spawns_are_hidden_and_module_local(self):
+        sync = Mock(return_value="sync child")
+        asynchronous = AsyncMock(return_value="async child")
+        module = SimpleNamespace(subprocess=SimpleNamespace(Popen=sync, PIPE=-1),
+                                 asyncio=SimpleNamespace(create_subprocess_exec=asynchronous, PIPE=-1))
+        original_popen, original_exec = subprocess.Popen, asyncio.create_subprocess_exec
+        with patch.object(worker.os, "name", "nt"), patch.object(worker.subprocess, "CREATE_NO_WINDOW", 0x08000000, create=True):
+            self.assertTrue(worker.configure_hidden_ffmpeg(module))
+            self.assertEqual(module.subprocess.Popen(["ffmpeg", "-version"], stdout=-1), "sync child")
+            self.assertEqual(asyncio.run(module.asyncio.create_subprocess_exec("ffmpeg", "-nostdin", creationflags=0x200, stdin=-1)), "async child")
+            self.assertEqual(sync.call_args.kwargs, {"stdout": -1, "creationflags": 0x08000000})
+            self.assertEqual(asynchronous.call_args.kwargs, {"stdin": -1, "creationflags": 0x08000200})
+            wrapped = module.subprocess
+            worker.configure_hidden_ffmpeg(module)
+            self.assertIs(module.subprocess, wrapped)  # Idempotent; no nested wrappers.
+        self.assertIs(subprocess.Popen, original_popen)
+        self.assertIs(asyncio.create_subprocess_exec, original_exec)
+        module = SimpleNamespace()
+        with patch.object(worker.os, "name", "posix"):
+            self.assertFalse(worker.configure_hidden_ffmpeg(module))
+        self.assertEqual(vars(module), {})
+
     def test_cover_url_and_redirect_validation_before_request(self):
         for url in ("http://i.scdn.co/image/a", "https://i.scdn.co.evil/image/a", "https://127.0.0.1/a",
                     "https://u:p@i.scdn.co/image/a", "https://i.scdn.co:80/a", None, "file:///a"):
@@ -186,6 +209,7 @@ class CoverAndProgressTests(unittest.TestCase):
             self.assertEqual(list(folder.glob("*.tmp")), [])
         secret = "https://user:password@host/private?token=private"
         for text, phase, code in (("Connection timeout "+secret, "search", "network"),
+                                  ("FFmpegError: Failed to convert "+secret, "download", "invalid_audio"),
                                   ("403 forbidden "+secret, "download", "unavailable"),
                                   ("Cannot fetch "+secret, "cover", "cover"),
                                   (secret, "metadata", "error")):
@@ -246,6 +270,30 @@ class AudioIntegrationTests(unittest.TestCase):
         worker.finish_audio(self.file, self.song, SOURCE, loader)
         loader.assert_not_called()
         self.assertEqual(before, self.encoded_audio())
+
+    @unittest.skipUnless(os.name == "nt", "Windows-specific child process regression")
+    def test_installed_spotdl_sync_and_async_ffmpeg_keep_real_exit_codes(self):
+        from spotdl.utils import ffmpeg
+        worker.configure_hidden_ffmpeg(ffmpeg)
+        self.assertIsNotNone(ffmpeg.get_ffmpeg_version(self.ffmpeg)[0])
+        sync_output = self.folder/"sync.mp3"
+        success, error = ffmpeg.convert(self.fixture, sync_output, ffmpeg=self.ffmpeg, bitrate="128k")
+        self.assertTrue(success, error)
+        self.assertAlmostEqual(MP3(sync_output).info.length, 3, delta=.1)
+        async_output = self.folder/"async.mp3"
+        success, error = asyncio.run(ffmpeg.async_convert(self.fixture, async_output, ffmpeg=self.ffmpeg, bitrate="128k"))
+        self.assertTrue(success, error)
+        self.assertAlmostEqual(MP3(async_output).info.length, 3, delta=.1)
+        success, error = asyncio.run(ffmpeg.async_convert(self.folder/"absent.webm", self.folder/"bad.mp3", ffmpeg=self.ffmpeg))
+        self.assertFalse(success)
+        self.assertNotEqual(error["return_code"], 0)
+        self.assertIn("-nostdin", error["arguments"])
+        interrupted = SimpleNamespace(returncode=0xC000013A,
+            communicate=AsyncMock(return_value=(b"received signal 15", None)))
+        with patch.object(ffmpeg.asyncio, "create_subprocess_exec", AsyncMock(return_value=interrupted)), patch.object(ffmpeg, "get_ffmpeg_version", return_value=(7.1, 2024)):
+            success, error = asyncio.run(ffmpeg.async_convert(self.fixture, self.folder/"interrupted.mp3", ffmpeg=self.ffmpeg))
+        self.assertFalse(success)
+        self.assertEqual(error["return_code"], 0xC000013A)  # Never accept the real failure as success.
 
     def test_failed_cover_keeps_audio_and_identity_bound_retry(self):
         before = self.file.read_bytes()

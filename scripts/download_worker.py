@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import unicodedata
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import parse_qs, urljoin, urlsplit
 
 
@@ -142,6 +143,8 @@ def failure_for(error, phase=None):
         return error
     # Classify upstream errors without exposing signed URLs or raw traces.
     detail = (type(error).__name__ + " " + str(error)).casefold()
+    if "ffmpegerror" in detail or "failed to convert" in detail:
+        return WorkerFailure("invalid_audio", "La conversion audio a échoué sur le PC. Réessaye la préparation.")
     if phase == "cover":
         return WorkerFailure("cover", "Pochette indisponible. L’audio est conservé ; réessaye pour ajouter l’image.")
     if any(s in detail for s in ("timeout", "timed out", "connection", "network", "resolve", "dns", "réseau", "connexion")):
@@ -198,6 +201,38 @@ def downloader_arguments():
         except (OSError, subprocess.SubprocessError):
             pass
     return shlex.join(args)
+
+
+def configure_hidden_ffmpeg(ffmpeg_module=None):
+    """Keep SpotDL's FFmpeg children windowless, including its async Windows path.
+
+    SpotDL 4.5.2 launches version checks/convert with subprocess.Popen and
+    async_convert with asyncio.create_subprocess_exec. Only those module-local
+    references change; process execution elsewhere and exit-code checks stay intact.
+    Its argument builder already includes -nostdin for every conversion.
+    """
+    if os.name != "nt":
+        return False
+    if ffmpeg_module is None:
+        from spotdl.utils import ffmpeg as ffmpeg_module
+    if getattr(ffmpeg_module, "_sg_windowless", False):
+        return True
+    original_subprocess = ffmpeg_module.subprocess
+    original_asyncio = ffmpeg_module.asyncio
+    flag = subprocess.CREATE_NO_WINDOW
+
+    def hidden_popen(*args, **kwargs):
+        kwargs["creationflags"] = kwargs.get("creationflags", 0) | flag
+        return original_subprocess.Popen(*args, **kwargs)
+
+    async def hidden_exec(*args, **kwargs):
+        kwargs["creationflags"] = kwargs.get("creationflags", 0) | flag
+        return await original_asyncio.create_subprocess_exec(*args, **kwargs)
+
+    ffmpeg_module.subprocess = SimpleNamespace(**(vars(original_subprocess) | {"Popen": hidden_popen}))
+    ffmpeg_module.asyncio = SimpleNamespace(**(vars(original_asyncio) | {"create_subprocess_exec": hidden_exec}))
+    ffmpeg_module._sg_windowless = True
+    return True
 
 
 MAX_COVER_BYTES = 8 * 1024 * 1024
@@ -337,6 +372,7 @@ def prepare(args, folder, progress):
     from spotdl.download.downloader import Downloader
     from spotdl.providers.audio.ytmusic import YouTubeMusic
     from ytmusicapi import YTMusic
+    configure_hidden_ffmpeg()
     progress.set("metadata")
     url = canonical(args.url)
     data = entity(url)
