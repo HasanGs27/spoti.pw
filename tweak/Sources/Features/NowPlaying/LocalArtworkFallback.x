@@ -103,7 +103,11 @@ static void localRemoveFullOverlay(void) {
 // Keep one viewport overlay above reused cells during local-to-local switches.
 // Queued cells are never changed. Returning to a non-local track removes it.
 static void localApplyFullPlayer(UIScrollView *list) {
-    if (!list.window || !sg_localImage || ![sg_localURI hasPrefix:@"spotify:local:"]) {
+    if (!list) return;
+    // An old detached carousel must not steal the visible player's overlay.
+    if (!list.window && sg_localFullOverlay.superview.window && sg_localFullOverlay.superview != list) return;
+    // Prepare before the presentation animation attaches/fades in this list.
+    if (!sg_localImage || ![sg_localURI hasPrefix:@"spotify:local:"]) {
         localRemoveFullOverlay();
         return;
     }
@@ -117,7 +121,8 @@ static void localApplyFullPlayer(UIScrollView *list) {
     for (NSUInteger depth = 0; controller && depth < 5; depth++, controller = controller.parentViewController) {
         __block BOOL found = NO;
         SGForEachView(controller.viewIfLoaded, ^(UIView *view) {
-            if ([view isKindOfClass:UILabel.class] && !view.hidden && view.alpha > 0 &&
+            // The title can already identify the track while its transition alpha is zero.
+            if ([view isKindOfClass:UILabel.class] &&
                 [localNormalized(((UILabel *)view).text) isEqualToString:localNormalized(sg_localTitle)]) found = YES;
         });
         if (found) { titleMatches = YES; break; }
@@ -130,7 +135,7 @@ static void localApplyFullPlayer(UIScrollView *list) {
         if (fabs(CGRectGetMidX(cell.frame) - middle) > 1.0) continue;
         SGForEachView(cell, ^(UIView *view) {
             CGSize size = view.bounds.size;
-            if (host || view.hidden || view.alpha <= 0 || size.width < 200 ||
+            if (host || size.width < 200 ||
                 fabs(size.width - size.height) > 2 ||
                 ![NSStringFromClass(view.class) containsString:@"CoverArtTiltView"]) return;
             host = view;
@@ -148,7 +153,7 @@ static void localApplyFullPlayer(UIScrollView *list) {
         overlay.backgroundColor = UIColor.blackColor;
         [list addSubview:overlay];
         sg_localFullOverlay = overlay;
-        SGLog(@"[SGLocalArtwork] full-player cover applied: %@", sg_localTitle);
+        SGLog(@"[SGLocalArtwork] full-player cover prepared before presentation: %@", sg_localTitle);
     }
     overlay.image = sg_localImage;
     CGRect frame = [host convertRect:host.bounds toView:list];
@@ -453,6 +458,25 @@ static void localObserveState(id state) {
 %end
 
 %group SGLocalFullPlayer
+// On first opening, the collection can lay out before its artwork child has
+// a usable frame. Attach as soon as that child finishes, before drawing a glyph.
+%hook _TtC35CreativeWorkCommons_CoverArtTiltKit16CoverArtTiltView
+- (void)layoutSubviews {
+    %orig;
+    if (!sg_localImage || ![sg_localURI hasPrefix:@"spotify:local:"]) return;
+    UIView *parent = ((UIView *)self).superview;
+    for (NSUInteger depth = 0; parent && depth < 12; depth++, parent = parent.superview) {
+        if (![NSStringFromClass(parent.class) isEqualToString:
+            @"_TtC35NowPlaying_ContentLayerPlatformImpl24AccessibleCollectionView"]) continue;
+        if (sg_localFullOverlay.superview != parent) {
+            sg_localFullList = (UIScrollView *)parent;
+            localApplyFullPlayer(sg_localFullList);
+        }
+        break;
+    }
+}
+%end
+
 %hook _TtC35NowPlaying_ContentLayerPlatformImpl24AccessibleCollectionView
 - (void)layoutSubviews {
     %orig;
@@ -461,7 +485,9 @@ static void localObserveState(id state) {
 }
 - (void)setContentOffset:(CGPoint)offset {
     %orig;
-    localPinFullOverlay((UIScrollView *)self);
+    UIScrollView *list = (UIScrollView *)self;
+    if (sg_localFullOverlay.superview == list) localPinFullOverlay(list);
+    else localApplyFullPlayer(list);
 }
 - (void)didMoveToWindow {
     %orig;
