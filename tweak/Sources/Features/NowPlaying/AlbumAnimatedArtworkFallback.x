@@ -51,6 +51,8 @@ static NSString *SGString(id value) {
 
 static UIImage *SGAspectFillImage(UIImage *image, CGSize target);
 static id SGSyntheticArtworkForAlbum(NSString *albumKey, UIImage *cover, BOOL tall);
+static NSString *SGTrackArtworkKey(NSDictionary *info);
+#import "AlbumArtworkDebug.h"
 
 static NSString *SGAlbumArtworkKey(NSDictionary *info) {
     NSString *album = SGString(info[MPMediaItemPropertyAlbumTitle]);
@@ -69,6 +71,7 @@ static UIImage *SGStaticCover(NSDictionary *info) {
 
     if ([artwork isKindOfClass:MPMediaItemArtwork.class]) {
         UIImage *image = [(MPMediaItemArtwork *)artwork imageWithSize:CGSizeMake(900, 900)];
+        SG_DEBUG_EVENT(@"staticImage.pipeline", @"artwork=%@ requested={900,900} result=%@", SGDebugIdentity(artwork), SGDebugImage(image));
         if (image) return image;
     }
     return nil;
@@ -117,13 +120,53 @@ static UIImage *SGSolidBlackImage(CGSize size) {
 
 static id SGStrictAnimatedArtworkInit(id self, SEL _cmd, id artworkID, id previewHandler, id videoHandler) {
     (void)previewHandler;
+#if SG_ARTWORK_DEBUG
+    NSUInteger objectToken = SGDebugNextID();
+    NSString *createdTrack = SGDebugTrack();
+    // A string identity avoids retaining self through its own stored request blocks.
+    __block NSString *identity = SGDebugIdentity(self);
+    SG_DEBUG_EVENT(@"animated.init.begin", @"token=%lu object=%@ artworkID=%@ createdTrack=%@ previewPresent=%d videoPresent=%d previewPolicy=black-replaces-original",
+        (unsigned long)objectToken, identity, SGDebugQuote(artworkID), SGDebugQuote(createdTrack), previewHandler != nil, videoHandler != nil);
+    void (^originalVideo)(CGSize, void (^)(NSURL * _Nullable)) = videoHandler;
+    if (originalVideo) {
+        videoHandler = [^(CGSize requestedSize, void (^handler)(NSURL * _Nullable)) {
+            NSUInteger request = SGDebugNextID();
+            NSTimeInterval started = NSProcessInfo.processInfo.systemUptime;
+            NSString *context = [NSString stringWithFormat:@"token=%lu request=%lu object=%@ artworkID=%@ createdTrack=%@ requestedTrack=%@ requested=%@",
+                (unsigned long)objectToken, (unsigned long)request, identity, SGDebugQuote(artworkID),
+                SGDebugQuote(createdTrack), SGDebugQuote(SGDebugTrack()), NSStringFromCGSize(requestedSize)];
+            SG_DEBUG_EVENT(@"video.request", @"%@ completionPresent=%d", context, handler != nil);
+            if (!handler) {
+                originalVideo(requestedSize, nil);
+                return;
+            }
+            originalVideo(requestedSize, ^(NSURL *url) {
+                SG_DEBUG_URL(@"video.return", [context stringByAppendingFormat:@" latencyMs=%.1f", (NSProcessInfo.processInfo.systemUptime - started) * 1000], url);
+                handler(url);
+            });
+        } copy];
+    }
+#endif
     void (^blackPreview)(CGSize, void (^)(UIImage * _Nullable)) = ^(CGSize requestedSize, void (^handler)(UIImage * _Nullable)) {
+#if SG_ARTWORK_DEBUG
+        NSUInteger request = SGDebugNextID();
+        NSTimeInterval started = NSProcessInfo.processInfo.systemUptime;
+#endif
+        SG_DEBUG_EVENT(@"preview.request", @"token=%lu request=%lu object=%@ artworkID=%@ createdTrack=%@ requested=%@ completionPresent=%d source=black",
+            (unsigned long)objectToken, (unsigned long)request, identity, SGDebugQuote(artworkID), SGDebugQuote(createdTrack), NSStringFromCGSize(requestedSize), handler != nil);
         if (!handler) return;
         CGSize size = requestedSize;
         if (size.width < 1.0 || size.height < 1.0) size = CGSizeMake(900, 900);
-        handler(SGSolidBlackImage(size));
+        UIImage *preview = SGSolidBlackImage(size);
+        SG_DEBUG_EVENT(@"preview.return", @"token=%lu request=%lu object=%@ result=%@ source=black latencyMs=%.1f", (unsigned long)objectToken, (unsigned long)request, identity, SGDebugImage(preview), (NSProcessInfo.processInfo.systemUptime - started) * 1000);
+        handler(preview);
     };
-    return ((id (*)(id, SEL, id, id, id))sgOriginalAnimatedArtworkInit)(self, _cmd, artworkID, blackPreview, videoHandler);
+    id initialized = ((id (*)(id, SEL, id, id, id))sgOriginalAnimatedArtworkInit)(self, _cmd, artworkID, blackPreview, videoHandler);
+#if SG_ARTWORK_DEBUG
+    identity = SGDebugIdentity(initialized);
+    SG_DEBUG_EVENT(@"animated.init.end", @"token=%lu object=%@ artworkID=%@", (unsigned long)objectToken, identity, SGDebugQuote(artworkID));
+#endif
+    return initialized;
 }
 
 static id SGBlackArtwork(void) {
@@ -137,6 +180,7 @@ static id SGBlackArtwork(void) {
 
 static void SGPublishTransitionInfo(NSDictionary *info) {
     if (![info isKindOfClass:NSDictionary.class]) return;
+    SG_DEBUG_EVENT(@"transition.publish", @"reason=hold-timer-black track=%@", SGDebugQuote(SGTrackArtworkKey(info)));
     sgInternalTransitionUpdate = YES;
     [MPNowPlayingInfoCenter defaultCenter].nowPlayingInfo = info;
     sgInternalTransitionUpdate = NO;
@@ -234,6 +278,7 @@ static NSDictionary *SGInfoWithHandoffStatic(NSDictionary *info) {
 }
 
 static void SGClearPreviousHold(void) {
+    SG_DEBUG_EVENT(@"hold.clear", @"wasHolding=%d generation=%lu", sgHoldingPreviousAnimation, (unsigned long)sgPreviousHoldGeneration);
     sgHoldingPreviousAnimation = NO;
     sgPreviousHoldTrackKey = nil;
     sgPreviousHoldUntil = 0;
@@ -250,8 +295,10 @@ static void SGStartPreviousHold(NSString *trackKey) {
     sgPreviousHoldTrackKey = [trackKey copy];
     sgPreviousHoldUntil = CFAbsoluteTimeGetCurrent() + 6.0;
     NSUInteger generation = ++sgPreviousHoldGeneration;
+    SG_DEBUG_EVENT(@"hold.start", @"generation=%lu track=%@ square=%@ tall=%@ timeoutMs=6000", (unsigned long)generation, SGDebugQuote(trackKey), SGDebugIdentity(sgHeldSquareArtwork), SGDebugIdentity(sgHeldTallArtwork));
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        SG_DEBUG_EVENT(@"hold.timer", @"generation=%lu currentGeneration=%lu holding=%d", (unsigned long)generation, (unsigned long)sgPreviousHoldGeneration, sgHoldingPreviousAnimation);
         if (generation != sgPreviousHoldGeneration || !sgHoldingPreviousAnimation) return;
         if (![sgPreviousHoldTrackKey isEqualToString:trackKey]) return;
         NSDictionary *current = [MPNowPlayingInfoCenter defaultCenter].nowPlayingInfo;
@@ -268,7 +315,9 @@ static void SGStartPreviousHold(NSString *trackKey) {
 
 static void SGScheduleDeferredEmptyClear(void) {
     NSUInteger generation = ++sgEmptyPacketGeneration;
+    SG_DEBUG_EVENT(@"empty.schedule", @"generation=%lu delayMs=1250", (unsigned long)generation);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        SG_DEBUG_EVENT(@"empty.timer", @"generation=%lu currentGeneration=%lu sinceNonEmptyMs=%.1f", (unsigned long)generation, (unsigned long)sgEmptyPacketGeneration, (CFAbsoluteTimeGetCurrent() - sgLastNonEmptyPacketAt) * 1000);
         if (generation != sgEmptyPacketGeneration) return;
         if ((CFAbsoluteTimeGetCurrent() - sgLastNonEmptyPacketAt) < 1.20) return;
 
@@ -281,6 +330,7 @@ static void SGScheduleDeferredEmptyClear(void) {
         SGClearPreviousHold();
 
         sgInternalTransitionUpdate = YES;
+        SG_DEBUG_EVENT(@"empty.clear", @"publishing=nil generation=%lu", (unsigned long)generation);
         [MPNowPlayingInfoCenter defaultCenter].nowPlayingInfo = nil;
         sgInternalTransitionUpdate = NO;
     });
@@ -335,10 +385,13 @@ static UIImage *SGAspectFillImage(UIImage *image, CGSize target) {
 }
 
 static void SGWriteKenBurnsVideo(UIImage *sourceImage, CGSize target, NSURL *url, void (^completion)(NSURL *result)) {
+    SG_DEBUG_URL(@"generation.queued", [NSString stringWithFormat:@"target=%@", NSStringFromCGSize(target)], url);
     dispatch_async(sgArtworkVideoQueue, ^{
         @autoreleasepool {
+            SG_DEBUG_URL(@"generation.start", [NSString stringWithFormat:@"target=%@", NSStringFromCGSize(target)], url);
             NSFileManager *fm = [NSFileManager defaultManager];
             if ([fm fileExistsAtPath:url.path]) {
+                SG_DEBUG_URL(@"generation.cacheHit", @"validation=exists-only", url);
                 completion(url);
                 return;
             }
@@ -348,6 +401,7 @@ static void SGWriteKenBurnsVideo(UIImage *sourceImage, CGSize target, NSURL *url
             NSError *error = nil;
             AVAssetWriter *writer = [[AVAssetWriter alloc] initWithURL:url fileType:AVFileTypeMPEG4 error:&error];
             if (!writer || error) {
+                SG_DEBUG_EVENT(@"generation.failed", @"stage=writer-init error=%@", SGDebugQuote(error));
                 completion(nil);
                 return;
             }
@@ -383,11 +437,13 @@ static void SGWriteKenBurnsVideo(UIImage *sourceImage, CGSize target, NSURL *url
                 [[AVAssetWriterInputPixelBufferAdaptor alloc] initWithAssetWriterInput:input sourcePixelBufferAttributes:attrs];
 
             if (![writer canAddInput:input]) {
+                SG_DEBUG_EVENT(@"generation.failed", @"stage=can-add-input error=%@", SGDebugQuote(writer.error));
                 completion(nil);
                 return;
             }
             [writer addInput:input];
             if (![writer startWriting]) {
+                SG_DEBUG_EVENT(@"generation.failed", @"stage=start-writing error=%@", SGDebugQuote(writer.error));
                 completion(nil);
                 return;
             }
@@ -399,9 +455,19 @@ static void SGWriteKenBurnsVideo(UIImage *sourceImage, CGSize target, NSURL *url
             CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
 
             BOOL ok = YES;
+#if SG_ARTWORK_DEBUG
+            NSTimeInterval lastWaitLog = NSProcessInfo.processInfo.systemUptime;
+#endif
             for (NSInteger i = 0; i < frameCount; i++) {
                 @autoreleasepool {
                     while (!input.readyForMoreMediaData) {
+#if SG_ARTWORK_DEBUG
+                        NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
+                        if (now - lastWaitLog >= 5.0) {
+                            lastWaitLog = now;
+                            SG_DEBUG_EVENT(@"generation.wait", @"url=%@ frame=%ld status=%ld error=%@", SGDebugQuote(url.absoluteString), (long)i, (long)writer.status, SGDebugQuote(writer.error));
+                        }
+#endif
                         [NSThread sleepForTimeInterval:0.002];
                     }
 
@@ -440,6 +506,7 @@ static void SGWriteKenBurnsVideo(UIImage *sourceImage, CGSize target, NSURL *url
             [input markAsFinished];
 
             if (!ok) {
+                SG_DEBUG_EVENT(@"generation.failed", @"stage=render-or-append status=%ld error=%@", (long)writer.status, SGDebugQuote(writer.error));
                 [writer cancelWriting];
                 [fm removeItemAtURL:url error:nil];
                 completion(nil);
@@ -447,6 +514,7 @@ static void SGWriteKenBurnsVideo(UIImage *sourceImage, CGSize target, NSURL *url
             }
 
             [writer finishWritingWithCompletionHandler:^{
+                SG_DEBUG_URL(@"generation.finish", [NSString stringWithFormat:@"status=%ld error=%@", (long)writer.status, SGDebugQuote(writer.error)], url);
                 if (writer.status == AVAssetWriterStatusCompleted) completion(url);
                 else {
                     [fm removeItemAtURL:url error:nil];
@@ -459,10 +527,14 @@ static void SGWriteKenBurnsVideo(UIImage *sourceImage, CGSize target, NSURL *url
 
 static void SGEnsureFastSyntheticArtwork(NSString *albumKey, UIImage *cover) {
     if (!albumKey.length || !SGUsableCover(cover)) return;
+    SG_DEBUG_EVENT(@"synthetic.ensure", @"album=%@ cover=%@ cachedSquare=%@ cachedTall=%@", SGDebugQuote(albumKey), SGDebugImage(cover), SGDebugIdentity([sgSyntheticSquareArtwork objectForKey:albumKey]), SGDebugIdentity([sgSyntheticTallArtwork objectForKey:albumKey]));
     if ([sgSyntheticSquareArtwork objectForKey:albumKey] || [sgSyntheticTallArtwork objectForKey:albumKey]) return;
 
     @synchronized (sgSyntheticGenerationInFlight) {
-        if ([sgSyntheticGenerationInFlight containsObject:albumKey]) return;
+        if ([sgSyntheticGenerationInFlight containsObject:albumKey]) {
+            SG_DEBUG_EVENT(@"synthetic.inFlight", @"album=%@", SGDebugQuote(albumKey));
+            return;
+        }
         [sgSyntheticGenerationInFlight addObject:albumKey];
     }
 
@@ -482,19 +554,23 @@ static void SGEnsureFastSyntheticArtwork(NSString *albumKey, UIImage *cover) {
 
     SGWriteKenBurnsVideo(cover, CGSizeMake(540, 540), squareURL, ^(NSURL *result) {
         dispatch_async(dispatch_get_main_queue(), ^{
+            SG_DEBUG_URL(@"synthetic.complete", [NSString stringWithFormat:@"album=%@ variant=1x1", SGDebugQuote(albumKey)], result);
             if (result) SGSyntheticArtworkForAlbum(albumKey, cover, NO);
             squareDone = YES;
             finishOne();
             NSDictionary *current = sgLastRawNowPlayingInfo ?: [MPNowPlayingInfoCenter defaultCenter].nowPlayingInfo;
+            SG_DEBUG_EVENT(@"synthetic.republishCheck", @"variant=1x1 album=%@ matchesCurrent=%d", SGDebugQuote(albumKey), [SGAlbumArtworkKey(current) isEqualToString:albumKey]);
             if ([SGAlbumArtworkKey(current) isEqualToString:albumKey]) [MPNowPlayingInfoCenter defaultCenter].nowPlayingInfo = current;
         });
     });
     SGWriteKenBurnsVideo(cover, CGSizeMake(540, 720), tallURL, ^(NSURL *result) {
         dispatch_async(dispatch_get_main_queue(), ^{
+            SG_DEBUG_URL(@"synthetic.complete", [NSString stringWithFormat:@"album=%@ variant=3x4", SGDebugQuote(albumKey)], result);
             if (result) SGSyntheticArtworkForAlbum(albumKey, cover, YES);
             tallDone = YES;
             finishOne();
             NSDictionary *current = sgLastRawNowPlayingInfo ?: [MPNowPlayingInfoCenter defaultCenter].nowPlayingInfo;
+            SG_DEBUG_EVENT(@"synthetic.republishCheck", @"variant=3x4 album=%@ matchesCurrent=%d", SGDebugQuote(albumKey), [SGAlbumArtworkKey(current) isEqualToString:albumKey]);
             if ([SGAlbumArtworkKey(current) isEqualToString:albumKey]) [MPNowPlayingInfoCenter defaultCenter].nowPlayingInfo = current;
         });
     });
@@ -514,6 +590,7 @@ static id SGSyntheticArtworkForAlbum(NSString *albumKey, UIImage *cover, BOOL ta
         NSURL *videoURL = [SGArtworkVideoDirectory() URLByAppendingPathComponent:
                            [NSString stringWithFormat:@"%@-%@.mp4", token, variant]];
 
+        SG_DEBUG_URL(@"synthetic.fileCheck", [NSString stringWithFormat:@"album=%@ variant=%@", SGDebugQuote(albumKey), variant], videoURL);
         if (![[NSFileManager defaultManager] fileExistsAtPath:videoURL.path]) return nil;
 
         NSString *artworkID = [NSString stringWithFormat:@"spoti.pw.synthetic.%@.%@", token, variant];
@@ -529,6 +606,7 @@ static id SGSyntheticArtworkForAlbum(NSString *albumKey, UIImage *cover, BOOL ta
                 }];
 
         if (animated) [cache setObject:animated forKey:albumKey];
+        SG_DEBUG_EVENT(@"synthetic.cached", @"album=%@ variant=%@ object=%@", SGDebugQuote(albumKey), variant, SGDebugIdentity(animated));
         return animated;
     }
     return nil;
@@ -537,8 +615,9 @@ static id SGSyntheticArtworkForAlbum(NSString *albumKey, UIImage *cover, BOOL ta
 %hook MPNowPlayingInfoCenter
 
 - (void)setNowPlayingInfo:(NSDictionary *)info {
+    __unused NSUInteger debugPacket = SG_DEBUG_BEGIN(info, sgInternalTransitionUpdate);
     if (sgInternalTransitionUpdate) {
-        %orig(info);
+        %orig(SG_DEBUG_OUTPUT(debugPacket, @"internal-pass-through", info));
         return;
     }
 
@@ -546,12 +625,15 @@ static id SGSyntheticArtworkForAlbum(NSString *albumKey, UIImage *cover, BOOL ta
         SGScheduleDeferredEmptyClear();
 
         NSDictionary *current = [MPNowPlayingInfoCenter defaultCenter].nowPlayingInfo;
-        if ([current isKindOfClass:NSDictionary.class] && current.count) return;
+        if ([current isKindOfClass:NSDictionary.class] && current.count) {
+            SG_DEBUG_EVENT(@"nowPlaying.suppressed", @"packet=%lu reason=empty-retain-current", (unsigned long)debugPacket);
+            return;
+        }
 
         id black = SGBlackArtwork();
         NSMutableDictionary *guard = [NSMutableDictionary dictionary];
         if (black) guard[MPMediaItemPropertyArtwork] = black;
-        %orig(guard);
+        %orig(SG_DEBUG_OUTPUT(debugPacket, @"empty-inject-black", guard));
         return;
     }
 
@@ -565,6 +647,7 @@ static id SGSyntheticArtworkForAlbum(NSString *albumKey, UIImage *cover, BOOL ta
         UIImage *incomingCover = SGStaticCover(info);
         BOOL incomingCoverUsable = SGUsableCover(incomingCover);
         BOOL topLevelTrackChanged = trackKey.length && ![sgCurrentTrackKey isEqualToString:trackKey];
+        SG_DEBUG_EVENT(@"pipeline.state", @"packet=%lu trackChanged=%d previousTrack=%@ coverUsable=%d albumKey=%@ holding=%d blackActive=%d presentedSquare=%@ presentedTall=%@", (unsigned long)debugPacket, topLevelTrackChanged, SGDebugQuote(sgCurrentTrackKey), incomingCoverUsable, SGDebugQuote(albumKey), sgHoldingPreviousAnimation, sgBlackTransitionActive, SGDebugIdentity(sgPresentedSquareArtwork), SGDebugIdentity(sgPresentedTallArtwork));
 
         if (topLevelTrackChanged) {
             sgCurrentTrackKey = [trackKey copy];
@@ -579,7 +662,7 @@ static id SGSyntheticArtworkForAlbum(NSString *albumKey, UIImage *cover, BOOL ta
                 SGRememberPresentedAnimation(shown);
                 SGClearPreviousHold();
                 if (albumKey.length && incomingCoverUsable) SGRememberStaticArtwork(info, albumKey);
-                %orig(shown);
+                %orig(SG_DEBUG_OUTPUT(debugPacket, @"track-change-new-animation-black-static", shown));
                 return;
             }
 
@@ -590,13 +673,13 @@ static id SGSyntheticArtworkForAlbum(NSString *albumKey, UIImage *cover, BOOL ta
 
             if (SGHasPresentedAnimation()) {
                 SGStartPreviousHold(trackKey);
-                %orig(SGInfoHoldingPreviousAnimation(info));
+                %orig(SG_DEBUG_OUTPUT(debugPacket, @"track-change-hold-old-animation-black-static", SGInfoHoldingPreviousAnimation(info)));
                 return;
             }
 
             sgBlackTransitionActive = YES;
             sgBlackTransitionTrackKey = [trackKey copy];
-            %orig(SGInfoWithBlackArtwork(info));
+            %orig(SG_DEBUG_OUTPUT(debugPacket, @"track-change-no-animation-inject-black", SGInfoWithBlackArtwork(info)));
             return;
         }
 
@@ -611,21 +694,21 @@ static id SGSyntheticArtworkForAlbum(NSString *albumKey, UIImage *cover, BOOL ta
                 SGRememberPresentedAnimation(shown);
                 SGClearPreviousHold();
                 if (albumKey.length && incomingCoverUsable) SGRememberStaticArtwork(info, albumKey);
-                %orig(shown);
+                %orig(SG_DEBUG_OUTPUT(debugPacket, @"hold-handoff-new-animation-black-static", shown));
                 return;
             }
 
             if (albumKey.length && incomingCoverUsable) SGEnsureFastSyntheticArtwork(albumKey, incomingCover);
 
             if (CFAbsoluteTimeGetCurrent() < sgPreviousHoldUntil) {
-                %orig(SGInfoHoldingPreviousAnimation(info));
+                %orig(SG_DEBUG_OUTPUT(debugPacket, @"hold-continue-old-animation-black-static", SGInfoHoldingPreviousAnimation(info)));
                 return;
             }
 
             sgHoldingPreviousAnimation = NO;
             sgBlackTransitionActive = YES;
             sgBlackTransitionTrackKey = [trackKey copy];
-            %orig(SGInfoWithBlackArtwork(clean));
+            %orig(SG_DEBUG_OUTPUT(debugPacket, @"hold-expired-inject-black", SGInfoWithBlackArtwork(clean)));
             return;
         }
 
@@ -640,12 +723,12 @@ static id SGSyntheticArtworkForAlbum(NSString *albumKey, UIImage *cover, BOOL ta
                 sgBlackTransitionActive = NO;
                 SGClearPreviousHold();
                 if (albumKey.length && incomingCoverUsable) SGRememberStaticArtwork(info, albumKey);
-                %orig(shown);
+                %orig(SG_DEBUG_OUTPUT(debugPacket, @"black-handoff-new-animation-black-static", shown));
                 return;
             }
 
             if (albumKey.length && incomingCoverUsable) SGEnsureFastSyntheticArtwork(albumKey, incomingCover);
-            %orig(SGInfoWithBlackArtwork(clean));
+            %orig(SG_DEBUG_OUTPUT(debugPacket, @"black-wait-no-ready-animation", SGInfoWithBlackArtwork(clean)));
             return;
         }
 
@@ -664,9 +747,9 @@ static id SGSyntheticArtworkForAlbum(NSString *albumKey, UIImage *cover, BOOL ta
             if (patched[MPNowPlayingInfoProperty1x1AnimatedArtwork] ||
                 patched[MPNowPlayingInfoProperty3x4AnimatedArtwork]) {
                 SGRememberPresentedAnimation(patched);
-                %orig(patched);
+                %orig(SG_DEBUG_OUTPUT(debugPacket, @"no-album-packet-or-previous-animation-black-static", patched));
             } else {
-                %orig(SGInfoWithBlackArtwork(info));
+                %orig(SG_DEBUG_OUTPUT(debugPacket, @"no-album-inject-black", SGInfoWithBlackArtwork(info)));
             }
             return;
         }
@@ -696,20 +779,21 @@ static id SGSyntheticArtworkForAlbum(NSString *albumKey, UIImage *cover, BOOL ta
             id black = SGBlackArtwork();
             if (black) patched[MPMediaItemPropertyArtwork] = black;
             SGRememberPresentedAnimation(patched);
-            %orig(patched);
+            %orig(SG_DEBUG_OUTPUT(debugPacket, @"album-packet-or-cached-animation-black-static", patched));
             return;
         }
 
         if (cover) SGEnsureFastSyntheticArtwork(albumKey, cover);
-        %orig(SGInfoWithBlackArtwork(info));
+        %orig(SG_DEBUG_OUTPUT(debugPacket, @"album-no-animation-inject-black", SGInfoWithBlackArtwork(info)));
         return;
     }
 
-    %orig(info);
+    %orig(SG_DEBUG_OUTPUT(debugPacket, @"pre-ios26-pass-through", info));
 }
 %end
 
 %ctor {
+    SG_DEBUG_START();
     sgRealSquareArtwork = [NSCache new];
     sgRealTallArtwork = [NSCache new];
     sgSyntheticSquareArtwork = [NSCache new];
@@ -728,6 +812,7 @@ static id SGSyntheticArtworkForAlbum(NSString *albumKey, UIImage *cover, BOOL ta
         SEL initSelector = NSSelectorFromString(@"initWithArtworkID:previewImageRequestHandler:videoAssetFileURLRequestHandler:");
         Method initMethod = animatedClass ? class_getInstanceMethod(animatedClass, initSelector) : NULL;
         if (initMethod) sgOriginalAnimatedArtworkInit = method_setImplementation(initMethod, (IMP)SGStrictAnimatedArtworkInit);
+        SG_DEBUG_EVENT(@"hook.install", @"class=%@ selector=%@ found=%d installed=%d", animatedClass, NSStringFromSelector(initSelector), initMethod != NULL, sgOriginalAnimatedArtworkInit != NULL);
     }
 
     %init;
