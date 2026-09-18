@@ -1,12 +1,11 @@
 // Local files can have an embedded cover visible in the library while Spotify's
 // mini/full player shows its missing-image glyph. Read that same cover from Documents.
-// Local lock-screen metadata is exposed through a narrowly matched snapshot.
+// Isolated from MPNowPlayingInfoCenter, Canvas and lock-screen animated artwork.
 // Revert by removing this file, or set SGLocalArtworkFallbackDisabled = YES.
 #import "Core/SGCore.h"
 #import "Headers/SPTPlayer.h"
 #import <AVFoundation/AVFoundation.h>
 #import <math.h>
-#import "LocalLockScreenArtwork.h"
 
 static NSObject *sg_localLock;
 static NSString *sg_localObserved, *sg_localURI, *sg_localTitle;
@@ -25,46 +24,6 @@ static __weak UIScrollView *sg_localMaskedList;
 static CALayer *sg_localPreviousMask;
 static CAShapeLayer *sg_localArtworkMask;
 static NSString *localNormalized(NSString *value);
-static NSDictionary *sg_localLockScreenTrack;
-static MPMediaItemArtwork *sg_localLockScreenArtwork;
-
-NSDictionary *SGLocalLockScreenSnapshot(NSDictionary *info) {
-    if (![info isKindOfClass:NSDictionary.class] || !info.count ||
-        [NSUserDefaults.standardUserDefaults boolForKey:@"SGLocalLockScreenArtworkDisabled"]) return nil;
-    @synchronized (sg_localLock) {
-        NSDictionary *track = sg_localLockScreenTrack;
-        if (!track) return nil;
-        NSString *external = info[MPNowPlayingInfoPropertyExternalContentIdentifier];
-        if ([external isKindOfClass:NSString.class] && [external hasPrefix:@"spotify:"] &&
-            ![external isEqualToString:track[@"uri"]]) return nil;
-        if (![localNormalized(info[MPMediaItemPropertyTitle]) isEqual:track[@"title"]] ||
-            ![localNormalized(info[MPMediaItemPropertyArtist]) isEqual:track[@"artist"]]) return nil;
-        NSString *album = localNormalized(info[MPMediaItemPropertyAlbumTitle]);
-        if (album.length && [track[@"album"] length] && ![album isEqual:track[@"album"]]) return nil;
-        id rawDuration = info[MPMediaItemPropertyPlaybackDuration];
-        double duration = [rawDuration respondsToSelector:@selector(doubleValue)] ? [rawDuration doubleValue] : 0;
-        double expected = [track[@"duration"] doubleValue];
-        if (duration > 0 && expected > 0 && fabs(duration - expected) > 2.5) return nil;
-        return sg_localLockScreenArtwork ? @{MPMediaItemPropertyArtwork: sg_localLockScreenArtwork} : @{};
-    }
-}
-
-// Called on the main queue after the existing local cover lookup finishes.
-// Never republish stale metadata or reuse the previous song's held UI cover.
-static void localPublishLockScreenCover(UIImage *image, NSUInteger generation) {
-    MPMediaItemArtwork *artwork = image ? [[MPMediaItemArtwork alloc] initWithBoundsSize:image.size
-        requestHandler:^UIImage *(CGSize size) { return image; }] : nil;
-    @synchronized (sg_localLock) {
-        if (generation != sg_localGeneration || !sg_localLockScreenTrack) return;
-        sg_localLockScreenArtwork = artwork;
-    }
-    MPNowPlayingInfoCenter *center = MPNowPlayingInfoCenter.defaultCenter;
-    NSDictionary *current = center.nowPlayingInfo;
-    if (SGLocalLockScreenSnapshot(current)) {
-        SGLog(@"[SGLocalArtwork] local lock-screen refresh cover=%d", artwork != nil);
-        center.nowPlayingInfo = current;
-    }
-}
 
 static UIImage *localBlackCover(void) {
     static UIImage *black;
@@ -349,10 +308,6 @@ static void localObserveState(id state) {
         if ([identity isEqualToString:sg_localObserved]) return;
         sg_localObserved = identity.copy;
         generation = ++sg_localGeneration;
-        sg_localLockScreenArtwork = nil;
-        sg_localLockScreenTrack = local && title.length && artist.length ? @{
-            @"uri": uri, @"title": localNormalized(title), @"artist": localNormalized(artist),
-            @"album": localNormalized(album), @"duration": @(seconds)} : nil;
     }
     dispatch_async(dispatch_get_main_queue(), ^{
         if (!localCurrent(generation)) return;
@@ -375,10 +330,9 @@ static void localObserveState(id state) {
             localApplyFullPlayer(sg_localFullList);
             return;
         }
-        SGLog(@"[SGLocalArtwork] local track: %@ - %@", title, artist);
+        SGLog(@"[SGLocalArtwork] local track: %@ — %@", title, artist);
         UIImage *cached = [sg_localCovers objectForKey:uri];
         if (cached) {
-            localPublishLockScreenCover(cached, generation);
             sg_localImage = cached;
             sg_localOverlay.image = cached;
             sg_localFullOverlay.image = cached;
@@ -387,7 +341,6 @@ static void localObserveState(id state) {
             return;
         }
         sg_localPending = YES;
-        localPublishLockScreenCover(nil, generation);
         localApplyBar(sg_localBar);
         localApplyFullPlayer(sg_localFullList);
         SGLog(@"[SGLocalArtwork] transition hold: %@", title);
@@ -406,7 +359,6 @@ static void localObserveState(id state) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 if (!localCurrent(generation) || ![uri isEqualToString:sg_localURI]) return;
                 sg_localPending = NO;
-                localPublishLockScreenCover(image, generation);
                 sg_localImage = image ?: localBlackCover();
                 if (image) {
                     NSUInteger cost = (NSUInteger)(image.size.width * image.scale * image.size.height * image.scale * 4);

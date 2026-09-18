@@ -164,8 +164,53 @@ static void hideConnectButton(UIView *bar) {
     });
 }
 
+static char kOfflineOffsetKey, kOfflineTransformKey;
+
+static BOOL visibleInWindow(UIView *view) {
+    if (!view.window) return NO;
+    for (UIView *ancestor = view; ancestor; ancestor = ancestor.superview)
+        if (ancestor.hidden || ancestor.alpha < 0.01) return NO;
+    return YES;
+}
+
+// The system tab bar can grow above Spotify's compact bar when an offline
+// banner changes the safe area. Move the complete mini-player only by the
+// measured overlap, including its glass and artwork, then restore it online.
+static void spaceOfflineBar(UIView *bar) {
+    if (!bar.window) return;
+    CGAffineTransform transform = bar.transform;
+    NSValue *previous = objc_getAssociatedObject(bar, &kOfflineTransformKey);
+    CGFloat oldOffset = previous && CGAffineTransformEqualToTransform(transform, previous.CGAffineTransformValue)
+        ? [objc_getAssociatedObject(bar, &kOfflineOffsetKey) doubleValue] : 0;
+    transform.ty -= oldOffset;
+    __block BOOL offline = NO;
+    __block UIView *tabs = nil;
+    SGForEachView(bar.window, ^(UIView *view) {
+        if (!visibleInWindow(view)) return;
+        if ([NSStringFromClass(view.class) isEqualToString:@"SGSystemTabBar"]) tabs = view;
+        if ([view isKindOfClass:UILabel.class]) {
+            NSString *text = ((UILabel *)view).text.lowercaseString;
+            if ([text containsString:@"vous êtes en mode hors connexion"] ||
+                [text isEqualToString:@"you're offline"] || [text isEqualToString:@"you’re offline"]) offline = YES;
+        }
+    });
+    CGFloat offset = 0;
+    if (offline && tabs && !sg_nowPlayingStock) {
+        CGRect player = [bar convertRect:bar.bounds toView:bar.window];
+        player.origin.y -= oldOffset;
+        CGRect navigation = [tabs convertRect:tabs.bounds toView:bar.window];
+        CGFloat overlap = CGRectGetMaxY(player) + 6 - CGRectGetMinY(navigation);
+        if (overlap > 0 && overlap < 96 && CGRectGetMinY(player) < CGRectGetMaxY(navigation)) offset = -overlap;
+    }
+    transform.ty += offset;
+    if (!CGAffineTransformEqualToTransform(bar.transform, transform)) bar.transform = transform;
+    objc_setAssociatedObject(bar, &kOfflineOffsetKey, @(offset), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(bar, &kOfflineTransformKey, [NSValue valueWithCGAffineTransform:transform], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
 static void styleNowPlayingBar(UIViewController *container) {
     if (!SGFlag(SGKeyNowPlayingBar, NO)) return;
+    spaceOfflineBar(container.view);
     UIViewController *barVC = container.childViewControllers.firstObject;
     UIView *bar = barVC.viewIfLoaded ?: container.view;
     sg_nowPlayingRoot = bar;
@@ -255,6 +300,13 @@ static void playerTransition(id<UIViewControllerAnimatedTransitioning> animator,
 - (void)viewDidLayoutSubviews {
     %orig;
     styleNowPlayingBar((UIViewController *)self);
+}
+%end
+
+%hook SGSystemTabBar
+- (void)layoutSubviews {
+    %orig;
+    if (SGFlag(SGKeyNowPlayingBar, NO)) spaceOfflineBar(sg_barGlassHost);
 }
 %end
 

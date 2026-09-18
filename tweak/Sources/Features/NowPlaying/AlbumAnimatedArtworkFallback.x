@@ -6,7 +6,6 @@
 #import <math.h>
 #import <objc/runtime.h>
 #import <CommonCrypto/CommonDigest.h>
-#import "LocalLockScreenArtwork.h"
 
 // Album animated-artwork fallback v4.0.3-test — refresh synthetic video when its cover changes.
 // Reference: v4.0.1 strict no-square handoff, commit 54d961f.
@@ -637,7 +636,6 @@ static void SGWriteKenBurnsVideo(UIImage *sourceImage, CGSize target, NSURL *url
 }
 
 static void SGEnsureFastSyntheticArtwork(NSString *albumKey, UIImage *cover) {
-    if (SGLocalLockScreenSnapshot(sgLastRawNowPlayingInfo)) return;
     if (!albumKey.length || !SGUsableCover(cover)) return;
     NSString *fingerprint = SGCoverFingerprint(cover);
     NSMutableDictionary *coverState = [sgSyntheticCoverStates objectForKey:albumKey];
@@ -780,29 +778,6 @@ static id SGSyntheticArtworkForAlbum(NSString *albumKey, UIImage *cover, BOOL ta
     __unused NSUInteger debugPacket = SG_DEBUG_BEGIN(info, sgInternalTransitionUpdate);
     if (sgInternalTransitionUpdate) {
         %orig(SG_DEBUG_OUTPUT(debugPacket, @"internal-pass-through", info));
-        return;
-    }
-
-    NSDictionary *localSnapshot = SGLocalLockScreenSnapshot(info);
-    if (localSnapshot) {
-        ++sgEmptyPacketGeneration;
-        sgLastNonEmptyPacketAt = CFAbsoluteTimeGetCurrent();
-        sgLastRawNowPlayingInfo = [info copy];
-        // End the old video hold only for a confirmed local track. Online-to-online
-        // transitions still use the unchanged pipeline below; its caches survive.
-        SGClearPreviousHold();
-        sgPresentedSquareArtwork = nil;
-        sgPresentedTallArtwork = nil;
-        sgCurrentTrackKey = nil;
-        sgBlackTransitionActive = NO;
-        sgBlackTransitionTrackKey = nil;
-        NSMutableDictionary *localInfo = [info mutableCopy];
-        if (@available(iOS 26.0, *)) {
-            [localInfo removeObjectForKey:MPNowPlayingInfoProperty1x1AnimatedArtwork];
-            [localInfo removeObjectForKey:MPNowPlayingInfoProperty3x4AnimatedArtwork];
-        }
-        localInfo[MPMediaItemPropertyArtwork] = localSnapshot[MPMediaItemPropertyArtwork] ?: SGBlackArtwork();
-        %orig(SG_DEBUG_OUTPUT(debugPacket, @"local-track-static-cover", localInfo));
         return;
     }
 
