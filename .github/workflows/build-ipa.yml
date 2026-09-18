@@ -18,6 +18,7 @@ on:
       - HasanGs27-patch-1
     paths:
       - "tweak/Sources/Features/NowPlaying/**"
+      - "tweak/Sources/Features/AdBlock/**"
       - "scripts/pipeline.sh"
       - "docs/app-icon.jpg"
       - ".github/workflows/build-ipa.yml"
@@ -50,6 +51,13 @@ jobs:
         run: |
           brew install make dpkg ldid
           python3 -m pip install --break-system-packages Pillow git+https://github.com/asdfzxcvbn/pyzule-rw.git
+
+      - name: Test home shelf ordering
+        run: |
+          clang -fobjc-arc -fblocks -framework Foundation -DSG_HOME_ORDER_TEST=1 \
+            tweak/Sources/Features/AdBlock/HomeShelfOrder.m \
+            tweak/Sources/Features/AdBlock/Protobuf.m -o "$RUNNER_TEMP/home-order-test"
+          "$RUNNER_TEMP/home-order-test"
 
       - name: Download IPA
         run: |
