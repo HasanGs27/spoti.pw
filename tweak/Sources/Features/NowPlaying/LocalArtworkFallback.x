@@ -12,12 +12,33 @@ static NSString *sg_localObserved, *sg_localURI, *sg_localTitle;
 static NSUInteger sg_localGeneration;
 static UIImage *sg_localImage;
 static NSCache<NSString *, UIImage *> *sg_localCovers;
+static NSCache<NSString *, NSDictionary *> *sg_localFileRecords;
+static BOOL sg_localPending;
 static dispatch_queue_t sg_localQueue;
 static __weak UIView *sg_localBar;
 static __weak UIImageView *sg_localOverlay;
 static __weak UIScrollView *sg_localFullList;
 static __weak UIImageView *sg_localFullOverlay;
+static CGRect sg_localFullViewportFrame;
 static NSString *localNormalized(NSString *value);
+
+static UIImage *localBlackCover(void) {
+    static UIImage *black;
+    if (!black) {
+        UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(8, 8)];
+        black = [renderer imageWithActions:^(UIGraphicsImageRendererContext *context) {
+            [UIColor.blackColor setFill];
+            [context fillRect:CGRectMake(0, 0, 8, 8)];
+        }];
+    }
+    return black;
+}
+
+static void localPinFullOverlay(UIScrollView *list) {
+    if (sg_localFullOverlay.superview != list) return;
+    sg_localFullOverlay.frame = CGRectOffset(sg_localFullViewportFrame, list.bounds.origin.x, list.bounds.origin.y);
+    [list bringSubviewToFront:sg_localFullOverlay];
+}
 
 static void localRemoveFullOverlay(void) {
     [sg_localFullOverlay removeFromSuperview];
@@ -25,13 +46,15 @@ static void localRemoveFullOverlay(void) {
 }
 
 // Reuse the embedded image only inside the full player's artwork collection.
-// Never paint queued/off-centre covers or retain a cover while swiping tracks.
+// Keep one viewport overlay above reused cells during local-to-local switches.
+// Queued cells are never changed. Returning to a non-local track removes it.
 static void localApplyFullPlayer(UIScrollView *list) {
-    if (!list.window || !sg_localImage || ![sg_localURI hasPrefix:@"spotify:local:"] ||
-        list.dragging || list.decelerating || list.tracking) {
+    if (!list.window || !sg_localImage || ![sg_localURI hasPrefix:@"spotify:local:"]) {
         localRemoveFullOverlay();
         return;
     }
+    localPinFullOverlay(list);
+    if (list.dragging || list.decelerating || list.tracking) return;
     // Match the title in this player's controller tree, not the mini-player below.
     UIResponder *responder = list;
     while (responder && ![responder isKindOfClass:UIViewController.class]) responder = responder.nextResponder;
@@ -45,7 +68,7 @@ static void localApplyFullPlayer(UIScrollView *list) {
         });
         if (found) { titleMatches = YES; break; }
     }
-    if (!titleMatches) { localRemoveFullOverlay(); return; }
+    if (!titleMatches) return; // Keep the outgoing cover until the title catches up.
 
     CGFloat middle = CGRectGetMidX(list.bounds);
     __block UIView *host = nil;
@@ -59,34 +82,26 @@ static void localApplyFullPlayer(UIScrollView *list) {
             host = view;
         });
     }
-    if (!host) { localRemoveFullOverlay(); return; }
-    __block BOOL nativeCover = NO;
-    SGForEachView(host, ^(UIView *view) {
-        if (view == sg_localFullOverlay || ![view isKindOfClass:UIImageView.class]) return;
-        UIImage *image = ((UIImageView *)view).image;
-        if (!view.hidden && view.alpha > 0 && view.bounds.size.width >= 200 && image &&
-            !image.isSymbolImage && image.size.width * image.scale >= 96 &&
-            image.size.height * image.scale >= 96) nativeCover = YES;
-    });
-    if (nativeCover) { localRemoveFullOverlay(); return; }
+    if (!host) return;
     UIImageView *overlay = sg_localFullOverlay;
-    if (!overlay || overlay.superview != host) {
+    if (!overlay || overlay.superview != list) {
         localRemoveFullOverlay();
         overlay = [[UIImageView alloc] initWithFrame:host.bounds];
         overlay.userInteractionEnabled = NO;
         overlay.isAccessibilityElement = NO;
         overlay.contentMode = UIViewContentModeScaleAspectFit;
         overlay.clipsToBounds = YES;
-        overlay.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-        [host addSubview:overlay];
+        overlay.backgroundColor = UIColor.blackColor;
+        [list addSubview:overlay];
         sg_localFullOverlay = overlay;
         SGLog(@"[SGLocalArtwork] full-player cover applied: %@", sg_localTitle);
     }
     overlay.image = sg_localImage;
-    overlay.frame = host.bounds;
+    CGRect frame = [host convertRect:host.bounds toView:list];
+    sg_localFullViewportFrame = CGRectOffset(frame, -list.bounds.origin.x, -list.bounds.origin.y);
     overlay.layer.cornerRadius = host.layer.cornerRadius > 0 ? host.layer.cornerRadius : 12;
     overlay.layer.cornerCurve = kCACornerCurveContinuous;
-    [host bringSubviewToFront:overlay];
+    localPinFullOverlay(list);
 }
 
 static NSString *localText(id value) {
@@ -117,13 +132,13 @@ static void localApplyBar(UIView *bar) {
         localRemoveOverlay();
         return;
     }
-    // A reused bar must already display this title before receiving this image.
+    // Keep its existing overlay while Spotify updates the title/layout.
     __block BOOL titleMatches = NO;
     SGForEachView(bar, ^(UIView *view) {
         if ([view isKindOfClass:UILabel.class] && !view.hidden && view.alpha > 0 &&
             [localNormalized(((UILabel *)view).text) isEqualToString:localNormalized(sg_localTitle)]) titleMatches = YES;
     });
-    if (!titleMatches) { localRemoveOverlay(); return; }
+    if (!titleMatches) return;
 
     // The existing mini-player layout has one leading 40pt artwork container.
     // Restrict to that bar, with an image descendant, never playlist cells/buttons.
@@ -141,39 +156,31 @@ static void localApplyBar(UIView *bar) {
         });
         if (hasImage) host = view;
     });
-    if (!host) { localRemoveOverlay(); return; }
-
-    __block BOOL nativeCover = NO;
-    SGForEachView(host, ^(UIView *view) {
-        if (view == sg_localOverlay || ![view isKindOfClass:UIImageView.class]) return;
-        UIImage *image = ((UIImageView *)view).image;
-        if (!view.hidden && view.alpha > 0 && image && !image.isSymbolImage &&
-            image.size.width * image.scale >= 96 && image.size.height * image.scale >= 96) nativeCover = YES;
-    });
-    if (nativeCover) { localRemoveOverlay(); return; }
+    if (!host) return;
 
     UIImageView *overlay = sg_localOverlay;
-    if (!overlay || overlay.superview != host) {
+    if (!overlay || overlay.superview != bar) {
         localRemoveOverlay();
         overlay = [[UIImageView alloc] initWithFrame:host.bounds];
         overlay.userInteractionEnabled = NO;
         overlay.isAccessibilityElement = NO;
         overlay.contentMode = UIViewContentModeScaleAspectFill;
         overlay.clipsToBounds = YES;
-        [host addSubview:overlay];
+        overlay.backgroundColor = UIColor.blackColor;
+        [bar addSubview:overlay];
         sg_localOverlay = overlay;
         SGLog(@"[SGLocalArtwork] mini-player cover applied: %@", sg_localTitle);
     }
     overlay.image = sg_localImage;
-    overlay.frame = host.bounds;
+    overlay.frame = [host convertRect:host.bounds toView:bar];
     overlay.layer.cornerRadius = host.layer.cornerRadius;
     overlay.layer.cornerCurve = kCACornerCurveContinuous;
-    [host bringSubviewToFront:overlay];
+    [bar bringSubviewToFront:overlay];
 }
 
 // Only local disk I/O on the serial worker. No network and no modifications to
 // audio files. A matching title + artist is required; album/duration narrow it.
-// If different covers share the same identity, leave Spotify's view unchanged.
+// If different covers share the same identity, return no image (black fallback).
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 static UIImage *localReadCover(NSString *title, NSString *artist, NSString *album,
@@ -182,7 +189,7 @@ static UIImage *localReadCover(NSString *title, NSString *artist, NSString *albu
     if (!documents) return nil;
     NSString *root = [[documents URLByResolvingSymlinksInPath].path stringByAppendingString:@"/"];
     NSDirectoryEnumerator *files = [NSFileManager.defaultManager enumeratorAtURL:documents
-        includingPropertiesForKeys:@[NSURLIsRegularFileKey, NSURLIsSymbolicLinkKey]
+        includingPropertiesForKeys:@[NSURLIsRegularFileKey, NSURLIsSymbolicLinkKey, NSURLContentModificationDateKey, NSURLFileSizeKey]
         options:NSDirectoryEnumerationSkipsHiddenFiles | NSDirectoryEnumerationSkipsPackageDescendants errorHandler:nil];
     NSSet *extensions = [NSSet setWithArray:@[@"mp3", @"m4a", @"mp4", @"flac", @"aif", @"aiff", @"wav"]];
     NSData *chosen = nil;
@@ -199,21 +206,35 @@ static UIImage *localReadCover(NSString *title, NSString *artist, NSString *albu
                 SGLog(@"[SGLocalArtwork] local scan limit reached; no guessed cover");
                 return nil;
             }
-            AVURLAsset *asset = [AVURLAsset URLAssetWithURL:url options:nil];
-            NSArray<AVMetadataItem *> *items = asset.commonMetadata;
-            NSString *fileTitle = @"", *fileArtist = @"", *fileAlbum = @"";
-            AVMetadataItem *artwork = nil;
-            for (AVMetadataItem *item in items) {
-                if ([item.commonKey isEqual:AVMetadataCommonKeyTitle]) fileTitle = localNormalized(item.stringValue);
-                else if ([item.commonKey isEqual:AVMetadataCommonKeyArtist]) fileArtist = localNormalized(item.stringValue);
-                else if ([item.commonKey isEqual:AVMetadataCommonKeyAlbumName]) fileAlbum = localNormalized(item.stringValue);
-                else if ([item.commonKey isEqual:AVMetadataCommonKeyArtwork]) artwork = item;
+            NSDate *modified = nil;
+            NSNumber *fileSize = nil;
+            [url getResourceValue:&modified forKey:NSURLContentModificationDateKey error:nil];
+            [url getResourceValue:&fileSize forKey:NSURLFileSizeKey error:nil];
+            NSString *recordKey = modified && fileSize ? [NSString stringWithFormat:@"%@|%.6f|%@",
+                url.path, modified.timeIntervalSince1970, fileSize] : nil;
+            NSDictionary *record = recordKey ? [sg_localFileRecords objectForKey:recordKey] : nil;
+            if (!record) {
+                AVURLAsset *asset = [AVURLAsset URLAssetWithURL:url options:nil];
+                NSString *fileTitle = @"", *fileArtist = @"", *fileAlbum = @"";
+                NSData *artwork = nil;
+                for (AVMetadataItem *item in asset.commonMetadata) {
+                    if ([item.commonKey isEqual:AVMetadataCommonKeyTitle]) fileTitle = localNormalized(item.stringValue);
+                    else if ([item.commonKey isEqual:AVMetadataCommonKeyArtist]) fileArtist = localNormalized(item.stringValue);
+                    else if ([item.commonKey isEqual:AVMetadataCommonKeyAlbumName]) fileAlbum = localNormalized(item.stringValue);
+                    else if ([item.commonKey isEqual:AVMetadataCommonKeyArtwork]) artwork = item.dataValue;
+                }
+                if (artwork.length > 8 * 1024 * 1024) artwork = nil;
+                record = @{@"title": fileTitle, @"artist": fileArtist, @"album": fileAlbum,
+                    @"duration": @(CMTimeGetSeconds(asset.duration)), @"artwork": artwork ?: NSData.data};
+                // The existing scan also warms the next tracks, with a bounded cache.
+                // Modified/replaced files get a different key; no disk writes.
+                if (recordKey) [sg_localFileRecords setObject:record forKey:recordKey cost:artwork.length + 512];
             }
-            if (![fileTitle isEqualToString:localNormalized(title)] || ![fileArtist isEqualToString:localNormalized(artist)]) continue;
-            if (album.length && ![fileAlbum isEqualToString:localNormalized(album)]) continue;
-            double duration = CMTimeGetSeconds(asset.duration);
+            if (![record[@"title"] isEqualToString:localNormalized(title)] || ![record[@"artist"] isEqualToString:localNormalized(artist)]) continue;
+            if (album.length && ![record[@"album"] isEqualToString:localNormalized(album)]) continue;
+            double duration = [record[@"duration"] doubleValue];
             if (seconds > 0 && (!isfinite(duration) || fabs(duration - seconds) > 2.5)) continue;
-            NSData *data = artwork.dataValue;
+            NSData *data = record[@"artwork"];
             if (!data.length || data.length > 8 * 1024 * 1024) continue;
             if (chosen && ![chosen isEqualToData:data]) {
                 SGLog(@"[SGLocalArtwork] ambiguous embedded covers for %@", title);
@@ -254,28 +275,61 @@ static void localObserveState(id state) {
     }
     dispatch_async(dispatch_get_main_queue(), ^{
         if (!localCurrent(generation)) return;
-        localRemoveOverlay();
-        localRemoveFullOverlay();
+        BOOL holdingLocal = [sg_localURI hasPrefix:@"spotify:local:"] && sg_localImage != nil;
         sg_localURI = uri.copy;
         sg_localTitle = title.copy;
-        sg_localImage = nil;
-        if (!local || !title.length || !artist.length) return;
-        SGLog(@"[SGLocalArtwork] local track: %@ — %@", title, artist);
-        UIImage *cached = [sg_localCovers objectForKey:uri];
-        if (cached) {
-            sg_localImage = cached;
+        sg_localPending = NO;
+        if (!local) {
+            sg_localImage = nil;
+            localRemoveOverlay();
+            localRemoveFullOverlay();
+            return;
+        }
+        if (!holdingLocal) sg_localImage = localBlackCover();
+        if (!title.length || !artist.length) {
+            sg_localImage = localBlackCover();
+            sg_localOverlay.image = sg_localImage;
+            sg_localFullOverlay.image = sg_localImage;
             localApplyBar(sg_localBar);
             localApplyFullPlayer(sg_localFullList);
             return;
         }
+        SGLog(@"[SGLocalArtwork] local track: %@ — %@", title, artist);
+        UIImage *cached = [sg_localCovers objectForKey:uri];
+        if (cached) {
+            sg_localImage = cached;
+            sg_localOverlay.image = cached;
+            sg_localFullOverlay.image = cached;
+            localApplyBar(sg_localBar);
+            localApplyFullPlayer(sg_localFullList);
+            return;
+        }
+        sg_localPending = YES;
+        localApplyBar(sg_localBar);
+        localApplyFullPlayer(sg_localFullList);
+        SGLog(@"[SGLocalArtwork] transition hold: %@", title);
+        // A missing/slow cover must not leave the previous track's image forever.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if (!localCurrent(generation) || !sg_localPending) return;
+            sg_localImage = localBlackCover();
+            sg_localOverlay.image = sg_localImage;
+            sg_localFullOverlay.image = sg_localImage;
+            localApplyBar(sg_localBar);
+            localApplyFullPlayer(sg_localFullList);
+        });
         dispatch_async(sg_localQueue, ^{
             if (!localCurrent(generation)) return;
             UIImage *image = localReadCover(title, artist, album, seconds, generation);
             dispatch_async(dispatch_get_main_queue(), ^{
-                if (!localCurrent(generation) || ![uri isEqualToString:sg_localURI] || !image) return;
-                sg_localImage = image;
-                NSUInteger cost = (NSUInteger)(image.size.width * image.scale * image.size.height * image.scale * 4);
-                [sg_localCovers setObject:image forKey:uri cost:cost];
+                if (!localCurrent(generation) || ![uri isEqualToString:sg_localURI]) return;
+                sg_localPending = NO;
+                sg_localImage = image ?: localBlackCover();
+                if (image) {
+                    NSUInteger cost = (NSUInteger)(image.size.width * image.scale * image.size.height * image.scale * 4);
+                    [sg_localCovers setObject:image forKey:uri cost:cost];
+                }
+                sg_localOverlay.image = sg_localImage;
+                sg_localFullOverlay.image = sg_localImage;
                 localApplyBar(sg_localBar);
                 localApplyFullPlayer(sg_localFullList);
             });
@@ -307,8 +361,8 @@ static void localObserveState(id state) {
     localApplyFullPlayer(sg_localFullList);
 }
 - (void)setContentOffset:(CGPoint)offset {
-    localRemoveFullOverlay();
     %orig;
+    localPinFullOverlay((UIScrollView *)self);
 }
 - (void)didMoveToWindow {
     %orig;
@@ -330,6 +384,9 @@ static void localObserveState(id state) {
     sg_localCovers = [NSCache new];
     sg_localCovers.countLimit = 16;
     sg_localCovers.totalCostLimit = 16 * 1024 * 1024;
+    sg_localFileRecords = [NSCache new];
+    sg_localFileRecords.countLimit = 2000;
+    sg_localFileRecords.totalCostLimit = 32 * 1024 * 1024;
     sg_localQueue = dispatch_queue_create("spoti.local-artwork", DISPATCH_QUEUE_SERIAL);
     %init;
     if (![NSUserDefaults.standardUserDefaults boolForKey:@"SGLocalFullPlayerArtworkDisabled"]) {
