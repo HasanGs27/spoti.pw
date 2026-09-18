@@ -53,37 +53,37 @@ static BOOL customButton(id button) {
 %hook _TtC35ListUXPlatform_FreeTierPlaylistImpl17FTPViewController
 - (void)viewDidAppear:(BOOL)animated {
     %orig;
-    SGNativeDownloadRefreshPage(self);
+    SGNativeDownloadRefreshPage((UIViewController *)self);
 }
 - (void)viewWillLayoutSubviews {
     %orig;
-    SGNativeDownloadRefreshPage(self);
+    SGNativeDownloadRefreshPage((UIViewController *)self);
 }
 %end
 
 %hook _TtC33Navigation_PageAPIIntegrationImpl35IdentifiedPageHostingViewController
 - (void)setCurrentPageController:(id)controller {
     %orig;
-    SGNativeDownloadRefreshPage(self);
+    SGNativeDownloadRefreshPage((UIViewController *)self);
 }
 - (void)viewDidAppear:(BOOL)animated {
     %orig;
-    SGNativeDownloadRefreshPage(self);
+    SGNativeDownloadRefreshPage((UIViewController *)self);
 }
 - (void)viewDidLayoutSubviews {
     %orig;
-    SGNativeDownloadRefreshPage(self);
+    SGNativeDownloadRefreshPage((UIViewController *)self);
 }
 %end
 
 %hook SPTHubViewController
 - (void)viewDidAppear:(BOOL)animated {
     %orig;
-    SGNativeDownloadRefreshPage(self);
+    SGNativeDownloadRefreshPage((UIViewController *)self);
 }
 - (void)headerView:(id)header componentViewWillAppear:(id)component {
     %orig;
-    SGNativeDownloadRefreshPage(self);
+    SGNativeDownloadRefreshPage((UIViewController *)self);
 }
 %end
 
