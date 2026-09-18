@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 import threading
 import unittest
+from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.request import Request, urlopen
@@ -18,11 +19,13 @@ from mutagen.mp3 import MP3
 from mutagen.id3 import TIT2, TPE1, TALB, APIC
 from automatic_downloads import Queue, handler_for, lan_address, audio_record
 from download_metadata import canonical, collection
-from download_worker import acceptable
+from download_worker import acceptable, remember_audio, reusable_audio, finish_audio
 
 TRACK = 'https://open.spotify.com/track/3DaGnKmAAmyZGIbC0KjmxT'
 OTHER = 'https://open.spotify.com/track/7sL89oFc1AcgjG5Q6tCkID'
 PLAYLIST = 'https://open.spotify.com/playlist/1Imj2Uc2NVvyHgrAouKQo3'
+THIRD = TRACK[:-1]+'U'
+FOURTH = TRACK[:-1]+'V'
 
 class MetadataTests(unittest.TestCase):
     def test_urls_and_playlist_validation(self):
@@ -89,6 +92,222 @@ class QueueTests(unittest.TestCase):
         job = queue.submit(request)
         queue.pool.submit(lambda: None).result(timeout=10)
         return queue.snapshot(job['id'])
+    def repair_worker(self, calls, downloads):
+        cover = MP3(self.fixture).tags.getall('APIC')[0].data
+        def prepare(url, folder):
+            calls.append(url)
+            song = SimpleNamespace(url=url, name='Repaired title', artists=['Test artist'], duration=3,
+                                   cover_url='https://i.scdn.co/image/test')
+            source = reusable_audio(folder, song)
+            if source is None:
+                downloads.append(url)
+                source = 'https://music.youtube.com/watch?v=abcdefghijk'
+                shutil.copyfile(self.fixture, folder/'audio.mp3')
+                audio = MP3(folder/'audio.mp3'); audio.tags.delall('APIC'); audio.save(v2_version=3)
+                remember_audio(folder, song, source)
+            if len(calls) == 1:
+                (folder/'failure.json').write_text(json.dumps({'code':'cover','message':'Pochette indisponible.'}), encoding='utf-8')
+                raise ValueError('Synthetic cover request failed')
+            finish_audio(folder/'audio.mp3', song, source, cover_loader=lambda url:(cover,'image/jpeg'))
+            return folder/'audio.mp3', {'source':source}
+        return prepare
+    def test_cover_retry_reuses_unfinished_audio_only_after_worker_validation(self):
+        calls, downloads = [], []
+        queue = self.queue(prepare=self.repair_worker(calls, downloads), resolve=lambda url, tracks:('Selection','test',[TRACK]))
+        first = self.settled(queue, {'url':TRACK,'request_id':'cover-first-attempt'})
+        self.assertEqual(first['state'], 'error')
+        self.assertFalse(queue.files)
+        self.assertFalse(queue.reusable)
+        self.assertIn(TRACK, queue.repairable)
+        source = Path(self.folder.name)/first['id']/'1'/'audio.mp3'
+        original = source.read_bytes()
+        second = self.settled(queue, {'url':TRACK,'request_id':'cover-second-attempt'})
+        self.assertEqual(calls, [TRACK,TRACK]) # The repair never bypasses the worker.
+        self.assertEqual(downloads, [TRACK])
+        self.assertEqual(second['state'], 'complete')
+        self.assertEqual(second['items'][0]['title'], 'Repaired title')
+        self.assertEqual(source.read_bytes(), original) # Retagging the new copy preserves the old file.
+        self.assertFalse(MP3(source).tags.getall('APIC'))
+        target = Path(self.folder.name)/second['id']/'1'/'audio.mp3'
+        self.assertTrue(MP3(target).tags.getall('APIC'))
+        self.assertEqual(hashlib.sha256(target.read_bytes()).hexdigest(), second['items'][0]['id'])
+    def test_cover_retry_restores_unfinished_audio_after_restart(self):
+        calls, downloads = [], []
+        prepare = self.repair_worker(calls, downloads)
+        queue = self.queue(prepare=prepare, resolve=lambda url, tracks:('Selection','test',[TRACK]))
+        first = self.settled(queue, {'url':TRACK,'request_id':'cover-before-restart'})
+        queue.pool.shutdown(wait=True)
+        restored = self.queue(prepare=prepare, resolve=lambda url, tracks:('Selection','test',[TRACK]))
+        self.assertEqual(restored.snapshot(first['id'])['state'], 'error')
+        self.assertFalse(restored.files)
+        self.assertIn(TRACK, restored.repairable)
+        second = self.settled(restored, {'url':TRACK,'request_id':'cover-after-restart'})
+        self.assertEqual(second['state'], 'complete')
+        self.assertEqual(calls, [TRACK,TRACK])
+        self.assertEqual(downloads, [TRACK])
+    def test_cover_retry_rejects_modified_audio_and_wrong_identity_marker(self):
+        for corruption, restart in (('audio',False),('audio',True),('identity',False),('identity',True),('source',True)):
+            with self.subTest(corruption=corruption, restart=restart), tempfile.TemporaryDirectory() as temp:
+                calls, downloads = [], []
+                prepare = self.repair_worker(calls, downloads)
+                queue = Queue(temp, 'unused', prepare=prepare, resolve=lambda url, tracks:('Selection','test',[TRACK]))
+                try:
+                    first = self.settled(queue, {'url':TRACK,'request_id':'bad-cover-first-attempt'})
+                    folder = Path(temp).resolve()/first['id']/'1'
+                    if corruption == 'audio':
+                        original = (folder/'audio.mp3').read_bytes()
+                        (folder/'audio.mp3').write_bytes(original[:-1]+bytes([original[-1]^1]))
+                    else:
+                        marker = json.loads((folder/'prepared-audio.json').read_text())
+                        marker['spotify' if corruption == 'identity' else 'source'] = OTHER if corruption == 'identity' else 'https://example.com/wrong'
+                        (folder/'prepared-audio.json').write_text(json.dumps(marker))
+                    if restart:
+                        queue.pool.shutdown(wait=True)
+                        queue = Queue(temp, 'unused', prepare=prepare, resolve=lambda url, tracks:('Selection','test',[TRACK]))
+                        self.assertNotIn(TRACK, queue.repairable)
+                    second = self.settled(queue, {'url':TRACK,'request_id':'bad-cover-second-attempt'})
+                    self.assertEqual(second['state'], 'complete')
+                    self.assertEqual(downloads, [TRACK,TRACK])
+                finally:
+                    queue.pool.shutdown(wait=True)
+    def test_cover_repair_refuses_outside_cache_folder_and_oversized_marker(self):
+        queue = self.cached_queue([])
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp).resolve()
+            shutil.copyfile(self.fixture, folder/'audio.mp3')
+            marker = {'version':1,'spotify':TRACK,'source':'https://music.youtube.com/watch?v=abcdefghijk',
+                      'sha256':hashlib.sha256(self.fixture.read_bytes()).hexdigest()}
+            (folder/'prepared-audio.json').write_text(json.dumps(marker))
+            queue.remember_repair(TRACK, folder)
+            self.assertNotIn(TRACK, queue.repairable)
+            queue.repairable[TRACK] = (folder/'audio.mp3',marker,self.fixture.stat().st_size)
+            target = Path(self.folder.name).resolve()/'new-position'; target.mkdir()
+            self.assertFalse(queue.seed_repair(TRACK,target))
+            self.assertFalse((target/'audio.mp3').exists())
+        inside = Path(self.folder.name).resolve()/'candidate'; inside.mkdir()
+        shutil.copyfile(self.fixture, inside/'audio.mp3')
+        marker['padding'] = 'x'*20000
+        (inside/'prepared-audio.json').write_text(json.dumps(marker))
+        queue.remember_repair(TRACK, inside)
+        self.assertNotIn(TRACK, queue.repairable)
+    def test_two_parallel_tracks_publish_progress_and_keep_playlists_sequential(self):
+        condition = threading.Condition()
+        release = {url:threading.Event() for url in (TRACK, OTHER, THIRD, FOURTH)}
+        started, active, maximum, folders = [], 0, 0, []
+        def prepare(url, folder):
+            nonlocal active, maximum
+            with condition:
+                started.append(url); folders.append(folder)
+                active += 1; maximum = max(maximum, active)
+                condition.notify_all()
+            try:
+                if not release[url].wait(10): raise TimeoutError('Test worker was not released.')
+                target = folder/'audio.mp3'; shutil.copyfile(self.fixture, target)
+                return target, {'source':url}
+            finally:
+                with condition:
+                    active -= 1
+                    condition.notify_all()
+        queue = self.queue(prepare=prepare, resolve=lambda url, tracks:('Selection','test',tracks))
+        first = queue.submit({'url':PLAYLIST, 'request_id':'parallel-first-playlist',
+                              'track_urls':[TRACK, OTHER, TRACK, THIRD]})
+        try:
+            with condition:
+                self.assertTrue(condition.wait_for(lambda: len(started) == 2, timeout=5))
+                self.assertCountEqual(started, [TRACK, OTHER])
+                self.assertEqual(active, 2)
+            second = queue.submit({'url':OTHER, 'request_id':'parallel-second-playlist', 'track_urls':[FOURTH]})
+            self.assertEqual(queue.snapshot(second['id'])['state'], 'queued')
+            release[OTHER].set()
+            with condition:
+                self.assertTrue(condition.wait_for(lambda: THIRD in started, timeout=5))
+                self.assertNotIn(FOURTH, started)
+                self.assertEqual(active, 2)
+            progress = queue.snapshot(first['id'])
+            self.assertEqual([row['spotify'] for row in progress['items']], [TRACK, OTHER, TRACK, THIRD])
+            self.assertEqual([row['state'] for row in progress['items']], ['running','ready','waiting','running'])
+            self.assertIn('1/4', progress['message'])
+            ready = progress['items'][1]
+            served_file = queue.files[ready['id']][0]
+            self.assertEqual(hashlib.sha256(served_file.read_bytes()).hexdigest(), ready['id'])
+            persisted = json.loads((Path(self.folder.name)/first['id']/'job.json').read_text(encoding='utf-8'))
+            self.assertEqual(persisted['items'][1]['state'], 'ready')
+        finally:
+            for event in release.values(): event.set()
+            queue.pool.shutdown(wait=True)
+        self.assertEqual(maximum, 2)
+        self.assertEqual(Counter(started), Counter([TRACK, OTHER, THIRD, FOURTH]))
+        self.assertEqual(len(set(folders)), 4)
+        self.assertEqual(queue.snapshot(first['id'])['state'], 'complete')
+        self.assertEqual(queue.snapshot(second['id'])['state'], 'complete')
+        self.assertEqual([row['position'] for row in queue.snapshot(first['id'])['items']], [1,2,3,4])
+        for position in (1,2,3,4):
+            self.assertTrue((Path(self.folder.name)/first['id']/str(position)/'audio.mp3').is_file())
+    def test_failed_duplicate_is_prepared_once_and_does_not_block_other_tracks(self):
+        calls = []; barrier = threading.Barrier(2)
+        def prepare(url, folder):
+            calls.append(url)
+            if url in (TRACK, OTHER): barrier.wait(timeout=5)
+            if url == OTHER:
+                (folder/'metadata.json').write_text(json.dumps({'title':'Missing song','artist':'Test artist'}), encoding='utf-8')
+                (folder/'failure.json').write_text(json.dumps({'code':'no_match','message':'Aucune correspondance fiable.'}), encoding='utf-8')
+                raise ValueError('Missing test source')
+            target = folder/'audio.mp3'; shutil.copyfile(self.fixture, target)
+            return target, {}
+        queue = self.queue(prepare=prepare, resolve=lambda url, tracks:('Selection','test',tracks))
+        done = self.settled(queue, {'url':PLAYLIST, 'request_id':'parallel-failed-duplicate',
+                                   'track_urls':[TRACK, OTHER, OTHER, THIRD]})
+        self.assertEqual(Counter(calls), Counter([TRACK, OTHER, THIRD]))
+        self.assertEqual(done['state'], 'partial')
+        self.assertEqual([row['state'] for row in done['items']], ['ready','error','error','ready'])
+        self.assertEqual([row['title'] for row in done['items'][1:3]], ['Missing song','Missing song'])
+        self.assertEqual([row['message'] for row in done['items'][1:3]], ['Aucune correspondance fiable.']*2)
+        queue.pool.shutdown(wait=True)
+        restored = self.cached_queue(calls)
+        self.assertEqual([row['state'] for row in restored.snapshot(done['id'])['items']], ['ready','error','error','ready'])
+        retry = self.settled(restored, {'url':PLAYLIST, 'request_id':'parallel-failed-retry',
+                                       'track_urls':[TRACK, OTHER, OTHER, THIRD]})
+        self.assertEqual(Counter(calls), Counter([TRACK, OTHER, OTHER, THIRD]))
+        self.assertEqual(retry['state'], 'complete')
+    def test_live_worker_labels_and_phase_are_coalesced_without_stale_ready_message(self):
+        release, published = threading.Event(), threading.Event()
+        saved = []
+        def prepare(url, folder):
+            (folder/'metadata.json').write_text(json.dumps({'title':'Early title','artist':'Early artist'}), encoding='utf-8')
+            (folder/'progress.json').write_text(json.dumps({'phase':'download','message':'Audio en cours.'}), encoding='utf-8')
+            if not release.wait(10): raise TimeoutError('Test worker was not released.')
+            target = folder/'audio.mp3'; shutil.copyfile(self.fixture, target)
+            return target, {}
+        queue = self.queue(prepare=prepare, resolve=lambda url, tracks:('Selection','test',tracks))
+        save = queue.save
+        def observe(job):
+            save(job); saved.append(job['state'])
+            if job['items'] and job['items'][0].get('message') == 'Audio en cours.': published.set()
+        queue.save = observe
+        first = queue.submit({'url':PLAYLIST,'request_id':'live-progress-request','track_urls':[TRACK,TRACK]})
+        try:
+            self.assertTrue(published.wait(5))
+            progress = queue.snapshot(first['id'])
+            self.assertEqual([row['title'] for row in progress['items']], ['Early title']*2)
+            self.assertEqual([row['state'] for row in progress['items']], ['running','waiting'])
+            self.assertNotIn('id', progress['items'][0]) # A phase is not verified audio availability.
+            self.assertEqual(progress['items'][0]['message'], 'Audio en cours.')
+            before = len(saved)
+            queue.publish_worker_progress(queue.jobs[first['id']])
+            self.assertEqual(len(saved), before) # Unchanged progress must not rewrite the job.
+            (Path(self.folder.name)/first['id']/'1'/'progress.json').write_text('{partial', encoding='utf-8')
+            queue.publish_worker_progress(queue.jobs[first['id']])
+            self.assertEqual(len(saved), before) # Incomplete worker output is harmless.
+        finally:
+            release.set()
+            queue.pool.shutdown(wait=True)
+        complete = queue.snapshot(first['id'])
+        self.assertEqual(complete['state'], 'complete')
+        self.assertEqual([row['title'] for row in complete['items']], ['Test track']*2)
+        self.assertTrue(all('message' not in row for row in complete['items']))
+        before = len(saved)
+        queue.publish_worker_progress(queue.jobs[first['id']])
+        self.assertEqual(len(saved), before)
     def test_complete_metadata_requires_app_list_or_single_track(self):
         queue = self.cached_queue([])
         for key, url, tracks, expected in (
