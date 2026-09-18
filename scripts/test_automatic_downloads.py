@@ -22,6 +22,7 @@ from download_worker import acceptable
 
 TRACK = 'https://open.spotify.com/track/3DaGnKmAAmyZGIbC0KjmxT'
 OTHER = 'https://open.spotify.com/track/7sL89oFc1AcgjG5Q6tCkID'
+PLAYLIST = 'https://open.spotify.com/playlist/1Imj2Uc2NVvyHgrAouKQo3'
 
 class MetadataTests(unittest.TestCase):
     def test_urls_and_playlist_validation(self):
@@ -88,6 +89,41 @@ class QueueTests(unittest.TestCase):
         job = queue.submit(request)
         queue.pool.submit(lambda: None).result(timeout=10)
         return queue.snapshot(job['id'])
+    def test_complete_metadata_requires_app_list_or_single_track(self):
+        queue = self.cached_queue([])
+        for key, url, tracks, expected in (
+            ('metadata-public-playlist', PLAYLIST, None, False),
+            ('metadata-app-playlist', PLAYLIST, [TRACK, OTHER], True),
+            ('metadata-single-track', TRACK, None, True),
+        ):
+            with self.subTest(key=key):
+                job = self.settled(queue, {'url':url, 'request_id':key, 'track_urls':tracks})
+                self.assertIs(job['completeMetadata'], expected)
+                self.assertEqual(job['state'], 'complete') # Audio success alone does not prove a full playlist.
+                persisted = json.loads((Path(self.folder.name)/job['id']/'job.json').read_text(encoding='utf-8'))
+                self.assertIs(persisted['completeMetadata'], expected)
+    def test_legacy_metadata_completeness_is_migrated_conservatively(self):
+        queue = self.cached_queue([])
+        expected = {}
+        for key, url, tracks, complete in (
+            ('legacy-public-playlist', PLAYLIST, None, False),
+            ('legacy-app-playlist', PLAYLIST, [TRACK], True),
+            ('legacy-single-track', TRACK, None, True),
+            ('explicit-partial-playlist', PLAYLIST, [TRACK], False),
+        ):
+            job = self.settled(queue, {'url':url, 'request_id':key, 'track_urls':tracks})
+            if key.startswith('legacy-'): job.pop('completeMetadata')
+            else: job['completeMetadata'] = False
+            queue.save(job)
+            expected[job['id']] = complete
+        queue.pool.shutdown(wait=True)
+        def no_network(url, tracks):
+            raise AssertionError('Restoring completeness must not fetch metadata.')
+        restored = self.queue(resolve=no_network)
+        for ident, complete in expected.items():
+            self.assertIs(restored.snapshot(ident)['completeMetadata'], complete)
+            persisted = json.loads((Path(self.folder.name)/ident/'job.json').read_text(encoding='utf-8'))
+            self.assertIs(persisted['completeMetadata'], complete)
     def test_reuses_duplicates_and_other_playlists_without_crossing_identity(self):
         calls = []; queue = self.cached_queue(calls)
         first = self.settled(queue, {'url':TRACK, 'request_id':'reuse-first-request', 'track_urls':[TRACK,TRACK]})

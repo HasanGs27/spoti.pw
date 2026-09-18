@@ -56,6 +56,11 @@ class Queue:
             try:
                 job = json.loads(path.read_text(encoding='utf-8'))
                 if job['id'] != path.parent.name: continue
+                if 'completeMetadata' not in job:
+                    tracks = job.get('track_urls')
+                    job['completeMetadata'] = ('/track/' in canonical(job['url']) or
+                        isinstance(tracks, list) and 1 <= len(tracks) <= 500 and
+                        all('/track/' in canonical(track) for track in tracks))
                 if job['state'] in ACTIVE:
                     job.update(state='interrupted', message='PC redémarré : relance ce téléchargement.')
                 for item in job.get('items', []):
@@ -155,6 +160,7 @@ class Queue:
                 raise ValueError('La file est pleine : attends un téléchargement en cours.')
             ident = secrets.token_hex(16)
             job = dict(version=2, id=ident, request_id=key, url=url, track_urls=tracks,
+                completeMetadata=tracks is not None or '/track/' in url,
                 name='Téléchargement', state='queued', items=[], message='En attente.', scope='', created=time.time())
             self.jobs[ident] = job
             self.save(job)
