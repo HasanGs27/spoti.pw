@@ -33,7 +33,7 @@ NSData *SGPatchBootstrap(NSData *body);
 
 // Feeds.m: a browsita, casita or scrollsita feed with its ad sections taken out; nil when there
 // were none, or the bytes were not the shape expected.
-NSData *SGStripFeed(NSData *body);
+NSData *SGStripFeed(NSData *body, BOOL prioritizeArtists);
 
 // The Premium, ads & privacy page: these switches, the ad flags they lock, telemetry, the counters.
 UIViewController *SGAdsSettingsPage(void);

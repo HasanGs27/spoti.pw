@@ -100,7 +100,7 @@ static NSData *blockedReply(NSString *path) {
 
 static NSData *patched(NSURL *url, NSData *body) {
     NSString *path = url.path.lowercaseString ?: @"";
-    if (isFeed(path)) return SGStripFeed(body);
+    if (isFeed(path)) return SGStripFeed(body, has(path, @"/casita/"));
     NSData *result = isBootstrap(path) ? SGPatchBootstrap(body) : SGPatchCustomize(body);
     if (!result) {
         SGLog(@"could not rewrite %@, passed through", path);

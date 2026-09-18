@@ -4,6 +4,7 @@
 #import "Core/SGCore.h"
 #import "AdBlock.h"
 #import "Protobuf.h"
+#import "HomeShelfOrder.h"
 
 static const char *const hardMarkers[] = {
     "spotify:ad:", "ad-formats", "advertisement", "brand-ad", "sponsored", "marquee", "promoted", "home-ads",
@@ -46,7 +47,7 @@ static BOOL adSection(NSData *section) {
     return containsAny(section, intentMarkers, COUNT(intentMarkers)) && containsAny(section, surfaceMarkers, COUNT(surfaceMarkers));
 }
 
-NSData *SGStripFeed(NSData *body) {
+NSData *SGStripFeed(NSData *body, BOOL prioritizeArtists) {
     NSMutableArray<SGPBField *> *fields = SGPBParse(body);
     SGPBField *container = fields.firstObject;
     if (container.number != 1 || container.wire != 2) return nil;
@@ -58,7 +59,9 @@ NSData *SGStripFeed(NSData *body) {
         if (adSection(section.payload)) SGAdBlockCountOne(@"Feed sections");
         else [kept addObject:section];
     }
-    if (kept.count == sections.count) return nil;
+    BOOL reordered = prioritizeArtists && SGHomeOrderShelves(kept);
+    if (reordered) SGLog(@"[SGHomeOrder] artists shelf moved before play shelf");
+    if (kept.count == sections.count && !reordered) return nil;
     SGLog(@"dropped %lu of %lu feed sections", (unsigned long)(sections.count - kept.count), (unsigned long)sections.count);
     container.payload = SGPBSerialize(kept);
     return SGPBSerialize(fields);
