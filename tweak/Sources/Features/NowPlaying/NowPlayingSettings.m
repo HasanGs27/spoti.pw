@@ -8,6 +8,9 @@
 #import "Features/LockScreenLyrics/LockScreenLyrics.h"
 #import "Features/LyricsSources/LyricsSources.h"
 
+extern UIViewController *SGLocalDownloadsPageCreate(void);
+extern void SGPresentNativeSpeedTest(void);
+
 static UIViewController *nowPlayingBarPage(void) {
     return [[SGModPage alloc] initWithTitle:@"Now playing bar" intro:SGRestartNote sections:@[
         SGSection(nil, @[
@@ -107,6 +110,8 @@ UIViewController *SGNowPlayingSettingsPage(void) {
 
     return [[SGModPage alloc] initWithTitle:@"Player" intro:@"Changes apply after you restart Spotify. Gestures and Blocked artists apply straight away." sections:@[
         SGSection(nil, @[
+            SGWithSymbol(SGPageRow(@"Fichiers du PC", ^UIViewController *{ return SGLocalDownloadsPageCreate(); }), @"arrow.down.circle"),
+            SGWithSymbol(SGActionRow(@"Vitesse native — test", @"Propose uniquement les vitesses autorisées par Spotify pour la lecture actuelle", ^{ SGPresentNativeSpeedTest(); }), @"speedometer"),
             SGWithSymbol(SGPageRow(@"Gestures", ^UIViewController *{ return SGGesturesSettingsPage(); }), @"hand.tap"),
             SGWithSymbol(SGPageRow(@"Lyrics", ^UIViewController *{ return lyricsPage(); }), @"quote.bubble"),
             SGWithSymbol(blocked, @"person.crop.circle.badge.xmark"),
