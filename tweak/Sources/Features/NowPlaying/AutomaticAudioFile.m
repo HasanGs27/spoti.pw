@@ -136,23 +136,15 @@ static BOOL completeAudio(AVURLAsset *asset, double expectedDuration, BOOL (^can
     if (reader.status == AVAssetReaderStatusReading) [reader cancelReading];
     return valid;
 }
-static BOOL writeM4A(AVURLAsset *asset, NSURL *outputURL, NSString *title, NSString *artist, NSString *album,
-    NSData *artwork, BOOL (^cancelled)(void)) {
+static BOOL writeM4AItems(AVURLAsset *asset, NSURL *outputURL, NSArray *metadata, BOOL (^cancelled)(void)) {
     // Passthrough changes the container tags only. It does not convert/re-encode the AAC audio.
     AVAssetExportSession *export = [[AVAssetExportSession alloc] initWithAsset:asset presetName:AVAssetExportPresetPassthrough];
     if (![export.supportedFileTypes containsObject:AVFileTypeAppleM4A]) return NO;
-    NSMutableArray *metadata = [NSMutableArray array];
-    for (AVMetadataItem *item in [asset metadataForFormat:AVMetadataFormatiTunesMetadata]) {
-        if (![@[AVMetadataCommonKeyTitle, AVMetadataCommonKeyArtist, AVMetadataCommonKeyAlbumName, AVMetadataCommonKeyArtwork]
-            containsObject:item.commonKey ?: @""]) [metadata addObject:item];
-    }
-    [metadata addObject:metadataItem(AVMetadataIdentifieriTunesMetadataSongName, title, (__bridge NSString *)kCMMetadataBaseDataType_UTF8)];
-    [metadata addObject:metadataItem(AVMetadataIdentifieriTunesMetadataArtist, artist, (__bridge NSString *)kCMMetadataBaseDataType_UTF8)];
-    [metadata addObject:metadataItem(AVMetadataIdentifieriTunesMetadataAlbum, album, (__bridge NSString *)kCMMetadataBaseDataType_UTF8)];
-    NSString *mime = pictureType(artwork);
-    if (mime) [metadata addObject:metadataItem(AVMetadataIdentifieriTunesMetadataCoverArt, artwork,
-        (__bridge NSString *)([mime isEqual:@"image/png"] ? kCMMetadataBaseDataType_PNG : kCMMetadataBaseDataType_JPEG))];
-    export.metadata = metadata; export.outputURL = outputURL; export.outputFileType = AVFileTypeAppleM4A;
+    export.outputURL = outputURL; export.outputFileType = AVFileTypeAppleM4A; export.metadata = metadata;
+#ifdef SG_AUTOMATIC_AUDIO_TEST
+    NSLog(@"M4A export metadata: supplied=%lu retained=%lu fileType=%@", (unsigned long)metadata.count,
+        (unsigned long)export.metadata.count, export.outputFileType);
+#endif
     dispatch_semaphore_t done = dispatch_semaphore_create(0);
     [export exportAsynchronouslyWithCompletionHandler:^{ dispatch_semaphore_signal(done); }];
     NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:45];
@@ -165,6 +157,21 @@ static BOOL writeM4A(AVURLAsset *asset, NSURL *outputURL, NSString *title, NSStr
         }
     }
     return export.status == AVAssetExportSessionStatusCompleted && !stopped(cancelled);
+}
+static BOOL writeM4A(AVURLAsset *asset, NSURL *outputURL, NSString *title, NSString *artist, NSString *album,
+    NSData *artwork, BOOL (^cancelled)(void)) {
+    NSMutableArray *metadata = [NSMutableArray array];
+    for (AVMetadataItem *item in [asset metadataForFormat:AVMetadataFormatiTunesMetadata]) {
+        if (![@[AVMetadataCommonKeyTitle, AVMetadataCommonKeyArtist, AVMetadataCommonKeyAlbumName, AVMetadataCommonKeyArtwork]
+            containsObject:item.commonKey ?: @""]) [metadata addObject:item];
+    }
+    [metadata addObject:metadataItem(AVMetadataIdentifieriTunesMetadataSongName, title, (__bridge NSString *)kCMMetadataBaseDataType_UTF8)];
+    [metadata addObject:metadataItem(AVMetadataIdentifieriTunesMetadataArtist, artist, (__bridge NSString *)kCMMetadataBaseDataType_UTF8)];
+    [metadata addObject:metadataItem(AVMetadataIdentifieriTunesMetadataAlbum, album, (__bridge NSString *)kCMMetadataBaseDataType_UTF8)];
+    NSString *mime = pictureType(artwork);
+    if (mime) [metadata addObject:metadataItem(AVMetadataIdentifieriTunesMetadataCoverArt, artwork,
+        (__bridge NSString *)([mime isEqual:@"image/png"] ? kCMMetadataBaseDataType_PNG : kCMMetadataBaseDataType_JPEG))];
+    return writeM4AItems(asset, outputURL, metadata, cancelled);
 }
 NSDictionary *SGAutomaticInstallAudio(NSURL *staging, NSDictionary *requested, NSString **reason) {
     return SGAutomaticInstallAudioCancellable(staging, requested, nil, reason);
@@ -320,6 +327,39 @@ static NSData *compressedAudio(NSURL *url) {
     assert(reader.status == AVAssetReaderStatusCompleted && bytes.length);
     return bytes;
 }
+static void diagnoseM4AMetadata(NSURL *source, NSDictionary *request) {
+    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:source options:nil];
+    NSData *packets = compressedAudio(source);
+    NSArray *iTunes = @[AVMetadataIdentifieriTunesMetadataSongName, AVMetadataIdentifieriTunesMetadataArtist,
+        AVMetadataIdentifieriTunesMetadataCoverArt];
+    NSArray *common = @[AVMetadataCommonIdentifierTitle, AVMetadataCommonIdentifierArtist, AVMetadataCommonIdentifierArtwork];
+    NSArray *values = @[request[@"expectedTitle"], request[@"expectedArtist"], request[@"artworkData"]];
+    for (NSUInteger mode = 0; mode < 8; mode++) {
+        NSMutableArray *metadata = [NSMutableArray array];
+        NSArray *identifiers = (mode & 1) ? common : iTunes;
+        for (NSUInteger index = 0; index < values.count; index++) {
+            AVMutableMetadataItem *item = [AVMutableMetadataItem new];
+            item.identifier = identifiers[index]; item.value = values[index];
+            if (mode & 2) item.locale = [NSLocale localeWithLocaleIdentifier:@"en_US"];
+            if (mode & 4) item.dataType = (__bridge NSString *)(index == 2 ? kCMMetadataBaseDataType_PNG : kCMMetadataBaseDataType_UTF8);
+            [metadata addObject:item];
+        }
+        NSURL *output = temporarySibling(source, @"m4a");
+        BOOL written = writeM4AItems(asset, output, metadata, nil);
+        AVURLAsset *check = [AVURLAsset URLAssetWithURL:output options:nil];
+        BOOL title = NO, artist = NO, cover = NO;
+        for (AVMetadataItem *item in check.commonMetadata) {
+            if ([item.commonKey isEqual:AVMetadataCommonKeyTitle]) title |= [item.stringValue isEqual:values[0]];
+            if ([item.commonKey isEqual:AVMetadataCommonKeyArtist]) artist |= [item.stringValue isEqual:values[1]];
+            if ([item.commonKey isEqual:AVMetadataCommonKeyArtwork]) cover |= [item.dataValue isEqual:values[2]];
+        }
+        BOOL sameAudio = written && check.playable && [packets isEqual:compressedAudio(output)];
+        NSLog(@"M4A probe: keySpace=%@ locale=%d explicitType=%d written=%d title=%d artist=%d cover=%d sameAAC=%d formats=%@",
+            (mode & 1) ? @"common" : @"iTunes", !!(mode & 2), !!(mode & 4), written, title, artist, cover, sameAudio,
+            check.availableMetadataFormats);
+        [NSFileManager.defaultManager removeItemAtURL:output error:nil];
+    }
+}
 int main(void) { @autoreleasepool {
     NSFileManager *fm = NSFileManager.defaultManager;
     NSURL *docs = [fm URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask].firstObject;
@@ -355,7 +395,7 @@ int main(void) { @autoreleasepool {
     NSURL *before = testInput(bareM4A, @"m4a");
     NSData *originalPackets = compressedAudio(before);
     row = SGAutomaticInstallAudio(source, catalogue, &reason);
-    if (!row) NSLog(@"Bare M4A retag failed: %@", reason);
+    if (!row) { NSLog(@"Bare M4A retag failed: %@", reason); diagnoseM4AMetadata(before, catalogue); }
     assert(row && [row[@"title"] isEqual:catalogue[@"expectedTitle"]] && [row[@"sourceKind"] isEqual:@"youtube-music"] && !row[@"artworkData"]);
     target = [[docs URLByAppendingPathComponent:@"Spoti Downloads"] URLByAppendingPathComponent:[row[@"id"] stringByAppendingPathExtension:@"m4a"]];
     assert([originalPackets isEqual:compressedAudio(target)]);
