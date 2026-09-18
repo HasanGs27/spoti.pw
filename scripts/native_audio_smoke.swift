@@ -23,6 +23,26 @@ import Darwin
         require(!SGNativeMatch.accepts(candidate("Bandolero", "Other Artist"), track), "Wrong artist accepted")
         require(!SGNativeMatch.accepts(candidate("Bandolero", "Moha La Squale", 180), track), "Wrong duration accepted")
         require(!SGNativeMatch.accepts(candidate("Bandolero", "Moha La Squale", 186, false), track), "Unofficial video accepted")
+        let featured = try SGNativeTrack(["expectedTitle": "200 Mph", "expectedArtist": "Bad Bunny, Diplo",
+                                          "expectedArtists": ["Bad Bunny", "Diplo"], "expectedSeconds": 170.51])
+        func featuredCandidate(_ title: String, _ artists: [String] = ["Bad Bunny"], _ seconds: Double = 171) -> SGNativeCandidate {
+            SGNativeCandidate(videoID: "9_jLl-ruToA", title: title, artists: artists, seconds: seconds, audioTrack: true)
+        }
+        require(SGNativeMatch.accepts(featuredCandidate("200 MPH FT Diplo (feat. Diplo)"), featured), "Official repeated guest credit rejected")
+        require(SGNativeMatch.accepts(featuredCandidate("200 Mph (with Diplo)"), featured), "Known bracketed guest credit rejected")
+        require(SGNativeMatch.accepts(featuredCandidate("200 MPH feat. Diplo"), featured), "Known trailing guest credit rejected")
+        require(!SGNativeMatch.accepts(featuredCandidate("200 Mph (feat. Other Artist)"), featured), "Unknown guest credit ignored")
+        require(!SGNativeMatch.accepts(featuredCandidate("200 Mph (feat. Bad)"), featured), "Partial artist name accepted as guest credit")
+        require(!SGNativeMatch.accepts(featuredCandidate("200 Mph (feat. Diplo) - Live"), featured), "Live guest version accepted")
+        require(!SGNativeMatch.accepts(featuredCandidate("200 Mph (feat. Diplo Remix)"), featured), "Version hidden inside guest credit accepted")
+        require(!SGNativeMatch.accepts(featuredCandidate("200 Mph Part 2 FT Diplo"), featured), "Different title with valid credit accepted")
+        require(!SGNativeMatch.accepts(featuredCandidate("200 Mph FT Diplo", ["Tribute Ensemble"]), featured), "Guest credit bypassed primary artist check")
+        require(!SGNativeMatch.accepts(featuredCandidate("200 Mph FT Diplo", ["Bad Bunny"], 166), featured), "Guest credit bypassed duration check")
+        let spotifyCredit = try SGNativeTrack(["title": "200 Mph (feat. Diplo)", "artist": "Bad Bunny, Diplo",
+                                               "expectedArtists": ["Bad Bunny", "Diplo"], "seconds": 170.51])
+        require(SGNativeMatch.accepts(featuredCandidate("200 Mph", ["Bad Bunny", "Diplo"]), spotifyCredit), "Credit present only in Spotify title rejected")
+        let emptyArtists = try SGNativeTrack(["title": "Bandolero", "artist": "Moha La Squale", "expectedArtists": [], "seconds": 186])
+        require(SGNativeMatch.accepts(candidate(), emptyArtists), "Empty optional artists array rejected valid artist")
         require(SGNativeMatch.sourceID(URL(string: "https://youtu.be/G3na6eXSKtc?si=abc")!) == "G3na6eXSKtc", "Share URL rejected")
         require(SGNativeMatch.sourceID(URL(string: "https://music.youtube.com/watch?v=G3na6eXSKtc&list=abc")!) == "G3na6eXSKtc", "Music URL rejected")
         require(SGNativeMatch.sourceID(URL(string: "https://youtube.com.evil.test/watch?v=G3na6eXSKtc")!) == nil, "Host spoof accepted")
@@ -38,6 +58,10 @@ import Darwin
             let data = try Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[position + 1]))
             let results = SGNativeMatch.parse(try JSONSerialization.jsonObject(with: data))
             require(results.contains(where: { $0.videoID == "G3na6eXSKtc" && SGNativeMatch.accepts($0, track) }), "Real search response not parsed")
+            require(results.contains(where: { $0.videoID == "9_jLl-ruToA" && SGNativeMatch.accepts($0, featured) }), "Real 200 Mph result rejected because of guest credits")
+            require(!results.contains(where: { $0.videoID == "leNdpiOWMhQ" && SGNativeMatch.accepts($0, featured) }), "Real karaoke result accepted")
+            let unlinkedGuest = results.first { $0.videoID == "XsgzVmsz4Q0" }
+            require(unlinkedGuest?.artists == ["Aries", "Arjan"], "Unlinked guest missing or album/duration parsed as artist")
         }
         print("Native source URL, identity, duration, variant and resource checks passed.")
         guard CommandLine.arguments.contains("--live") else { return }

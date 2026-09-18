@@ -145,6 +145,262 @@
           "videoId": "ZhkDh9x50G4"
         }
       }
+    },
+    {
+      "musicResponsiveListItemRenderer": {
+        "flexColumns": [
+          {
+            "musicResponsiveListItemFlexColumnRenderer": {
+              "text": {
+                "runs": [
+                  {
+                    "text": "200 MPH FT Diplo (feat. Diplo)",
+                    "navigationEndpoint": {
+                      "watchEndpoint": {
+                        "videoId": "9_jLl-ruToA",
+                        "watchEndpointMusicSupportedConfigs": {
+                          "watchEndpointMusicConfig": {
+                            "musicVideoType": "MUSIC_VIDEO_TYPE_ATV"
+                          }
+                        }
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          {
+            "musicResponsiveListItemFlexColumnRenderer": {
+              "text": {
+                "runs": [
+                  {
+                    "text": "Bad Bunny",
+                    "navigationEndpoint": {
+                      "browseEndpoint": {
+                        "browseId": "UCiY3z8HAGD6BlSNKVn2kSvQ",
+                        "browseEndpointContextSupportedConfigs": {
+                          "browseEndpointContextMusicConfig": {
+                            "pageType": "MUSIC_PAGE_TYPE_ARTIST"
+                          }
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "text": " • "
+                  },
+                  {
+                    "text": "X 100PRE",
+                    "navigationEndpoint": {
+                      "browseEndpoint": {
+                        "browseId": "MPREb_3Q0zBY6qTt0",
+                        "browseEndpointContextSupportedConfigs": {
+                          "browseEndpointContextMusicConfig": {
+                            "pageType": "MUSIC_PAGE_TYPE_ALBUM"
+                          }
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "text": " • "
+                  },
+                  {
+                    "text": "2:51"
+                  }
+                ]
+              }
+            }
+          },
+          {
+            "musicResponsiveListItemFlexColumnRenderer": {
+              "text": {
+                "runs": [
+                  {
+                    "text": "98M plays"
+                  }
+                ]
+              }
+            }
+          }
+        ],
+        "playlistItemData": {
+          "videoId": "9_jLl-ruToA"
+        }
+      }
+    },
+    {
+      "musicResponsiveListItemRenderer": {
+        "flexColumns": [
+          {
+            "musicResponsiveListItemFlexColumnRenderer": {
+              "text": {
+                "runs": [
+                  {
+                    "text": "200 Mph (Made Popular By Bad Bunny & Diplo) [Karaoke Version]",
+                    "navigationEndpoint": {
+                      "watchEndpoint": {
+                        "videoId": "leNdpiOWMhQ",
+                        "watchEndpointMusicSupportedConfigs": {
+                          "watchEndpointMusicConfig": {
+                            "musicVideoType": "MUSIC_VIDEO_TYPE_ATV"
+                          }
+                        }
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          {
+            "musicResponsiveListItemFlexColumnRenderer": {
+              "text": {
+                "runs": [
+                  {
+                    "text": "Party Tyme Karaoke"
+                  },
+                  {
+                    "text": " • "
+                  },
+                  {
+                    "text": "Party Tyme 197 (Spanish Karaoke Versions)",
+                    "navigationEndpoint": {
+                      "browseEndpoint": {
+                        "browseId": "MPREb_Yu9GVfnkUNt",
+                        "browseEndpointContextSupportedConfigs": {
+                          "browseEndpointContextMusicConfig": {
+                            "pageType": "MUSIC_PAGE_TYPE_ALBUM"
+                          }
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "text": " • "
+                  },
+                  {
+                    "text": "2:51"
+                  }
+                ]
+              }
+            }
+          },
+          {
+            "musicResponsiveListItemFlexColumnRenderer": {
+              "text": {
+                "runs": [
+                  {
+                    "text": "5.6K plays"
+                  }
+                ]
+              }
+            }
+          }
+        ],
+        "playlistItemData": {
+          "videoId": "leNdpiOWMhQ"
+        }
+      }
+    },
+    {
+      "musicResponsiveListItemRenderer": {
+        "flexColumns": [
+          {
+            "musicResponsiveListItemFlexColumnRenderer": {
+              "text": {
+                "runs": [
+                  {
+                    "text": "Bandolero",
+                    "navigationEndpoint": {
+                      "watchEndpoint": {
+                        "videoId": "XsgzVmsz4Q0",
+                        "watchEndpointMusicSupportedConfigs": {
+                          "watchEndpointMusicConfig": {
+                            "musicVideoType": "MUSIC_VIDEO_TYPE_ATV"
+                          }
+                        }
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          {
+            "musicResponsiveListItemFlexColumnRenderer": {
+              "text": {
+                "runs": [
+                  {
+                    "text": "Aries",
+                    "navigationEndpoint": {
+                      "browseEndpoint": {
+                        "browseId": "UC3KcIO1yvqu02TPOQLUbtvA",
+                        "browseEndpointContextSupportedConfigs": {
+                          "browseEndpointContextMusicConfig": {
+                            "pageType": "MUSIC_PAGE_TYPE_ARTIST"
+                          }
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "text": " & "
+                  },
+                  {
+                    "text": "Arjan"
+                  },
+                  {
+                    "text": " • "
+                  },
+                  {
+                    "text": "Bandolero",
+                    "navigationEndpoint": {
+                      "browseEndpoint": {
+                        "browseId": "MPREb_e57lFrO7S4e",
+                        "browseEndpointContextSupportedConfigs": {
+                          "browseEndpointContextMusicConfig": {
+                            "pageType": "MUSIC_PAGE_TYPE_ALBUM"
+                          }
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "text": " • "
+                  },
+                  {
+                    "text": "2:54"
+                  }
+                ]
+              }
+            }
+          },
+          {
+            "musicResponsiveListItemFlexColumnRenderer": {
+              "text": {
+                "runs": [
+                  {
+                    "text": "2.3K plays"
+                  }
+                ]
+              }
+            }
+          }
+        ],
+        "playlistItemData": {
+          "videoId": "XsgzVmsz4Q0"
+        }
+      }
     }
-  ]
+  ],
+  "_provenance": {
+    "source": "Public YouTube Music WEB_REMIX song search, no cookies",
+    "queries": [
+      "Bandolero Moha La Squale",
+      "200 Mph Bad Bunny, Diplo"
+    ],
+    "newCases": "Preserved title credits and unlinked guest artist from actual responses; tracking and unrelated presentation fields removed."
+  }
 }
