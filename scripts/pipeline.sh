@@ -24,7 +24,7 @@ FLEX_DEB="$ROOT/vendor/com.hopeless.autoflex_0.0.1_iphoneos-arm.deb"
 BUNDLE_ID="${BUNDLE_ID:-}"
 mkdir -p "$ROOT/out"
 
-IN="" OUT="" WITH_FLEX=1 INSTALL=0 NAME="" ICON=""
+IN="" OUT="" WITH_FLEX=1 INSTALL=0 NAME="" ICON="${SPOTI_ICON:-$ROOT/docs/app-icon.jpg}"
 while [ $# -gt 0 ]; do
   case "$1" in
     -o) OUT="$2"; shift 2 ;;
@@ -50,7 +50,10 @@ need cyan "uv tool install 'cyan @ git+https://github.com/asdfzxcvbn/pyzule-rw'"
 # cyan skips -k with only a warning when its environment has no Pillow.
 if [ -n "$ICON" ]; then
   [ -f "$ICON" ] || { echo "no such icon: $ICON" >&2; exit 1; }
-  "$(dirname "$(readlink -f "$(command -v cyan)")")/python" -c 'import PIL' 2>/dev/null \
+  # CI installs cyan and Pillow with python3; isolated local installs can keep
+  # using cyan's adjacent interpreter. --icon still overrides the default asset.
+  ICON_PYTHON="${CYAN_PYTHON:-$(dirname "$(readlink -f "$(command -v cyan)")")/python}"
+  "$ICON_PYTHON" -c 'import PIL' 2>/dev/null \
     || { echo "cyan has no Pillow for --icon -> uv tool install --force --with pillow 'cyan @ git+https://github.com/asdfzxcvbn/pyzule-rw'" >&2; exit 1; }
 fi
 
