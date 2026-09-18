@@ -65,6 +65,13 @@ jobs:
             tweak/Sources/Features/NowPlaying/LocalDownloadManifest.m -o "$RUNNER_TEMP/local-download-test"
           "$RUNNER_TEMP/local-download-test"
 
+      - name: Test automatic download model
+        run: |
+          clang -fobjc-arc -framework Foundation -DSG_AUTOMATIC_DOWNLOAD_TEST=1 \
+            tweak/Sources/Features/NowPlaying/AutomaticDownloadModel.m \
+            tweak/Sources/Features/NowPlaying/LocalDownloadManifest.m -o "$RUNNER_TEMP/automatic-download-test"
+          "$RUNNER_TEMP/automatic-download-test"
+
       - name: Download IPA
         run: |
           mkdir -p ipa
