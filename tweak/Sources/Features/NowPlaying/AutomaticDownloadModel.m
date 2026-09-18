@@ -155,6 +155,48 @@ NSDictionary *SGAutomaticMergeLocalRows(NSDictionary *job, NSDictionary *localRo
     return merged;
 }
 
+NSDictionary *SGAutomaticClearUnfinishedHistory(NSDictionary *history, NSDictionary *verifiedLocalRows) {
+    if (![history isKindOfClass:NSDictionary.class] || ![verifiedLocalRows isKindOfClass:NSDictionary.class]) return @{};
+    NSMutableDictionary *available = [NSMutableDictionary dictionary];
+    for (id key in verifiedLocalRows) {
+        NSDictionary *row = validatedRow(verifiedLocalRows[key]);
+        if (row && [row[@"state"] isEqual:@"ready"] && [key isEqual:row[@"spotify"]]) available[key] = row;
+    }
+    NSMutableDictionary *kept = [NSMutableDictionary dictionary];
+    for (id key in history) {
+        id stored = history[key];
+        NSData *data = [NSJSONSerialization isValidJSONObject:stored] ? [NSJSONSerialization dataWithJSONObject:stored options:0 error:nil] : nil;
+        NSDictionary *job = SGAutomaticJob(data);
+        if (!job || ![key isEqual:job[@"url"]]) continue;
+        NSMutableDictionary *clean = [SGAutomaticMergeLocalRows(job, available) mutableCopy];
+        NSMutableArray *rows = [NSMutableArray array];
+        for (NSDictionary *row in clean[@"items"]) {
+            if (!available[row[@"spotify"]]) continue; // A persisted ready flag alone is not proof of a local file.
+            NSMutableDictionary *copy = [row mutableCopy]; copy[@"position"] = @(rows.count + 1);
+            [copy removeObjectForKey:@"errorMessage"]; [copy removeObjectForKey:@"progress"];
+            [rows addObject:[copy copy]];
+        }
+        if (!rows.count) continue;
+        if (rows.count < [job[@"items"] count]) clean[@"completeMetadata"] = @NO;
+        BOOL complete = clean[@"completeMetadata"] ? [clean[@"completeMetadata"] boolValue] : ![clean[@"engine"] isEqual:@"device"];
+        clean[@"items"] = [rows copy]; clean[@"state"] = complete ? @"complete" : @"partial";
+        clean[@"message"] = @""; // Do not restore a stale "searching" or transfer error after relaunch.
+        kept[key] = [clean copy];
+    }
+    return [kept copy];
+}
+
+NSArray<NSNumber *> *SGAutomaticPreparationOrder(NSArray<NSDictionary *> *items) {
+    if (![items isKindOfClass:NSArray.class]) return @[];
+    NSMutableArray *untried = [NSMutableArray array], *failed = [NSMutableArray array];
+    for (NSUInteger index = 0; index < items.count; index++) {
+        NSDictionary *row = items[index];
+        BOOL error = [row isKindOfClass:NSDictionary.class] && [row[@"state"] isEqual:@"error"];
+        [(error ? failed : untried) addObject:@(index)];
+    }
+    [untried addObjectsFromArray:failed]; return [untried copy];
+}
+
 BOOL SGAutomaticDurationMatches(NSDictionary *row, double actualSeconds) {
     if (!isfinite(actualSeconds) || actualSeconds < 1 || actualSeconds > 86400) return NO;
     id expected = row[@"expectedSeconds"];
@@ -173,7 +215,59 @@ NSString *SGAutomaticRowState(NSDictionary *row, BOOL exists, BOOL active, BOOL 
 #ifdef SG_AUTOMATIC_DOWNLOAD_TEST
 #include <assert.h>
 static NSData *fixture(id value) { return [NSJSONSerialization dataWithJSONObject:value options:0 error:nil]; }
+static void clearHistoryTests(void) {
+    NSString *a = @"https://open.spotify.com/track/3DaGnKmAAmyZGIbC0KjmxT";
+    NSString *b = @"https://open.spotify.com/track/4DNTHdu4F7eTNuhyLQvEzG";
+    NSString *missing = @"https://open.spotify.com/track/aaaaaaaaaaaaaaaaaaaaaa";
+    NSString *playlist = @"https://open.spotify.com/playlist/1Imj2Uc2NVvyHgrAouKQo3";
+    NSMutableDictionary *localA = [@{@"position":@1, @"state":@"ready", @"spotify":a, @"title":@"Saved A", @"artist":@"Artist",
+        @"album":@"Album", @"seconds":@123, @"bytes":@2048, @"extension":@"m4a", @"sourceKind":@"manual",
+        @"id":[@"a" stringByPaddingToLength:64 withString:@"a" startingAtIndex:0]} mutableCopy];
+    NSMutableDictionary *localB = [localA mutableCopy]; localB[@"spotify"] = b; localB[@"title"] = @"Saved B";
+    localB[@"id"] = [@"b" stringByPaddingToLength:64 withString:@"b" startingAtIndex:0];
+    NSDictionary *waiting = @{@"position":@1, @"state":@"waiting", @"spotify":missing, @"title":@"Missing", @"artist":@"Artist"};
+    NSDictionary *error = @{@"position":@2, @"state":@"error", @"spotify":a, @"title":@"Old A", @"artist":@"Artist",
+        @"expectedTitle":@"Catalogue A", @"errorMessage":@"Failed earlier", @"progress":@0.4};
+    NSMutableDictionary *stale = [localA mutableCopy]; stale[@"spotify"] = missing; stale[@"position"] = @3;
+    NSMutableDictionary *fourth = [localB mutableCopy]; fourth[@"position"] = @4;
+    NSMutableDictionary *duplicate = [error mutableCopy]; duplicate[@"position"] = @5;
+    NSDictionary *mixed = @{@"version":@2, @"id":@"0123456789abcdef0123456789abcdef", @"url":playlist,
+        @"state":@"interrupted", @"name":@"Mixed", @"message":@"Searching", @"scope":@"Original selection", @"engine":@"device",
+        @"completeMetadata":@YES, @"items":@[waiting, error, stale, fourth, duplicate]};
+    NSMutableDictionary *pc = [mixed mutableCopy]; pc[@"url"] = b; pc[@"engine"] = @"pc";
+    pc[@"items"] = @[localB]; [pc removeObjectForKey:@"completeMetadata"];
+    NSMutableDictionary *empty = [mixed mutableCopy]; empty[@"url"] = missing; empty[@"items"] = @[waiting];
+    NSMutableDictionary *partial = [mixed mutableCopy]; partial[@"url"] = a; partial[@"items"] = @[localA]; partial[@"completeMetadata"] = @NO;
+    NSDictionary *history = @{playlist:mixed, b:pc, missing:empty, a:partial};
+    NSDictionary *available = @{a:localA, b:localB};
+    NSDictionary *clean = SGAutomaticClearUnfinishedHistory(history, available);
+    assert(clean.count == 3 && !clean[missing]);
+    NSDictionary *kept = clean[playlist]; NSArray *rows = kept[@"items"];
+    assert(rows.count == 3 && [kept[@"completeMetadata"] isEqual:@NO] && [kept[@"state"] isEqual:@"partial"]);
+    assert([rows[0][@"position"] isEqual:@1] && [rows[1][@"position"] isEqual:@2] && [rows[2][@"position"] isEqual:@3]);
+    assert([rows[0][@"spotify"] isEqual:a] && [rows[1][@"spotify"] isEqual:b] && [rows[2][@"spotify"] isEqual:a]);
+    assert([rows[0][@"id"] isEqual:localA[@"id"]] && [rows[0][@"extension"] isEqual:@"m4a"] && [rows[0][@"sourceKind"] isEqual:@"manual"]);
+    assert([rows[0][@"expectedTitle"] isEqual:@"Catalogue A"] && !rows[0][@"errorMessage"] && !rows[0][@"progress"]);
+    assert([kept[@"message"] isEqual:@""] && [kept[@"name"] isEqual:@"Mixed"]);
+    assert([clean[b][@"state"] isEqual:@"complete"] && [clean[a][@"state"] isEqual:@"partial"]);
+    assert([clean[b][@"items"][0][@"id"] isEqual:rows[1][@"id"]]); // Same installed file can remain in several playlists.
+    assert([mixed[@"items"] count] == 5 && [mixed[@"message"] isEqual:@"Searching"] && available.count == 2);
+    assert([SGAutomaticClearUnfinishedHistory(clean, available) isEqual:clean]);
+    assert(!SGAutomaticClearUnfinishedHistory(history, @{}).count);
+    assert(!SGAutomaticClearUnfinishedHistory(@{a:partial}, @{a:localB}).count); // Never trust a wrong Spotify identity.
+    for (NSDictionary *job in clean.allValues) assert([SGAutomaticJob(fixture(job)) isEqual:job]);
+    NSMutableDictionary *complete = [mixed mutableCopy]; complete[@"items"] = @[localA];
+    NSDictionary *full = SGAutomaticClearUnfinishedHistory(@{playlist:complete}, available)[playlist];
+    assert([full[@"state"] isEqual:@"complete"] && [full[@"completeMetadata"] isEqual:@YES]);
+    NSMutableDictionary *prunedPC = [mixed mutableCopy]; prunedPC[@"engine"] = @"pc"; [prunedPC removeObjectForKey:@"completeMetadata"];
+    NSDictionary *trimmedPC = SGAutomaticClearUnfinishedHistory(@{playlist:prunedPC}, available)[playlist];
+    assert([trimmedPC[@"state"] isEqual:@"partial"] && [trimmedPC[@"completeMetadata"] isEqual:@NO]);
+    NSArray *order = SGAutomaticPreparationOrder(@[@{@"state":@"error"}, @{@"state":@"error"}, @{@"state":@"waiting"},
+        @{@"state":@"ready"}, @{@"state":@"running"}, @{@"state":@"error"}]);
+    assert(([order isEqual:@[@2, @3, @4, @0, @1, @5]] && !SGAutomaticPreparationOrder(@[]).count));
+}
 int main(void) { @autoreleasepool {
+    clearHistoryTests();
     assert(SGAutomaticSpotifyURL(@"spotify:playlist:1Imj2Uc2NVvyHgrAouKQo3"));
     assert([SGAutomaticSpotifyURL(@" https://open.spotify.com/intl-fr/track/3DaGnKmAAmyZGIbC0KjmxT?si=shared ")
         isEqual:@"https://open.spotify.com/track/3DaGnKmAAmyZGIbC0KjmxT"]);

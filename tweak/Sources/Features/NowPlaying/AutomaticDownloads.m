@@ -94,6 +94,7 @@ static void tell(NSString *message) {
 
 @interface SGAutomaticDownloads : NSObject <NSURLSessionTaskDelegate, NSURLSessionDownloadDelegate>
 @property (atomic) BOOL busy;
+@property (atomic) BOOL clearing;
 @property (atomic) NSUInteger generation;
 @property (atomic, copy) NSString *message;
 @property (atomic, copy) NSDictionary *job;
@@ -126,6 +127,7 @@ static void tell(NSString *message) {
 - (void)start:(NSString *)url;
 - (void)resume;
 - (void)pause;
+- (void)clearUnfinished;
 - (void)play:(NSUInteger)position;
 - (void)submitPending;
 - (void)follow:(NSDictionary *)initial root:(NSURL *)root generation:(NSUInteger)generation;
@@ -294,7 +296,7 @@ static void tell(NSString *message) {
 - (void)finish:(NSString *)message generation:(NSUInteger)generation {
     dispatch_async(dispatch_get_main_queue(), ^{
         if (self.generation != generation) return;
-        self.busy = NO; self.activeSpotify = nil; self.activeCollection = nil;
+        self.busy = NO; self.clearing = NO; self.activeSpotify = nil; self.activeCollection = nil;
         self.preparingAudio = NO; self.transferProgress = 0; self.resolverToken = nil;
         if (self.backgroundTask != UIBackgroundTaskInvalid) {
             [UIApplication.sharedApplication endBackgroundTask:self.backgroundTask]; self.backgroundTask = UIBackgroundTaskInvalid;
@@ -391,7 +393,10 @@ static void tell(NSString *message) {
         }
         if (!job) {
             NSMutableDictionary *failures = [self.collectionErrors mutableCopy]; failures[url] = reason ?: @"Connexion indisponible."; self.collectionErrors = failures;
-            [self finish:reason ?: @"Connexion indisponible. Réessaie avec du réseau." generation:generation]; return;
+            NSString *failure = reason ?: @"Connexion indisponible. Réessaie avec du réseau.";
+            [self finish:failure generation:generation];
+            dispatch_async(dispatch_get_main_queue(), ^{ if (generation == self.generation) tell(failure); });
+            return;
         }
         [self saveJob:job];
         self.devicePendingURL = nil; [NSUserDefaults.standardUserDefaults removeObjectForKey:@"spotifyglass.automaticDownloads.pendingDevice"];
@@ -408,7 +413,8 @@ static void tell(NSString *message) {
         if (generation != self.generation) return;
         NSUInteger ready = 0; for (NSDictionary *item in self.job[@"items"]) ready += onPhone(item);
         NSMutableDictionary *done = [self.job mutableCopy];
-        done[@"state"] = ready == [done[@"items"] count] && ([done[@"completeMetadata"] boolValue] || ![done[@"engine"] isEqual:@"device"]) ? @"complete" : @"partial"; [self saveJob:done];
+        BOOL complete = done[@"completeMetadata"] ? [done[@"completeMetadata"] boolValue] : ![done[@"engine"] isEqual:@"device"];
+        done[@"state"] = ready == [done[@"items"] count] && complete ? @"complete" : @"partial"; [self saveJob:done];
         [self finish:onPhone(self.localRows[row[@"spotify"]]) ? @"Morceau enregistré sur l'iPhone." : self.importErrors[row[@"spotify"]] generation:generation];
     });
 }
@@ -476,7 +482,8 @@ static void tell(NSString *message) {
     NSMutableDictionary *running = [[self merged:initial] mutableCopy]; running[@"state"] = @"running"; running[@"engine"] = @"device";
     [self saveJob:running];
     NSUInteger count = [running[@"items"] count];
-    for (NSUInteger i = 0; i < count; i++) {
+    for (NSNumber *position in SGAutomaticPreparationOrder(running[@"items"])) {
+        NSUInteger i = position.unsignedIntegerValue;
         if (generation != self.generation) return;
         NSDictionary *job = [self merged:self.job]; NSDictionary *row = job[@"items"][i];
         if (verifyRow(row)) { [self remember:row]; continue; }
@@ -515,6 +522,7 @@ static void tell(NSString *message) {
     });
 }
 - (void)start:(NSString *)url {
+    if (self.clearing) { [self update:@"Nettoyage en cours. Les fichiers téléchargés sont conservés."]; return; }
     NSString *canonical = SGAutomaticSpotifyURL(url);
     if (!canonical) return;
     if (self.busy) {
@@ -680,6 +688,11 @@ static void tell(NSString *message) {
     if (self.pending) { [self submitPending]; return; }
     if (self.devicePendingURL) { [self startDevice:self.devicePendingURL]; return; }
     if ([self.job[@"engine"] isEqual:@"device"]) {
+        // Cleanup retains only downloaded rows. Reload the playlist on an
+        // explicit retry instead of repeatedly processing that ready subset.
+        BOOL allReady = [self.job[@"items"] count] > 0;
+        for (NSDictionary *row in self.job[@"items"]) allReady = allReady && onPhone(row);
+        if (allReady && ![self.job[@"completeMetadata"] boolValue]) { [self startDevice:self.job[@"url"]]; return; }
         self.busy = YES; self.activeCollection = self.job[@"url"];
         NSUInteger generation = ++self.generation; NSDictionary *job = self.job; [self beginBackgroundAllowance];
         dispatch_async(self.worker, ^{ [self followDevice:job generation:generation]; }); return;
@@ -692,6 +705,7 @@ static void tell(NSString *message) {
     dispatch_async(self.worker, ^{ [self follow:job root:root generation:generation]; });
 }
 - (void)pause {
+    if (self.clearing) return;
     self.userPaused = YES;
     if (!self.busy) return;
     NSUInteger generation = ++self.generation;
@@ -703,6 +717,34 @@ static void tell(NSString *message) {
             NSMutableDictionary *paused = [self.job mutableCopy]; paused[@"state"] = @"interrupted"; [self saveJob:paused];
         }
         [self finish:@"En pause. Les fichiers terminés sont conservés ; Reprendre continue les titres restants." generation:generation];
+    });
+}
+- (void)clearUnfinished {
+    if (self.clearing) return;
+    // Keep the engine unavailable until the cancelled worker has drained. This
+    // prevents a late resolver/import completion from restoring deleted jobs.
+    self.clearing = YES; self.busy = YES; self.userPaused = YES;
+    NSUInteger generation = ++self.generation;
+    [self.active cancel]; [(SGNativeAudioRequest *)self.resolverToken cancel];
+    self.queuedURLs = @[]; self.pending = nil; self.devicePendingURL = nil;
+    [NSUserDefaults.standardUserDefaults removeObjectForKey:queueKey];
+    [NSUserDefaults.standardUserDefaults removeObjectForKey:@"spotifyglass.automaticDownloads.pendingDevice"];
+    [self update:@"Nettoyage des attentes et des échecs…"];
+    dispatch_async(self.worker, ^{
+        NSMutableDictionary *available = [NSMutableDictionary dictionary];
+        for (NSString *key in self.localRows) if (verifyRow(self.localRows[key])) available[key] = self.localRows[key];
+        NSDictionary *history = SGAutomaticClearUnfinishedHistory(self.history, available);
+        NSString *last = self.job[@"url"];
+        if (!history[last ?: @""]) last = [[history.allKeys sortedArrayUsingSelector:@selector(compare:)] firstObject];
+        self.history = history; self.job = last ? history[last] : nil;
+        self.importErrors = @{}; self.collectionErrors = @{};
+        [statusCounts() removeAllObjects];
+        NSUserDefaults *prefs = NSUserDefaults.standardUserDefaults;
+        [prefs setObject:history forKey:@"spotifyglass.automaticDownloads.history"];
+        [prefs removeObjectForKey:@"spotifyglass.automaticDownloads.errors"];
+        if (last) [prefs setObject:last forKey:@"spotifyglass.automaticDownloads.last"];
+        else [prefs removeObjectForKey:@"spotifyglass.automaticDownloads.last"];
+        [self finish:@"Attentes et échecs retirés. Tes morceaux téléchargés sont conservés." generation:generation];
     });
 }
 - (void)play:(NSUInteger)position {
@@ -764,7 +806,7 @@ static void tell(NSString *message) {
 - (void)viewDidLayoutSubviews { [super viewDidLayoutSubviews]; SGInsetForBars(self.tableView); }
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)table { return 3; }
 - (NSInteger)tableView:(UITableView *)table numberOfRowsInSection:(NSInteger)section {
-    return section == 0 ? 5 : section == 1 ? [self.displayJob[@"items"] count] : self.historyURLs.count;
+    return section == 0 ? 6 : section == 1 ? [self.displayJob[@"items"] count] : self.historyURLs.count;
 }
 - (NSString *)tableView:(UITableView *)table titleForHeaderInSection:(NSInteger)section {
     return section == 1 ? (self.displayJob[@"name"] ?: @"Sélection") : section == 2 ? @"Sélections enregistrées" : nil;
@@ -772,16 +814,16 @@ static void tell(NSString *message) {
 - (NSString *)tableView:(UITableView *)table titleForFooterInSection:(NSInteger)section {
     return section == 1 ? self.displayJob[@"scope"] : nil;
 }
-- (CGFloat)tableView:(UITableView *)table heightForRowAtIndexPath:(NSIndexPath *)path { return path.section == 0 && path.row == 4 ? 140 : 70; }
+- (CGFloat)tableView:(UITableView *)table heightForRowAtIndexPath:(NSIndexPath *)path { return path.section == 0 && path.row == 5 ? 140 : 70; }
 - (UITableViewCell *)tableView:(UITableView *)table cellForRowAtIndexPath:(NSIndexPath *)path {
     UITableViewCell *cell = SGDequeueCell(table, @"auto-download");
     cell.accessoryView = nil;
     SGAutomaticDownloads *engine = SGAutomaticDownloads.shared;
     if (path.section == 0) {
         BOOL phone = ![[NSUserDefaults.standardUserDefaults stringForKey:modeKey] isEqual:@"pc"];
-        NSArray *titles = @[phone ? @"Cet iPhone · autonome" : @"PC associé", @"Ajouter un lien Spotify", engine.busy ? @"Mettre en pause" : @"Reprendre", @"Réessayer les titres manquants", @"État"];
-        NSString *detail = path.row == 4 ? engine.message : path.row == 0 ? @"Choisir le mode de préparation" : nil;
-        if (path.row == 4 && engine.queuedURLs.count) detail = [detail stringByAppendingFormat:@"\n%lu sélection(s) en attente.", (unsigned long)engine.queuedURLs.count];
+        NSArray *titles = @[phone ? @"Cet iPhone · autonome" : @"PC associé", @"Ajouter un lien Spotify", engine.busy ? @"Mettre en pause" : @"Reprendre", @"Réessayer les titres manquants", engine.clearing ? @"Nettoyage en cours…" : @"Nettoyer les téléchargements", @"État"];
+        NSString *detail = path.row == 5 ? engine.message : path.row == 4 ? @"Retire les attentes et les échecs · fichiers conservés" : path.row == 0 ? @"Choisir le mode de préparation" : nil;
+        if (path.row == 5 && engine.queuedURLs.count) detail = [detail stringByAppendingFormat:@"\n%lu sélection(s) en attente.", (unsigned long)engine.queuedURLs.count];
         SGFillCell(cell, titles[path.row], detail, nil, nil);
     } else if (path.section == 1) {
         NSDictionary *row = self.displayJob[@"items"][path.row];
@@ -811,6 +853,7 @@ static void tell(NSString *message) {
 - (void)tableView:(UITableView *)table didSelectRowAtIndexPath:(NSIndexPath *)path {
     [table deselectRowAtIndexPath:path animated:YES];
     SGAutomaticDownloads *engine = SGAutomaticDownloads.shared;
+    if (engine.clearing) return;
     if (path.section == 1) {
         if ([engine.job[@"id"] isEqual:self.displayJob[@"id"]]) {
             NSDictionary *row = self.displayJob[@"items"][path.row];
@@ -826,6 +869,7 @@ static void tell(NSString *message) {
     }
     if (path.row == 2) { if (engine.busy) [engine pause]; else [engine resume]; return; }
     if (path.row == 3) { if (engine.job && !engine.busy) [engine resume]; return; }
+    if (path.row == 4) { [engine clearUnfinished]; return; }
     if (path.row > 1 || engine.busy) return;
     if (path.row == 0) { [self chooseMode:[table cellForRowAtIndexPath:path]]; return; }
     BOOL pairing = path.row == 0;
@@ -976,7 +1020,7 @@ NSDictionary *SGAutomaticDownloadStatus(id entity) {
     }
     BOOL running = engine.busy && ([url isEqual:engine.activeCollection] || [url isEqual:engine.activeSpotify]);
     BOOL queued = [engine.queuedURLs containsObject:url];
-    BOOL complete = ![job[@"engine"] isEqual:@"device"] || [job[@"completeMetadata"] boolValue];
+    BOOL complete = job[@"completeMetadata"] ? [job[@"completeMetadata"] boolValue] : ![job[@"engine"] isEqual:@"device"];
     NSString *state = running || queued ? @"running" : total && ready == total ? (complete ? @"ready" : @"incomplete") :
         [job[@"state"] isEqual:@"interrupted"] ? @"paused" : ready ? @"partial" : failed || engine.collectionErrors[url] ? @"error" : @"idle";
     double progress = total ? ((double)ready + (running ? engine.transferProgress : 0)) / total : 0;

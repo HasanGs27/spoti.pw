@@ -65,7 +65,9 @@ struct SGNativeTrack {
     init(_ row: [String: Any]) throws {
         title = (row["expectedTitle"] as? String ?? row["title"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         artist = (row["expectedArtist"] as? String ?? row["artist"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        artists = row["expectedArtists"] as? [String] ?? [artist]
+        let suppliedArtists = (row["expectedArtists"] as? [String] ?? [])
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+        artists = suppliedArtists.isEmpty ? [artist] : suppliedArtists
         seconds = (row["expectedSeconds"] as? NSNumber ?? row["seconds"] as? NSNumber)?.doubleValue ?? 0
         guard !title.isEmpty, !artist.isEmpty, title.count <= 500, artist.count <= 500,
               seconds.isFinite, (1...1800).contains(seconds) else {
@@ -87,10 +89,36 @@ enum SGNativeMatch {
         let text = value.folding(options: [.diacriticInsensitive, .caseInsensitive, .widthInsensitive], locale: Locale(identifier: "en_US_POSIX")).lowercased()
         return Set(text.components(separatedBy: CharacterSet.alphanumerics.inverted).filter { !$0.isEmpty })
     }
+    // Catalogues put guest credits in different fields: Spotify's "200 Mph"
+    // is YouTube Music's "200 MPH FT Diplo (feat. Diplo)". Remove only explicit
+    // credits whose complete artist names are independently present in Spotify
+    // metadata. Do not strip arbitrary brackets, extra title words or versions.
+    private static func titleWords(_ value: String, artists: [String]) -> Set<String> {
+        let names = artists.map(words).filter { !$0.isEmpty }
+        func knownCredit(_ credit: String) -> Bool {
+            let tokens = words(credit).subtracting(["and"])
+            guard !tokens.isEmpty else { return false }
+            let recognized = names.filter { $0.isSubset(of: tokens) }
+                .reduce(into: Set<String>()) { $0.formUnion($1) }
+            return recognized == tokens
+        }
+        var title = value
+        let bracketed = try! NSRegularExpression(pattern: #"[\(\[]\s*(?:feat(?:uring)?|ft|with)\.?\s+([^\)\]]+)[\)\]]"#, options: .caseInsensitive)
+        for match in bracketed.matches(in: title, range: NSRange(title.startIndex..., in: title)).reversed() {
+            guard let creditRange = Range(match.range(at: 1), in: title),
+                  knownCredit(String(title[creditRange])), let range = Range(match.range, in: title) else { continue }
+            title.replaceSubrange(range, with: " ")
+        }
+        let trailing = try! NSRegularExpression(pattern: #"\s+(?:[-–—]\s*)?(?:feat(?:uring)?|ft)\.?\s+(.+?)\s*$"#, options: .caseInsensitive)
+        if let match = trailing.firstMatch(in: title, range: NSRange(title.startIndex..., in: title)),
+           let creditRange = Range(match.range(at: 1), in: title), knownCredit(String(title[creditRange])),
+           let range = Range(match.range, in: title) { title.replaceSubrange(range, with: " ") }
+        return words(title)
+    }
     static func accepts(_ result: SGNativeCandidate, _ track: SGNativeTrack) -> Bool {
-        let title = words(track.title)
+        let title = titleWords(track.title, artists: track.artists)
         let artist = words(track.artists.first ?? track.artist)
-        let actualTitle = words(result.title)
+        let actualTitle = titleWords(result.title, artists: track.artists)
         let variants: Set<String> = ["live", "cover", "remix", "slowed", "sped", "reverb", "instrumental", "karaoke", "acoustic", "remaster", "remastered"]
         return result.audioTrack && !title.isEmpty && !artist.isEmpty && result.seconds.isFinite &&
             abs(result.seconds - track.seconds) <= max(2, track.seconds * 0.012) &&
@@ -122,6 +150,23 @@ enum SGNativeMatch {
         guard text.range(of: "^[0-9]{1,2}:[0-5][0-9](?::[0-5][0-9])?$", options: .regularExpression) != nil else { return nil }
         return text.split(separator: ":").compactMap { Double($0) }.reduce(0) { $0 * 60 + $1 }
     }
+    private static func artistNames(_ detailRuns: [[String: Any]]) -> [String] {
+        var names: [String] = []
+        // Guest names are sometimes plain text without a browseEndpoint. The
+        // first detail column starts with artists, then a bullet, album/duration.
+        // Never collect plain text from album, duration or play-count columns.
+        for run in detailRuns {
+            guard let raw = run["text"] as? String else { continue }
+            let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            if text.contains("•") || text.contains("·") || duration(text) != nil { break }
+            let type = nested(run, ["navigationEndpoint", "browseEndpoint", "browseEndpointContextSupportedConfigs", "browseEndpointContextMusicConfig", "pageType"]) as? String
+            if let type, type != "MUSIC_PAGE_TYPE_ARTIST" { break }
+            if !words(text).isEmpty && (type == "MUSIC_PAGE_TYPE_ARTIST" || !["and", "&", ","].contains(text.lowercased())) {
+                names.append(text)
+            }
+        }
+        return names
+    }
     static func parse(_ object: Any) -> [SGNativeCandidate] {
         var rows: [SGNativeCandidate] = []
         var seen = Set<String>()
@@ -136,10 +181,7 @@ enum SGNativeMatch {
                     let videoID = endpoint?["videoId"] as? String ?? nested(row, ["playlistItemData", "videoId"]) as? String ?? ""
                     let type = endpoint.flatMap { nested($0, ["watchEndpointMusicSupportedConfigs", "watchEndpointMusicConfig", "musicVideoType"]) as? String }
                     let detailRuns = columns.dropFirst().flatMap(runs)
-                    let artists = detailRuns.compactMap { run -> String? in
-                        let type = nested(run, ["navigationEndpoint", "browseEndpoint", "browseEndpointContextSupportedConfigs", "browseEndpointContextMusicConfig", "pageType"]) as? String
-                        return type == "MUSIC_PAGE_TYPE_ARTIST" ? run["text"] as? String : nil
-                    }
+                    let artists = columns.count > 1 ? artistNames(runs(columns[1])) : []
                     let seconds = detailRuns.compactMap { ($0["text"] as? String).flatMap(duration) }.first
                     if validID(videoID), !title.isEmpty, !artists.isEmpty, let seconds, seen.insert(videoID).inserted {
                         rows.append(SGNativeCandidate(videoID: videoID, title: title, artists: artists, seconds: seconds, audioTrack: type == "MUSIC_VIDEO_TYPE_ATV"))

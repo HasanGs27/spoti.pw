@@ -26,11 +26,14 @@ NSDictionary *SGNativeMetadataEntity(NSData *data, id spotify) {
     NSDictionary *entity = dictionary(dictionary(dictionary(dictionary(dictionary(root[@"props"])[@"pageProps"])[@"state"])[@"data"])[@"entity"]);
     NSArray *path = [NSURL URLWithString:canonical].pathComponents;
     if (path.count != 3 || ![entity[@"type"] isEqual:path[1]] || ![entity[@"id"] isEqual:path[2]]) return nil;
+    // If Spotify supplies both an id and a URI they must describe the same entity.
+    // Do not let metadata for a different song overwrite this collection's row.
+    if (entity[@"uri"] && ![SGAutomaticSpotifyURL(entity[@"uri"]) isEqual:canonical]) return nil;
     return entity;
 }
 
 NSDictionary *SGNativeTrackMetadata(NSDictionary *entity, NSUInteger position) {
-    if (![entity[@"type"] isEqual:@"track"]) return nil;
+    if (![entity isKindOfClass:NSDictionary.class] || ![entity[@"type"] isEqual:@"track"]) return nil;
     NSString *spotify = SGAutomaticSpotifyURL(entity[@"uri"]);
     NSString *title = label(entity[@"title"]);
     NSMutableArray *artists = [NSMutableArray array];
@@ -56,10 +59,16 @@ NSDictionary *SGNativeTrackMetadata(NSDictionary *entity, NSUInteger position) {
 }
 
 NSDictionary *SGNativeCollectionJob(NSData *html, id spotify, NSString **reason) {
+    if (reason) *reason = nil;
     NSString *url = SGAutomaticSpotifyURL(spotify);
     NSDictionary *entity = SGNativeMetadataEntity(html, url);
-    if (!entity) { if (reason) *reason = @"La sélection n'est pas accessible pour le moment. Ouvre-la dans Spotify puis réessaie."; return nil; }
+    if (!entity) {
+        if (reason) *reason = !html.length ? @"La page de la sélection n'a pas pu être chargée. Vérifie la connexion puis réessaie." :
+            @"Spotify ne fournit pas de liste publique pour cette sélection. Elle peut être privée, personnalisée ou momentanément indisponible.";
+        return nil;
+    }
     NSMutableArray *rows = [NSMutableArray array];
+    NSUInteger unavailable = 0, overflow = 0;
     if ([entity[@"type"] isEqual:@"track"]) {
         NSDictionary *row = SGNativeTrackMetadata(entity, 1);
         if (row) [rows addObject:row];
@@ -67,10 +76,11 @@ NSDictionary *SGNativeCollectionJob(NSData *html, id spotify, NSString **reason)
         for (id value in array(entity[@"trackList"])) {
             NSDictionary *item = dictionary(value);
             NSString *track = SGAutomaticSpotifyURL(item[@"uri"]);
-            if (!track || ![track containsString:@"/track/"] || rows.count >= 500) {
-                if (reason) *reason = @"Cette sélection contient un élément non pris en charge ou dépasse 500 titres. Essaie une sélection plus petite.";
-                return nil;
-            }
+            // Local files, unavailable entries and episodes have no resolvable song
+            // identity here. Retain the supported songs instead of failing the whole
+            // playlist because one entry is absent from the public metadata.
+            if (!track || ![track containsString:@"/track/"]) { unavailable++; continue; }
+            if (rows.count >= 500) { overflow++; continue; }
             NSString *title = label(item[@"title"]), *artist = label(item[@"subtitle"]);
             NSMutableDictionary *row = [@{@"position":@(rows.count + 1), @"spotify":track, @"title":title.length ? title : @"Morceau",
                 @"artist":artist, @"state":@"waiting"} mutableCopy];
@@ -83,10 +93,13 @@ NSDictionary *SGNativeCollectionJob(NSData *html, id spotify, NSString **reason)
     }
     if (!rows.count) { if (reason) *reason = @"Aucun morceau accessible dans cette sélection. Tu peux aussi importer un fichier depuis Téléchargements."; return nil; }
     NSString *name = label(entity[@"title"]); if (!name.length) name = label(entity[@"name"]);
+    NSString *scope = [entity[@"type"] isEqual:@"track"] ? @"Un morceau." : @"Titres accessibles sur la page publique. Spotify peut limiter la liste fournie.";
+    if (unavailable) scope = [scope stringByAppendingFormat:@" %lu élément(s) sans lien de morceau reconnu n'ont pas été ajoutés.", (unsigned long)unavailable];
+    if (overflow) scope = [scope stringByAppendingString:@" La limite de 500 morceaux par sélection a été atteinte."];
     return @{@"version":@2, @"engine":@"device", @"id":[[NSUUID.UUID.UUIDString stringByReplacingOccurrencesOfString:@"-" withString:@""] lowercaseString],
         @"url":url, @"name":name.length ? name : @"Sélection", @"state":@"queued", @"message":@"Prêt sur cet iPhone", @"items":rows,
         @"completeMetadata":@([entity[@"type"] isEqual:@"track"]),
-        @"scope":[entity[@"type"] isEqual:@"track"] ? @"Un morceau." : @"Titres accessibles sur la page publique. Spotify peut limiter la liste fournie."};
+        @"scope":scope};
 }
 
 #ifdef SG_NATIVE_COLLECTION_TEST
@@ -105,12 +118,44 @@ int main(void) { @autoreleasepool {
     assert(job && [job[@"items"] count] == 1 && [job[@"items"][0][@"expectedSeconds"] isEqual:@123]);
     assert(!job[@"items"][0][@"sourceURL"]); // Never substitute a preview for a full track.
     assert(!SGNativeCollectionJob(html(track), @"spotify:track:5aIp2IBhStp31hkyLG6ssZ", nil));
+    NSMutableDictionary *wrongIdentity = [track mutableCopy]; wrongIdentity[@"uri"] = @"spotify:track:5aIp2IBhStp31hkyLG6ssZ";
+    assert(!SGNativeCollectionJob(html(wrongIdentity), uri, nil));
     assert(!SGNativeCollectionJob([@"<html>Unavailable</html>" dataUsingEncoding:NSUTF8StringEncoding], uri, nil));
     NSDictionary *list = @{@"type":@"playlist", @"id":@"1Imj2Uc2NVvyHgrAouKQo3", @"title":@"Test", @"trackList":@[
         @{@"uri":uri, @"title":@"First", @"subtitle":@"Artist", @"duration":@123000},
         @{@"uri":uri, @"title":@"Duplicate", @"subtitle":@"Artist", @"duration":@123000}]};
     job = SGNativeCollectionJob(html(list), @"spotify:playlist:1Imj2Uc2NVvyHgrAouKQo3", nil);
     assert([job[@"items"] count] == 2 && [job[@"items"][1][@"position"] isEqual:@2]);
+    assert(![job[@"completeMetadata"] boolValue]); // An embed never proves the complete private/native list.
+
+    NSMutableDictionary *mixed = [list mutableCopy];
+    mixed[@"trackList"] = @[
+        NSNull.null, @{@"uri":@"spotify:episode:4DNTHdu4F7eTNuhyLQvEzG"},
+        list[@"trackList"][0], @{@"uri":@"spotify:local:Artist:Album:Song:123"},
+        @{@"uri":@"spotify:track:5aIp2IBhStp31hkyLG6ssZ", @"title":@"Last", @"subtitle":@"Other Artist"}];
+    NSString *reason = @"A stale error must not survive a successful parse";
+    job = SGNativeCollectionJob(html(mixed), @"spotify:playlist:1Imj2Uc2NVvyHgrAouKQo3", &reason);
+    assert(job && !reason && [job[@"items"] count] == 2);
+    assert([job[@"items"][0][@"position"] isEqual:@1] && [job[@"items"][1][@"position"] isEqual:@2]);
+    assert([job[@"items"][1][@"spotify"] isEqual:@"https://open.spotify.com/track/5aIp2IBhStp31hkyLG6ssZ"]);
+    assert([job[@"items"][1][@"artist"] isEqual:@"Other Artist"]);
+    assert([job[@"scope"] containsString:@"3 élément(s)"] && ![job[@"completeMetadata"] boolValue]);
+    // Check the real persisted-job validator too: skipping entries must keep valid positions.
+    assert(SGAutomaticJob([NSJSONSerialization dataWithJSONObject:job options:0 error:nil]));
+
+    NSMutableArray *large = [NSMutableArray array];
+    for (NSUInteger i = 0; i < 501; i++) [large addObject:list[@"trackList"][0]];
+    mixed[@"trackList"] = large;
+    job = SGNativeCollectionJob(html(mixed), @"spotify:playlist:1Imj2Uc2NVvyHgrAouKQo3", nil);
+    assert([job[@"items"] count] == 500 && [job[@"items"][499][@"position"] isEqual:@500]);
+    assert([job[@"scope"] containsString:@"500 morceaux"] && ![job[@"completeMetadata"] boolValue]);
+    assert(SGAutomaticJob([NSJSONSerialization dataWithJSONObject:job options:0 error:nil]));
+
+    mixed[@"trackList"] = @[@{@"uri":@"spotify:local:Artist:Album:Song:123"}, NSNull.null];
+    assert(!SGNativeCollectionJob(html(mixed), @"spotify:playlist:1Imj2Uc2NVvyHgrAouKQo3", &reason) && reason.length);
+    assert(!SGNativeCollectionJob(nil, uri, &reason) && [reason containsString:@"connexion"]);
+    assert(!SGNativeCollectionJob([@"<html>Unavailable</html>" dataUsingEncoding:NSUTF8StringEncoding], uri, &reason));
+    assert([reason containsString:@"privée"]);
     assert(!SGNativeMetadataEntity(html(@{@"props":NSNull.null}), uri));
     puts("Native collection metadata: PASS");
 } return 0; }
