@@ -6,6 +6,7 @@
 #import <math.h>
 #import <objc/runtime.h>
 #import <CommonCrypto/CommonDigest.h>
+#import "LocalLockScreenArtwork.h"
 
 // Album animated-artwork fallback v4.0.3-test — refresh synthetic video when its cover changes.
 // Reference: v4.0.1 strict no-square handoff, commit 54d961f.
@@ -42,6 +43,7 @@ static NSDictionary *sgLastRawNowPlayingInfo;
 static NSUInteger sgEmptyPacketGeneration;
 static CFTimeInterval sgLastNonEmptyPacketAt;
 static IMP sgOriginalAnimatedArtworkInit;
+static __weak MPNowPlayingInfoCenter *sgArtworkCenter;
 
 static NSString *SGString(id value) {
     return [value isKindOfClass:NSString.class] ? (NSString *)value : nil;
@@ -636,6 +638,7 @@ static void SGWriteKenBurnsVideo(UIImage *sourceImage, CGSize target, NSURL *url
 }
 
 static void SGEnsureFastSyntheticArtwork(NSString *albumKey, UIImage *cover) {
+    if (SGLocalLockScreenSnapshot(sgLastRawNowPlayingInfo)) return;
     if (!albumKey.length || !SGUsableCover(cover)) return;
     NSString *fingerprint = SGCoverFingerprint(cover);
     NSMutableDictionary *coverState = [sgSyntheticCoverStates objectForKey:albumKey];
@@ -772,6 +775,23 @@ static id SGSyntheticArtworkForAlbum(NSString *albumKey, UIImage *cover, BOOL ta
     return nil;
 }
 
+void SGRefreshLocalSystemArtwork(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSDictionary *raw = sgLastRawNowPlayingInfo;
+        if (!sgArtworkCenter || !SGLocalLockScreenSnapshot(raw)) return;
+        NSMutableDictionary *current = [raw mutableCopy];
+        NSNumber *elapsed = raw[MPNowPlayingInfoPropertyElapsedPlaybackTime];
+        NSNumber *rate = raw[MPNowPlayingInfoPropertyPlaybackRate];
+        if ([elapsed respondsToSelector:@selector(doubleValue)] &&
+            [rate respondsToSelector:@selector(doubleValue)]) {
+            NSTimeInterval age = MAX(0, CFAbsoluteTimeGetCurrent() - sgLastNonEmptyPacketAt);
+            current[MPNowPlayingInfoPropertyElapsedPlaybackTime] = @(elapsed.doubleValue + age * rate.doubleValue);
+        }
+        SG_DEBUG_EVENT(@"local.system.refresh", @"track=%@", SGDebugQuote(SGTrackArtworkKey(raw)));
+        sgArtworkCenter.nowPlayingInfo = current;
+    });
+}
+
 %hook MPNowPlayingInfoCenter
 
 - (void)setNowPlayingInfo:(NSDictionary *)info {
@@ -800,6 +820,24 @@ static id SGSyntheticArtworkForAlbum(NSString *albumKey, UIImage *cover, BOOL ta
     ++sgEmptyPacketGeneration;
     sgLastNonEmptyPacketAt = CFAbsoluteTimeGetCurrent();
     sgLastRawNowPlayingInfo = [info copy];
+    sgArtworkCenter = self;
+    NSDictionary *localSnapshot = SGLocalLockScreenSnapshot(info);
+    if (localSnapshot) {
+        SGClearPreviousHold();
+        sgCurrentTrackKey = SGTrackArtworkKey(info);
+        sgPresentedSquareArtwork = nil;
+        sgPresentedTallArtwork = nil;
+        sgBlackTransitionActive = NO;
+        sgBlackTransitionTrackKey = nil;
+        NSMutableDictionary *localInfo = [info mutableCopy];
+        if (@available(iOS 26.0, *)) {
+            [localInfo removeObjectForKey:MPNowPlayingInfoProperty1x1AnimatedArtwork];
+            [localInfo removeObjectForKey:MPNowPlayingInfoProperty3x4AnimatedArtwork];
+        }
+        localInfo[MPMediaItemPropertyArtwork] = localSnapshot[MPMediaItemPropertyArtwork] ?: SGBlackArtwork();
+        %orig(SG_DEBUG_OUTPUT(debugPacket, @"local-system-static-artwork", localInfo));
+        return;
+    }
 
     if (@available(iOS 26.0, *)) {
         NSString *albumKey = SGAlbumArtworkKey(info);

@@ -1,11 +1,12 @@
 // Local files can have an embedded cover visible in the library while Spotify's
 // mini/full player shows its missing-image glyph. Read that same cover from Documents.
-// Isolated from MPNowPlayingInfoCenter, Canvas and lock-screen animated artwork.
+// Embedded artwork is also exposed to the system for confirmed local tracks.
 // Revert by removing this file, or set SGLocalArtworkFallbackDisabled = YES.
 #import "Core/SGCore.h"
 #import "Headers/SPTPlayer.h"
 #import <AVFoundation/AVFoundation.h>
 #import <math.h>
+#import "LocalLockScreenArtwork.h"
 
 static NSObject *sg_localLock;
 static NSString *sg_localObserved, *sg_localURI, *sg_localTitle;
@@ -24,6 +25,37 @@ static __weak UIScrollView *sg_localMaskedList;
 static CALayer *sg_localPreviousMask;
 static CAShapeLayer *sg_localArtworkMask;
 static NSString *localNormalized(NSString *value);
+
+// Separate from the held UI image: a previous song's cover is never exported.
+static NSDictionary *sg_localSystemTrack;
+static MPMediaItemArtwork *sg_localSystemArtwork;
+
+NSDictionary *SGLocalLockScreenSnapshot(NSDictionary *info) {
+    if (!sg_localLock || ![info isKindOfClass:NSDictionary.class] || !info.count ||
+        [NSUserDefaults.standardUserDefaults boolForKey:@"SGLocalLockScreenArtworkDisabled"]) return nil;
+    @synchronized (sg_localLock) {
+        NSDictionary *track = sg_localSystemTrack;
+        if (!track) return nil;
+        // The player state is authoritative for local playback. Spotify can map
+        // its external content ID/album/duration to a catalogue entry; those are
+        // not a reliable local-file identity. Match the current title AND artist.
+        if (![localNormalized(info[MPMediaItemPropertyTitle]) isEqual:track[@"title"]] ||
+            ![localNormalized(info[MPMediaItemPropertyArtist]) isEqual:track[@"artist"]]) return nil;
+        return sg_localSystemArtwork ? @{MPMediaItemPropertyArtwork: sg_localSystemArtwork} : @{};
+    }
+}
+
+static void localPublishSystemCover(UIImage *image, NSUInteger generation) {
+    MPMediaItemArtwork *artwork = image ? [[MPMediaItemArtwork alloc] initWithBoundsSize:image.size
+        requestHandler:^UIImage *(CGSize size) { return image; }] : nil;
+    @synchronized (sg_localLock) {
+        if (generation != sg_localGeneration || !sg_localSystemTrack) return;
+        sg_localSystemArtwork = artwork;
+    }
+    SGLog(@"[SGArtworkDebug] local.system.cover generation=%lu image=%@",
+          (unsigned long)generation, image ? NSStringFromCGSize(image.size) : @"pending");
+    SGRefreshLocalSystemArtwork();
+}
 
 static UIImage *localBlackCover(void) {
     static UIImage *black;
@@ -308,6 +340,10 @@ static void localObserveState(id state) {
         if ([identity isEqualToString:sg_localObserved]) return;
         sg_localObserved = identity.copy;
         generation = ++sg_localGeneration;
+        sg_localSystemArtwork = nil;
+        sg_localSystemTrack = local && title.length && artist.length ? @{
+            @"title": localNormalized(title), @"artist": localNormalized(artist), @"uri": uri
+        } : nil;
     }
     dispatch_async(dispatch_get_main_queue(), ^{
         if (!localCurrent(generation)) return;
@@ -334,6 +370,7 @@ static void localObserveState(id state) {
         UIImage *cached = [sg_localCovers objectForKey:uri];
         if (cached) {
             sg_localImage = cached;
+            localPublishSystemCover(cached, generation);
             sg_localOverlay.image = cached;
             sg_localFullOverlay.image = cached;
             localApplyBar(sg_localBar);
@@ -341,6 +378,7 @@ static void localObserveState(id state) {
             return;
         }
         sg_localPending = YES;
+        localPublishSystemCover(nil, generation);
         localApplyBar(sg_localBar);
         localApplyFullPlayer(sg_localFullList);
         SGLog(@"[SGLocalArtwork] transition hold: %@", title);
@@ -360,6 +398,7 @@ static void localObserveState(id state) {
                 if (!localCurrent(generation) || ![uri isEqualToString:sg_localURI]) return;
                 sg_localPending = NO;
                 sg_localImage = image ?: localBlackCover();
+                localPublishSystemCover(image, generation);
                 if (image) {
                     NSUInteger cost = (NSUInteger)(image.size.width * image.scale * image.size.height * image.scale * 4);
                     [sg_localCovers setObject:image forKey:uri cost:cost];

@@ -1,7 +1,8 @@
 #pragma once
 #import <MediaPlayer/MediaPlayer.h>
 
-// A snapshot only for a confirmed spotify:local: player state whose metadata
-// matches this Now Playing packet. Nil means the normal animated path applies.
-// An empty dictionary means a local track whose cover is still unavailable.
+// Nil: normal online pipeline. Empty: confirmed local track awaiting its cover.
+// Otherwise contains only the current local track's MPMediaItemArtwork.
 FOUNDATION_EXPORT NSDictionary *SGLocalLockScreenSnapshot(NSDictionary *info);
+// Re-publish the latest raw system packet, not a UI-held cover or modified getter.
+FOUNDATION_EXPORT void SGRefreshLocalSystemArtwork(void);
