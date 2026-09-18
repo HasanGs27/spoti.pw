@@ -16,8 +16,8 @@ static NSCache<NSString *, UIImage *> *sg_localCovers;
 static NSCache<NSString *, NSDictionary *> *sg_localFileRecords;
 static BOOL sg_localPending;
 static dispatch_queue_t sg_localQueue;
-static __weak UIView *sg_localBar;
-static __weak UIImageView *sg_localOverlay;
+static NSHashTable<UIView *> *sg_localBars;
+static char sg_localBarOverlayKey;
 static __weak UIScrollView *sg_localFullList;
 static __weak UIImageView *sg_localFullOverlay;
 static CGRect sg_localFullViewportFrame;
@@ -190,16 +190,27 @@ static BOOL localCurrent(NSUInteger generation) {
     @synchronized (sg_localLock) { return generation == sg_localGeneration; }
 }
 
+static void localRemoveBarOverlay(UIView *bar) {
+    UIImageView *overlay = objc_getAssociatedObject(bar, &sg_localBarOverlayKey);
+    [overlay removeFromSuperview];
+    if (bar) objc_setAssociatedObject(bar, &sg_localBarOverlayKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
 static void localRemoveOverlay(void) {
-    [sg_localOverlay removeFromSuperview];
-    sg_localOverlay = nil;
+    for (UIView *bar in sg_localBars.allObjects) localRemoveBarOverlay(bar);
 }
 
 static void localApplyBar(UIView *bar) {
-    if (!bar || !bar.window || !sg_localImage || ![sg_localURI hasPrefix:@"spotify:local:"]) {
-        localRemoveOverlay();
+    if (!bar) return;
+    [sg_localBars addObject:bar];
+    // Navigation can briefly retain both the outgoing and incoming player.
+    // A detached bar must never clear the incoming bar's image.
+    if (!sg_localImage || ![sg_localURI hasPrefix:@"spotify:local:"]) {
+        localRemoveBarOverlay(bar);
         return;
     }
+    if (!bar.window) return;
+    UIImageView *overlay = objc_getAssociatedObject(bar, &sg_localBarOverlayKey);
     // Keep its existing overlay while Spotify updates the title/layout.
     __block BOOL titleMatches = NO;
     SGForEachView(bar, ^(UIView *view) {
@@ -213,22 +224,21 @@ static void localApplyBar(UIView *bar) {
     __block UIView *host = nil;
     SGForEachView(bar, ^(UIView *view) {
         CGSize size = view.bounds.size;
-        if (host || view == sg_localOverlay || view.hidden || view.alpha <= 0 ||
+        if (host || view == overlay || view.hidden || view.alpha <= 0 ||
             size.width < 36 || size.width > 48 || fabs(size.width - size.height) > 1 ||
             CGRectGetMinX(SGFrameIn(view, bar)) > bar.bounds.size.width * 0.25) return;
         NSString *name = NSStringFromClass(view.class);
         if (view.layer.cornerRadius <= 0 && ![name containsString:@"CoverArtTiltView"]) return;
         __block BOOL hasImage = NO;
         SGForEachView(view, ^(UIView *child) {
-            if ([child isKindOfClass:UIImageView.class] && child != sg_localOverlay) hasImage = YES;
+            if ([child isKindOfClass:UIImageView.class] && child != overlay) hasImage = YES;
         });
         if (hasImage) host = view;
     });
     if (!host) return;
 
-    UIImageView *overlay = sg_localOverlay;
     if (!overlay || overlay.superview != bar) {
-        localRemoveOverlay();
+        localRemoveBarOverlay(bar);
         overlay = [[UIImageView alloc] initWithFrame:host.bounds];
         overlay.userInteractionEnabled = NO;
         overlay.isAccessibilityElement = NO;
@@ -236,14 +246,22 @@ static void localApplyBar(UIView *bar) {
         overlay.clipsToBounds = YES;
         overlay.backgroundColor = UIColor.blackColor;
         [bar addSubview:overlay];
-        sg_localOverlay = overlay;
-        SGLog(@"[SGLocalArtwork] mini-player cover applied: %@", sg_localTitle);
+        objc_setAssociatedObject(bar, &sg_localBarOverlayKey, overlay, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        SGLog(@"[SGLocalArtwork] mini-player owned cover applied: %@", sg_localTitle);
     }
     overlay.image = sg_localImage;
     overlay.frame = [host convertRect:host.bounds toView:bar];
     overlay.layer.cornerRadius = host.layer.cornerRadius;
     overlay.layer.cornerCurve = kCACornerCurveContinuous;
     [bar bringSubviewToFront:overlay];
+}
+
+static void localApplyBars(void) {
+    for (UIView *bar in sg_localBars.allObjects) {
+        UIImageView *overlay = objc_getAssociatedObject(bar, &sg_localBarOverlayKey);
+        overlay.image = sg_localImage;
+        localApplyBar(bar);
+    }
 }
 
 // Only local disk I/O on the serial worker. No network and no modifications to
@@ -322,6 +340,9 @@ static void localObserveState(id state) {
     SPTPlayerTrack *track = [state respondsToSelector:@selector(track)] ? [state track] : nil;
     id rawURI = [track respondsToSelector:@selector(URI)] ? track.URI : nil;
     NSString *uri = [rawURI isKindOfClass:NSURL.class] ? [rawURI absoluteString] : localText([rawURI description]);
+    // A tab's temporary empty player state is not a confirmed track change.
+    // Keep the current artwork until a real URI replaces it.
+    if (!track || !uri.length) return;
     BOOL local = [uri hasPrefix:@"spotify:local:"];
     NSString *title = local && [track respondsToSelector:@selector(trackTitle)] ? localText(track.trackTitle) : @"";
     NSString *artist = local && [track respondsToSelector:@selector(artistName)] ? localText(track.artistName) : @"";
@@ -360,9 +381,8 @@ static void localObserveState(id state) {
         if (!holdingLocal) sg_localImage = localBlackCover();
         if (!title.length || !artist.length) {
             sg_localImage = localBlackCover();
-            sg_localOverlay.image = sg_localImage;
             sg_localFullOverlay.image = sg_localImage;
-            localApplyBar(sg_localBar);
+            localApplyBars();
             localApplyFullPlayer(sg_localFullList);
             return;
         }
@@ -371,24 +391,22 @@ static void localObserveState(id state) {
         if (cached) {
             sg_localImage = cached;
             localPublishSystemCover(cached, generation);
-            sg_localOverlay.image = cached;
             sg_localFullOverlay.image = cached;
-            localApplyBar(sg_localBar);
+            localApplyBars();
             localApplyFullPlayer(sg_localFullList);
             return;
         }
         sg_localPending = YES;
         localPublishSystemCover(nil, generation);
-        localApplyBar(sg_localBar);
+        localApplyBars();
         localApplyFullPlayer(sg_localFullList);
         SGLog(@"[SGLocalArtwork] transition hold: %@", title);
         // A missing/slow cover must not leave the previous track's image forever.
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             if (!localCurrent(generation) || !sg_localPending) return;
             sg_localImage = localBlackCover();
-            sg_localOverlay.image = sg_localImage;
             sg_localFullOverlay.image = sg_localImage;
-            localApplyBar(sg_localBar);
+            localApplyBars();
             localApplyFullPlayer(sg_localFullList);
         });
         dispatch_async(sg_localQueue, ^{
@@ -403,9 +421,8 @@ static void localObserveState(id state) {
                     NSUInteger cost = (NSUInteger)(image.size.width * image.scale * image.size.height * image.scale * 4);
                     [sg_localCovers setObject:image forKey:uri cost:cost];
                 }
-                sg_localOverlay.image = sg_localImage;
                 sg_localFullOverlay.image = sg_localImage;
-                localApplyBar(sg_localBar);
+                localApplyBars();
                 localApplyFullPlayer(sg_localFullList);
             });
         });
@@ -421,10 +438,17 @@ static void localObserveState(id state) {
 %end
 
 %hook _TtC18NowPlaying_BarImpl27NowPlayingBarViewController
+- (void)viewWillAppear:(BOOL)animated {
+    %orig;
+    localApplyBar(((UIViewController *)self).viewIfLoaded);
+}
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+    localApplyBar(((UIViewController *)self).viewIfLoaded);
+}
 - (void)viewDidLayoutSubviews {
     %orig;
-    sg_localBar = ((UIViewController *)self).viewIfLoaded;
-    localApplyBar(sg_localBar);
+    localApplyBar(((UIViewController *)self).viewIfLoaded);
 }
 %end
 
@@ -456,6 +480,7 @@ static void localObserveState(id state) {
 %ctor {
     if ([NSUserDefaults.standardUserDefaults boolForKey:@"SGLocalArtworkFallbackDisabled"]) return;
     sg_localLock = [NSObject new];
+    sg_localBars = [NSHashTable weakObjectsHashTable];
     sg_localCovers = [NSCache new];
     sg_localCovers.countLimit = 16;
     sg_localCovers.totalCostLimit = 16 * 1024 * 1024;
