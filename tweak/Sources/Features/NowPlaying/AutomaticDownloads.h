@@ -10,7 +10,8 @@ UIViewController *SGAutomaticDownloadsPageCreate(void);
 BOOL SGAutomaticDownloadEntity(id entity, UIView *source);
 void SGAutomaticDownloadObservePlayer(id player);
 // Main-thread snapshot. Green is reserved for files verified by the download engine.
-// Keys: state (idle/running/ready/incomplete/error/partial/paused), completed, total, progress.
+// Keys: state (idle/queued/running/ready/incomplete/error/partial/paused), completed, total, progress.
+// queuePosition is one-based for queued collections, otherwise zero.
 NSDictionary *SGAutomaticDownloadStatus(id entity);
 // Immutable, verified snapshots, safe from the native player's dispatch queue.
 NSDictionary *SGAutomaticDownloadedRow(id track);

@@ -197,6 +197,44 @@ NSArray<NSNumber *> *SGAutomaticPreparationOrder(NSArray<NSDictionary *> *items)
     [untried addObjectsFromArray:failed]; return [untried copy];
 }
 
+static NSString *summaryTrackURL(id value) {
+    NSString *url = SGAutomaticSpotifyURL(value);
+    return [url containsString:@"/track/"] ? url : nil;
+}
+static NSSet *summaryTrackURLs(NSSet *values) {
+    NSMutableSet *urls = [NSMutableSet set];
+    if ([values isKindOfClass:NSSet.class]) for (id value in values) {
+        NSString *url = summaryTrackURL(value); if (url) [urls addObject:url];
+    }
+    return urls;
+}
+NSDictionary<NSString *, NSNumber *> *SGAutomaticDownloadSummary(NSArray<NSDictionary *> *items,
+    NSSet<NSString *> *verifiedReadyURLs, NSSet<NSString *> *failedURLs, NSString *activeSpotifyURL) {
+    if (![items isKindOfClass:NSArray.class]) items = @[];
+    NSSet *readyURLs = summaryTrackURLs(verifiedReadyURLs), *errors = summaryTrackURLs(failedURLs);
+    NSString *active = summaryTrackURL(activeSpotifyURL);
+    NSMutableArray *identities = [NSMutableArray arrayWithCapacity:items.count];
+    NSUInteger activeIndex = NSNotFound, ready = 0, failed = 0, waiting = 0, running = 0;
+    for (NSUInteger i = 0; i < items.count; i++) {
+        NSDictionary *row = [items[i] isKindOfClass:NSDictionary.class] ? items[i] : @{};
+        NSString *identity = summaryTrackURL(row[@"spotify"]); [identities addObject:identity ?: NSNull.null];
+        if (active && [identity isEqual:active] && ![readyURLs containsObject:identity]) {
+            if (activeIndex == NSNotFound || (![items[activeIndex][@"state"] isEqual:@"running"] && [row[@"state"] isEqual:@"running"]))
+                activeIndex = i;
+        }
+    }
+    for (NSUInteger i = 0; i < items.count; i++) {
+        NSDictionary *row = [items[i] isKindOfClass:NSDictionary.class] ? items[i] : @{};
+        id identity = identities[i];
+        if ([readyURLs containsObject:identity]) ready++;
+        else if (i == activeIndex) running++;
+        else if ([errors containsObject:identity] || [row[@"state"] isEqual:@"error"]) failed++;
+        else waiting++;
+    }
+    return @{@"total":@(items.count), @"ready":@(ready), @"failed":@(failed), @"waiting":@(waiting),
+        @"running":@(running), @"processed":@(ready + failed)};
+}
+
 BOOL SGAutomaticDurationMatches(NSDictionary *row, double actualSeconds) {
     if (!isfinite(actualSeconds) || actualSeconds < 1 || actualSeconds > 86400) return NO;
     id expected = row[@"expectedSeconds"];
@@ -215,6 +253,39 @@ NSString *SGAutomaticRowState(NSDictionary *row, BOOL exists, BOOL active, BOOL 
 #ifdef SG_AUTOMATIC_DOWNLOAD_TEST
 #include <assert.h>
 static NSData *fixture(id value) { return [NSJSONSerialization dataWithJSONObject:value options:0 error:nil]; }
+static void summaryTests(void) {
+    NSString *a = @"https://open.spotify.com/track/aaaaaaaaaaaaaaaaaaaaaa";
+    NSString *b = @"https://open.spotify.com/track/bbbbbbbbbbbbbbbbbbbbbb";
+    NSString *c = @"https://open.spotify.com/track/cccccccccccccccccccccc";
+    NSString *d = @"https://open.spotify.com/track/dddddddddddddddddddddd";
+    NSString *e = @"https://open.spotify.com/track/eeeeeeeeeeeeeeeeeeeeee";
+    NSString *f = @"https://open.spotify.com/track/ffffffffffffffffffffff";
+    NSArray *items = @[@{@"spotify":a, @"state":@"ready"}, @{@"spotify":b, @"state":@"error"},
+        @{@"spotify":b, @"state":@"waiting"}, @{@"spotify":c, @"state":@"error"}, @{@"spotify":c, @"state":@"running"},
+        @{@"spotify":d, @"state":@"running"}, @{@"spotify":e, @"state":@"waiting"}, @{@"spotify":f, @"state":@"error"},
+        @{@"spotify":@"https://open.spotify.com.evil/track/aaaaaaaaaaaaaaaaaaaaaa", @"state":@"ready"}];
+    NSSet *ready = [NSSet setWithArray:@[@" spotify:track:bbbbbbbbbbbbbbbbbbbbbb ",
+        @"https://open.spotify.com.evil/track/aaaaaaaaaaaaaaaaaaaaaa", @"https://open.spotify.com/playlist/aaaaaaaaaaaaaaaaaaaaaa"]];
+    NSSet *errors = [NSSet setWithArray:@[[e stringByAppendingString:@"?si=shared"], c]];
+    NSDictionary *summary = SGAutomaticDownloadSummary(items, ready, errors, @"spotify:track:cccccccccccccccccccccc");
+    assert(([summary isEqual:@{@"total":@9, @"ready":@2, @"failed":@3, @"waiting":@3, @"running":@1, @"processed":@5}]));
+    // Persisted running states are not active after a restart, and errors never count as saved music.
+    NSDictionary *paused = SGAutomaticDownloadSummary(items, ready, errors, nil);
+    assert([paused[@"running"] isEqual:@0] && [paused[@"waiting"] isEqual:@3] && [paused[@"failed"] isEqual:@4]);
+    assert([paused[@"ready"] isEqual:@2] && [paused[@"processed"] isEqual:@6]);
+    // A verified shared file satisfies every occurrence, even if one was active or had an older error.
+    NSDictionary *savedActive = SGAutomaticDownloadSummary(items, ready, errors, b);
+    assert([savedActive[@"running"] isEqual:@0] && [savedActive[@"ready"] isEqual:@2]);
+    NSArray *duplicates = @[@{@"spotify":a, @"state":@"waiting"}, @{@"spotify":a, @"state":@"waiting"}];
+    NSDictionary *singleActive = SGAutomaticDownloadSummary(duplicates, nil, nil, a);
+    assert([singleActive[@"running"] isEqual:@1] && [singleActive[@"waiting"] isEqual:@1] && [singleActive[@"processed"] isEqual:@0]);
+    assert(([SGAutomaticDownloadSummary(@[], nil, nil, nil) isEqual:@{@"total":@0, @"ready":@0, @"failed":@0, @"waiting":@0, @"running":@0, @"processed":@0}]));
+    for (NSDictionary *counts in @[summary, paused, singleActive]) {
+        assert([counts[@"total"] unsignedIntegerValue] == [counts[@"ready"] unsignedIntegerValue] + [counts[@"failed"] unsignedIntegerValue] +
+            [counts[@"waiting"] unsignedIntegerValue] + [counts[@"running"] unsignedIntegerValue]);
+        assert([counts[@"processed"] unsignedIntegerValue] == [counts[@"ready"] unsignedIntegerValue] + [counts[@"failed"] unsignedIntegerValue]);
+    }
+}
 static void clearHistoryTests(void) {
     NSString *a = @"https://open.spotify.com/track/3DaGnKmAAmyZGIbC0KjmxT";
     NSString *b = @"https://open.spotify.com/track/4DNTHdu4F7eTNuhyLQvEzG";
@@ -267,6 +338,7 @@ static void clearHistoryTests(void) {
     assert(([order isEqual:@[@2, @3, @4, @0, @1, @5]] && !SGAutomaticPreparationOrder(@[]).count));
 }
 int main(void) { @autoreleasepool {
+    summaryTests();
     clearHistoryTests();
     assert(SGAutomaticSpotifyURL(@"spotify:playlist:1Imj2Uc2NVvyHgrAouKQo3"));
     assert([SGAutomaticSpotifyURL(@" https://open.spotify.com/intl-fr/track/3DaGnKmAAmyZGIbC0KjmxT?si=shared ")

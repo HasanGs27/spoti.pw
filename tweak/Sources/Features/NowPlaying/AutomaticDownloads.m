@@ -96,6 +96,7 @@ static void tell(NSString *message) {
 @property (atomic) BOOL busy;
 @property (atomic) BOOL clearing;
 @property (atomic) NSUInteger generation;
+@property (atomic) NSUInteger verificationRevision;
 @property (atomic, copy) NSString *message;
 @property (atomic, copy) NSDictionary *job;
 @property (atomic, copy) NSDictionary *history;
@@ -113,6 +114,7 @@ static void tell(NSString *message) {
 @property (atomic) BOOL preparingAudio;
 @property (atomic, strong) id resolverToken;
 @property (nonatomic) CFTimeInterval lastProgressNotification;
+@property (nonatomic) BOOL notificationPending;
 @property (nonatomic) UIBackgroundTaskIdentifier backgroundTask;
 @property (nonatomic, strong) NSCache *covers;
 @property (atomic, strong) NSURL *root;
@@ -128,6 +130,7 @@ static void tell(NSString *message) {
 - (void)resume;
 - (void)pause;
 - (void)clearUnfinished;
+- (void)removeQueued:(NSString *)url;
 - (void)play:(NSUInteger)position;
 - (void)submitPending;
 - (void)follow:(NSDictionary *)initial root:(NSURL *)root generation:(NSUInteger)generation;
@@ -207,6 +210,7 @@ static void tell(NSString *message) {
         [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) {
             if (!engine.busy) dispatch_async(engine.worker, ^{
                 for (NSDictionary *row in engine.localRows.allValues) verifyRow(row);
+                engine.verificationRevision += 1;
                 [engine update:engine.message];
             });
         }];
@@ -215,7 +219,14 @@ static void tell(NSString *message) {
 }
 - (void)update:(NSString *)message {
     if (message) self.message = message;
-    dispatch_async(dispatch_get_main_queue(), ^{ [NSNotificationCenter.defaultCenter postNotificationName:changed object:self]; });
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (self.notificationPending) return;
+        self.notificationPending = YES;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+            self.notificationPending = NO;
+            [NSNotificationCenter.defaultCenter postNotificationName:changed object:self];
+        });
+    });
 }
 - (void)selectJob:(NSDictionary *)job {
     if (self.busy || !job) return;
@@ -234,8 +245,16 @@ static void tell(NSString *message) {
     [NSUserDefaults.standardUserDefaults setObject:job[@"url"] forKey:@"spotifyglass.automaticDownloads.last"];
 }
 - (NSDictionary *)merged:(NSDictionary *)job {
+    if (!job) return nil;
     NSMutableDictionary *available = [NSMutableDictionary dictionary];
-    for (NSString *key in self.localRows) if (onPhone(self.localRows[key])) available[key] = self.localRows[key];
+    NSMutableSet *checked = [NSMutableSet set];
+    NSDictionary *locals = self.localRows;
+    for (NSDictionary *row in job[@"items"]) {
+        NSString *key = row[@"spotify"];
+        if (!key || [checked containsObject:key]) continue;
+        [checked addObject:key];
+        if (onPhone(locals[key])) available[key] = locals[key];
+    }
     return SGAutomaticMergeLocalRows(job, available);
 }
 - (void)remember:(NSDictionary *)row {
@@ -322,6 +341,13 @@ static void tell(NSString *message) {
     self.queuedURLs = queue; [NSUserDefaults.standardUserDefaults setObject:queue forKey:queueKey];
     [self start:next];
 }
+- (void)removeQueued:(NSString *)url {
+    if (self.clearing || ![self.queuedURLs containsObject:url]) return;
+    NSMutableArray *queue = [self.queuedURLs mutableCopy]; [queue removeObject:url];
+    self.queuedURLs = queue;
+    [NSUserDefaults.standardUserDefaults setObject:queue forKey:queueKey];
+    [self update:@"Sélection retirée de la file. Tes fichiers sont conservés."];
+}
 - (void)saveError:(NSString *)reason row:(NSDictionary *)row {
     if (!row[@"spotify"]) return;
     NSMutableDictionary *errors = [self.importErrors mutableCopy] ?: [NSMutableDictionary dictionary];
@@ -395,7 +421,6 @@ static void tell(NSString *message) {
             NSMutableDictionary *failures = [self.collectionErrors mutableCopy]; failures[url] = reason ?: @"Connexion indisponible."; self.collectionErrors = failures;
             NSString *failure = reason ?: @"Connexion indisponible. Réessaie avec du réseau.";
             [self finish:failure generation:generation];
-            dispatch_async(dispatch_get_main_queue(), ^{ if (generation == self.generation) tell(failure); });
             return;
         }
         [self saveJob:job];
@@ -526,6 +551,8 @@ static void tell(NSString *message) {
     NSString *canonical = SGAutomaticSpotifyURL(url);
     if (!canonical) return;
     if (self.busy) {
+        if ([canonical isEqual:self.activeCollection]) { [self update:@"Cette sélection est déjà en cours."]; return; }
+        if ([self.queuedURLs containsObject:canonical]) { [self update:@"Cette sélection est déjà dans la file d'attente."]; return; }
         if (![canonical isEqual:self.activeCollection] && ![self.queuedURLs containsObject:canonical]) {
             if (self.queuedURLs.count >= 10) { [self update:@"Dix sélections sont déjà en attente."]; return; }
             self.queuedURLs = [self.queuedURLs arrayByAddingObject:canonical];
@@ -534,9 +561,11 @@ static void tell(NSString *message) {
         [self update:@"Sélection ajoutée à la file. Le téléchargement en cours continue."]; return;
     }
     self.userPaused = NO;
-    if (![[NSUserDefaults.standardUserDefaults stringForKey:modeKey] isEqual:@"pc"]) { [self startDevice:canonical]; return; }
+    if (![[NSUserDefaults.standardUserDefaults stringForKey:modeKey] isEqual:@"pc"]) { self.pending = nil; [self startDevice:canonical]; return; }
+    self.devicePendingURL = nil;
+    [NSUserDefaults.standardUserDefaults removeObjectForKey:@"spotifyglass.automaticDownloads.pendingDevice"];
     self.pending = @{@"url":canonical, @"request_id":NSUUID.UUID.UUIDString};
-    if (!self.root) { [self update:@"Connecte le PC ci-dessus : la sélection sera ensuite envoyée automatiquement."]; return; }
+    if (!self.root) { [self update:@"Associe le PC dans Options et nettoyage : la sélection sera ensuite envoyée automatiquement."]; return; }
     [self submitPending];
 }
 - (void)submitPending {
@@ -571,7 +600,9 @@ static void tell(NSString *message) {
     NSURL *target = rowFile(row);
     if (verifyRow(row)) return YES;
     NSURL *url = [[root URLByAppendingPathComponent:@"file"] URLByAppendingPathComponent:row[@"id"]];
+    self.preparingAudio = YES; self.transferProgress = 0;
     NSURL *file = [self fetch:[NSURLRequest requestWithURL:url] limit:[row[@"bytes"] unsignedIntegerValue] generation:generation];
+    self.preparingAudio = NO; self.transferProgress = 0;
     if (!file) return NO;
     NSNumber *bytes = nil; [file getResourceValue:&bytes forKey:NSURLFileSizeKey error:nil];
     BOOL valid = [bytes isEqual:row[@"bytes"]] && [fileHash(file) isEqual:row[@"id"]];
@@ -685,6 +716,11 @@ static void tell(NSString *message) {
 - (void)resume {
     if (self.busy) return;
     self.userPaused = NO;
+    BOOL pc = [[NSUserDefaults.standardUserDefaults stringForKey:modeKey] isEqual:@"pc"];
+    NSString *selection = self.pending[@"url"] ?: self.devicePendingURL ?: self.job[@"url"];
+    BOOL switchMode = (self.pending && !pc) || (self.devicePendingURL && pc) ||
+        (!self.pending && !self.devicePendingURL && self.job && pc == [self.job[@"engine"] isEqual:@"device"]);
+    if (selection && switchMode) { [self start:selection]; return; }
     if (self.pending) { [self submitPending]; return; }
     if (self.devicePendingURL) { [self startDevice:self.devicePendingURL]; return; }
     if ([self.job[@"engine"] isEqual:@"device"]) {
@@ -699,6 +735,11 @@ static void tell(NSString *message) {
     }
     if (!self.job && self.queuedURLs.count) { [self advanceQueue]; return; }
     if (!self.job || !self.root) { [self update:@"Connecte le PC puis utilise une flèche de téléchargement."]; return; }
+    if ([@[@"partial", @"error", @"complete", @"interrupted"] containsObject:self.job[@"state"]]) {
+        // A completed server job cannot retry itself. A fresh request reuses
+        // verified PC files and asks the worker to prepare only missing ones.
+        [self start:self.job[@"url"]]; return;
+    }
     self.busy = YES; NSUInteger generation = ++self.generation;
     self.activeCollection = self.job[@"url"]; [self beginBackgroundAllowance];
     NSDictionary *job = self.job; NSURL *root = self.root;
@@ -776,128 +817,274 @@ static void tell(NSString *message) {
 }
 @end
 
+@interface SGDownloadProgressCell : UITableViewCell
+@property(nonatomic, strong) UIProgressView *progress;
+@end
+@implementation SGDownloadProgressCell
+- (instancetype)initWithStyle:(UITableViewCellStyle)style reuseIdentifier:(NSString *)identifier {
+    if ((self = [super initWithStyle:style reuseIdentifier:identifier])) {
+        _progress = [[UIProgressView alloc] initWithProgressViewStyle:UIProgressViewStyleDefault];
+        _progress.progressTintColor = SGGreen(); _progress.trackTintColor = [UIColor colorWithWhite:1 alpha:0.12];
+        _progress.isAccessibilityElement = NO; [self.contentView addSubview:_progress];
+    }
+    return self;
+}
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    self.progress.frame = CGRectMake(16, self.contentView.bounds.size.height - 18, MAX(0, self.contentView.bounds.size.width - 32), 3);
+    [self.contentView bringSubviewToFront:self.progress];
+}
+@end
+
 @interface SGAutomaticDownloadsPage : SGPage <UIDocumentPickerDelegate>
 @property (nonatomic, strong) UIView *note;
+@property (nonatomic, strong) UISegmentedControl *filter;
+@property (nonatomic, strong) UIView *filterHeader;
+@property (nonatomic, strong) UILabel *filterTitle;
 @property (nonatomic, copy) NSArray *historyURLs;
+@property (nonatomic, copy) NSArray *queuedURLs;
+@property (nonatomic, copy) NSArray<NSNumber *> *positions;
 @property (nonatomic, copy) NSDictionary *displayJob;
 @property (nonatomic, copy) NSDictionary *displayHistory;
+@property (nonatomic, copy) NSDictionary *summary;
+@property (nonatomic, copy) NSSet *readyURLs;
+@property (nonatomic, copy) NSSet *failedURLs;
+@property (nonatomic, strong) NSDictionary *rawJob;
+@property (nonatomic, strong) NSDictionary *rawLocals;
+@property (nonatomic, strong) NSDictionary *rawErrors;
 @property (nonatomic, copy) NSDictionary *pickedRow;
 @property (nonatomic, copy) NSDictionary *pickedSelection;
+@property (nonatomic) CFTimeInterval lastInsetCheck;
+@property (nonatomic) NSUInteger verificationRevision;
 - (void)chooseMode:(UITableViewCell *)cell;
+- (void)addLink;
+- (void)showActions:(UITableViewCell *)cell;
+- (void)fillCell:(UITableViewCell *)cell at:(NSIndexPath *)path;
 @end
 @implementation SGAutomaticDownloadsPage
-- (instancetype)init { if ((self = [super initWithStyle:UITableViewStyleInsetGrouped])) self.title = @"Téléchargements automatiques"; return self; }
+- (instancetype)init { if ((self = [super initWithStyle:UITableViewStyleInsetGrouped])) self.title = @"Téléchargements"; return self; }
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.note = SGNote(@"La flèche d'une playlist lance la recherche sur cet iPhone. Vert : fichier vérifié et enregistré. Rouge : touche le titre pour réessayer, choisir un fichier ou coller un lien. Garde Spotify ouvert pendant la préparation. Les morceaux disponibles dépendent des sources trouvées.");
+    self.note = SGNote(@"Garde Spotify ouvert pendant la préparation. Les fichiers terminés restent disponibles hors ligne.");
     self.tableView.tableHeaderView = self.note;
+    self.filter = [[UISegmentedControl alloc] initWithItems:@[@"Tout", @"À compléter", @"Téléchargés"]];
+    self.filter.selectedSegmentIndex = 0; self.filter.accessibilityLabel = @"Afficher les morceaux";
+    [self.filter addTarget:self action:@selector(filterChanged:) forControlEvents:UIControlEventValueChanged];
+    self.filterHeader = [[UIView alloc] initWithFrame:CGRectMake(0, 0, self.tableView.bounds.size.width, 82)];
+    self.filterTitle = [[UILabel alloc] initWithFrame:CGRectMake(16, 4, self.tableView.bounds.size.width - 32, 25)];
+    self.filterTitle.font = [UIFont preferredFontForTextStyle:UIFontTextStyleHeadline];
+    self.filterTitle.textColor = UIColor.whiteColor;
+    self.filterTitle.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+    self.filter.frame = CGRectMake(16, 37, self.tableView.bounds.size.width - 32, 32);
+    self.filter.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+    [self.filterHeader addSubview:self.filterTitle]; [self.filterHeader addSubview:self.filter];
     [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(refresh:) name:changed object:SGAutomaticDownloads.shared];
     [self refresh:nil];
 }
 - (void)dealloc { [NSNotificationCenter.defaultCenter removeObserver:self]; }
+- (void)viewWillAppear:(BOOL)animated { [super viewWillAppear:animated]; [self refresh:nil]; }
+- (void)filterChanged:(UISegmentedControl *)sender { [self refresh:nil]; }
 - (void)refresh:(NSNotification *)note {
-    // A coherent main-thread snapshot prevents row counts changing underneath table callbacks.
-    self.displayJob = [SGAutomaticDownloads.shared merged:SGAutomaticDownloads.shared.job];
-    self.displayHistory = SGAutomaticDownloads.shared.history;
-    self.historyURLs = [self.displayHistory.allKeys sortedArrayUsingSelector:@selector(compare:)];
-    [self.tableView reloadData];
-}
-- (void)viewWillLayoutSubviews { [super viewWillLayoutSubviews]; SGFitNote(self.tableView, self.note, 16, 16); }
-- (void)viewDidLayoutSubviews { [super viewDidLayoutSubviews]; SGInsetForBars(self.tableView); }
-- (NSInteger)numberOfSectionsInTableView:(UITableView *)table { return 3; }
-- (NSInteger)tableView:(UITableView *)table numberOfRowsInSection:(NSInteger)section {
-    return section == 0 ? 6 : section == 1 ? [self.displayJob[@"items"] count] : self.historyURLs.count;
-}
-- (NSString *)tableView:(UITableView *)table titleForHeaderInSection:(NSInteger)section {
-    return section == 1 ? (self.displayJob[@"name"] ?: @"Sélection") : section == 2 ? @"Sélections enregistrées" : nil;
-}
-- (NSString *)tableView:(UITableView *)table titleForFooterInSection:(NSInteger)section {
-    return section == 1 ? self.displayJob[@"scope"] : nil;
-}
-- (CGFloat)tableView:(UITableView *)table heightForRowAtIndexPath:(NSIndexPath *)path { return path.section == 0 && path.row == 5 ? 140 : 70; }
-- (UITableViewCell *)tableView:(UITableView *)table cellForRowAtIndexPath:(NSIndexPath *)path {
-    UITableViewCell *cell = SGDequeueCell(table, @"auto-download");
-    cell.accessoryView = nil;
+    if (note && !self.viewIfLoaded.window) return;
     SGAutomaticDownloads *engine = SGAutomaticDownloads.shared;
-    if (path.section == 0) {
-        BOOL phone = ![[NSUserDefaults.standardUserDefaults stringForKey:modeKey] isEqual:@"pc"];
-        NSArray *titles = @[phone ? @"Cet iPhone · autonome" : @"PC associé", @"Ajouter un lien Spotify", engine.busy ? @"Mettre en pause" : @"Reprendre", @"Réessayer les titres manquants", engine.clearing ? @"Nettoyage en cours…" : @"Nettoyer les téléchargements", @"État"];
-        NSString *detail = path.row == 5 ? engine.message : path.row == 4 ? @"Retire les attentes et les échecs · fichiers conservés" : path.row == 0 ? @"Choisir le mode de préparation" : nil;
-        if (path.row == 5 && engine.queuedURLs.count) detail = [detail stringByAppendingFormat:@"\n%lu sélection(s) en attente.", (unsigned long)engine.queuedURLs.count];
-        SGFillCell(cell, titles[path.row], detail, nil, nil);
-    } else if (path.section == 1) {
-        NSDictionary *row = self.displayJob[@"items"][path.row];
-        BOOL active = engine.busy && ([row[@"spotify"] isEqual:engine.activeSpotify] ||
-            ([engine.job[@"id"] isEqual:self.displayJob[@"id"]] && [row[@"state"] isEqual:@"running"]));
-        NSString *error = engine.importErrors[row[@"spotify"]];
-        NSString *state = SGAutomaticRowState(row, onPhone(row), active, error.length > 0);
-        BOOL ready = [state isEqual:@"ready"], failed = [state isEqual:@"error"], running = [state isEqual:@"running"];
-        NSString *status = ready ? @"Sur l'iPhone · toucher pour lire" : failed ? (error ?: @"Échec · toucher pour ajouter une source") :
-            running ? @"En cours…" : @"En attente · toucher pour ajouter un fichier";
-        SGFillCell(cell, row[@"title"], [NSString stringWithFormat:@"%@ · %@", row[@"artist"], status], nil, ready ? @"arrow.down.circle.fill" : @"arrow.down.circle");
-        UIListContentConfiguration *content = (UIListContentConfiguration *)cell.contentConfiguration;
-        content.imageProperties.tintColor = ready ? SGGreen() : failed ? SGRed() : SGGrey();
-        cell.contentConfiguration = content;
-        cell.accessibilityLabel = [NSString stringWithFormat:@"%@, %@", row[@"title"], status];
-        if (running) {
-            UIActivityIndicatorView *spinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
-            [spinner startAnimating]; cell.accessoryView = spinner;
+    NSString *oldURL = self.displayJob[@"url"];
+    NSArray *oldPositions = self.positions, *oldHistory = self.historyURLs, *oldQueue = self.queuedURLs;
+    // Progress ticks reuse immutable snapshots and never re-scan every audio file.
+    if (!self.summary || self.rawJob != engine.job || self.rawLocals != engine.localRows || self.rawErrors != engine.importErrors || self.verificationRevision != engine.verificationRevision || !note) {
+        self.rawJob = engine.job; self.rawLocals = engine.localRows; self.rawErrors = engine.importErrors;
+        self.verificationRevision = engine.verificationRevision;
+        self.displayJob = [engine merged:engine.job];
+        NSMutableSet *ready = [NSMutableSet set], *checked = [NSMutableSet set];
+        for (NSDictionary *row in self.displayJob[@"items"]) {
+            NSString *url = row[@"spotify"];
+            if ([checked containsObject:url]) continue;
+            [checked addObject:url]; if (onPhone(row)) [ready addObject:url];
+        }
+        self.readyURLs = ready; self.failedURLs = [NSSet setWithArray:engine.importErrors.allKeys];
+    }
+    self.summary = SGAutomaticDownloadSummary(self.displayJob[@"items"], self.readyURLs, self.failedURLs, engine.busy ? engine.activeSpotify : nil);
+    NSMutableArray *positions = [NSMutableArray array];
+    NSArray *items = self.displayJob[@"items"];
+    for (NSUInteger i = 0; i < items.count; i++) {
+        BOOL ready = [self.readyURLs containsObject:items[i][@"spotify"]];
+        if (self.filter.selectedSegmentIndex == 0 || (self.filter.selectedSegmentIndex == 1 && !ready) || (self.filter.selectedSegmentIndex == 2 && ready)) [positions addObject:@(i)];
+    }
+    self.positions = positions; self.queuedURLs = engine.queuedURLs ?: @[];
+    self.displayHistory = engine.history;
+    NSMutableArray *history = [[engine.history.allKeys sortedArrayUsingSelector:@selector(compare:)] mutableCopy];
+    [history removeObject:self.displayJob[@"url"] ?: @""]; self.historyURLs = history;
+    self.filterTitle.text = self.displayJob[@"name"] ?: @"Mes morceaux";
+    BOOL sameSelection = [(oldURL ?: @"") isEqual:(self.displayJob[@"url"] ?: @"")];
+    BOOL structural = !sameSelection || ![oldPositions isEqual:self.positions] || ![oldHistory isEqual:self.historyURLs] || ![oldQueue isEqual:self.queuedURLs];
+    if (structural) {
+        CGPoint offset = self.tableView.contentOffset;
+        [UIView performWithoutAnimation:^{ [self.tableView reloadData]; [self.tableView layoutIfNeeded]; }];
+        if (sameSelection) {
+            CGFloat minimum = -self.tableView.adjustedContentInset.top;
+            CGFloat maximum = MAX(minimum, self.tableView.contentSize.height - self.tableView.bounds.size.height + self.tableView.adjustedContentInset.bottom);
+            offset.y = MIN(maximum, MAX(minimum, offset.y)); [self.tableView setContentOffset:offset animated:NO];
         }
     } else {
-        NSDictionary *job = self.displayHistory[self.historyURLs[path.row]];
-        SGFillCell(cell, job[@"name"], @"Ouvrir les copies de cette sélection", nil, @"music.note.list");
+        // Keep the scroll position, selection and gestures during transfer progress.
+        for (NSIndexPath *path in self.tableView.indexPathsForVisibleRows) [self fillCell:[self.tableView cellForRowAtIndexPath:path] at:path];
     }
-    cell.detailTextLabel.numberOfLines = 0;
-    return cell;
+}
+- (void)viewWillLayoutSubviews { [super viewWillLayoutSubviews]; SGFitNote(self.tableView, self.note, 10, 8); }
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    if (CACurrentMediaTime() - self.lastInsetCheck > 0.7) { self.lastInsetCheck = CACurrentMediaTime(); SGInsetForBars(self.tableView); }
+}
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)table { return 4; }
+- (NSInteger)tableView:(UITableView *)table numberOfRowsInSection:(NSInteger)section {
+    return section == 0 ? 4 : section == 1 ? MAX(1, self.positions.count) : section == 2 ? self.queuedURLs.count : self.historyURLs.count;
+}
+- (NSString *)tableView:(UITableView *)table titleForHeaderInSection:(NSInteger)section {
+    return section == 2 && self.queuedURLs.count ? @"À suivre" : section == 3 && self.historyURLs.count ? @"Mes sélections" : nil;
+}
+- (UIView *)tableView:(UITableView *)table viewForHeaderInSection:(NSInteger)section {
+    if (section == 1) return self.filterHeader;
+    NSString *title = [self tableView:table titleForHeaderInSection:section];
+    return title ? SGSectionHeader(table, title) : nil;
+}
+- (CGFloat)tableView:(UITableView *)table heightForHeaderInSection:(NSInteger)section {
+    return section == 1 ? 82 : [self tableView:table titleForHeaderInSection:section] ? SGSectionHeaderHeight : 12;
+}
+- (NSString *)tableView:(UITableView *)table titleForFooterInSection:(NSInteger)section {
+    if (section == 2 && self.queuedURLs.count) return @"Glisse une sélection vers la gauche pour la retirer de la file.";
+    return section == 1 && [self.displayJob[@"items"] count] && ![self.displayJob[@"completeMetadata"] boolValue] && [self.displayJob[@"engine"] isEqual:@"device"] ? @"La liste accessible peut être incomplète." : nil;
+}
+- (CGFloat)tableView:(UITableView *)table heightForRowAtIndexPath:(NSIndexPath *)path { return path.section == 0 && path.row == 0 ? 142 : 70; }
+- (UITableViewCell *)tableView:(UITableView *)table cellForRowAtIndexPath:(NSIndexPath *)path {
+    UITableViewCell *cell;
+    if (path.section == 0 && path.row == 0) cell = [table dequeueReusableCellWithIdentifier:@"download-status"] ?: [[SGDownloadProgressCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"download-status"];
+    else cell = SGDequeueCell(table, @"auto-download");
+    [self fillCell:cell at:path]; return cell;
+}
+- (void)fillCell:(UITableViewCell *)cell at:(NSIndexPath *)path {
+    if (!cell) return;
+    SGAutomaticDownloads *engine = SGAutomaticDownloads.shared;
+    UIActivityIndicatorView *previousSpinner = [cell.accessoryView isKindOfClass:UIActivityIndicatorView.class] ? (id)cell.accessoryView : nil;
+    cell.accessoryView = nil; cell.accessoryType = UITableViewCellAccessoryNone;
+    cell.accessibilityLabel = nil; cell.accessibilityHint = nil; cell.accessibilityValue = nil;
+    NSUInteger total = [self.summary[@"total"] unsignedIntegerValue], ready = [self.summary[@"ready"] unsignedIntegerValue];
+    NSUInteger failed = [self.summary[@"failed"] unsignedIntegerValue], processed = [self.summary[@"processed"] unsignedIntegerValue];
+    if (path.section == 0) {
+        if (path.row == 0) {
+            BOOL opening = engine.busy && engine.activeCollection && ![self.displayJob[@"url"] isEqual:engine.activeCollection];
+            NSString *title = total && !opening ? [NSString stringWithFormat:@"%lu / %lu sur l'iPhone", (unsigned long)ready, (unsigned long)total] : engine.busy ? @"Préparation en cours" : @"Prêt à télécharger";
+            NSString *mode = [[NSUserDefaults.standardUserDefaults stringForKey:modeKey] isEqual:@"pc"] ? @"Préparation sur le PC" : @"Préparation sur cet iPhone";
+            NSString *counts = total && !opening ? [NSString stringWithFormat:@"%lu traités · %lu à vérifier", (unsigned long)processed, (unsigned long)failed] : @"Utilise la flèche d'une playlist ou ajoute un lien.";
+            SGFillCell(cell, title, [NSString stringWithFormat:@"%@\n%@\n%@", mode, counts, engine.message ?: @""], nil, nil);
+            UIListContentConfiguration *content = (id)cell.contentConfiguration;
+            content.textProperties.font = [UIFont preferredFontForTextStyle:UIFontTextStyleHeadline];
+            content.secondaryTextProperties.numberOfLines = 4;
+            content.directionalLayoutMargins = NSDirectionalEdgeInsetsMake(12, 16, 28, 16); cell.contentConfiguration = content;
+            double activeProgress = engine.busy && engine.activeSpotify ? MIN(0.98, MAX(0, engine.transferProgress)) : 0;
+            SGDownloadProgressCell *status = (id)cell; status.progress.hidden = total == 0 || opening;
+            [status.progress setProgress:total ? MIN(1, ((double)processed + activeProgress) / total) : 0 animated:!UIAccessibilityIsReduceMotionEnabled() && self.view.window != nil];
+            status.progress.progressTintColor = failed ? UIColor.systemOrangeColor : SGGreen();
+            cell.accessibilityLabel = [NSString stringWithFormat:@"%@. %@. %@", title, counts, engine.message ?: @""];
+        } else if (path.row == 1) {
+            BOOL allReady = total && ready == total;
+            NSString *title = engine.clearing ? @"Nettoyage en cours…" : engine.busy ? @"Mettre en pause" : allReady ? @"Écouter hors ligne" : self.displayJob || engine.devicePendingURL || engine.pending || engine.queuedURLs.count ? @"Reprendre la préparation" : @"Télécharger une sélection";
+            SGFillCell(cell, title, engine.busy ? @"Les morceaux terminés seront conservés" : nil, SGGreen(), engine.busy ? @"pause.circle.fill" : allReady ? @"play.circle.fill" : @"arrow.down.circle.fill");
+        } else if (path.row == 2) SGFillCell(cell, @"Ajouter un lien Spotify", engine.busy ? @"Ajouter une sélection à la suite" : @"Un morceau ou une playlist", nil, @"plus.circle");
+        else SGFillCell(cell, @"Options et nettoyage", @"Mode PC / iPhone · réessayer · nettoyer", nil, @"slider.horizontal.3");
+    } else if (path.section == 1) {
+        if (!self.positions.count) {
+            NSString *title = !total ? @"Aucun morceau pour le moment" : self.filter.selectedSegmentIndex == 2 ? @"Pas encore de fichier terminé" : @"Tout est disponible sur l'iPhone";
+            SGFillCell(cell, title, !total ? @"Lance une playlist avec sa flèche de téléchargement." : nil, SGGrey(), @"music.note"); return;
+        }
+        NSDictionary *row = self.displayJob[@"items"][[self.positions[path.row] unsignedIntegerValue]];
+        BOOL active = engine.busy && [row[@"spotify"] isEqual:engine.activeSpotify] && ![self.readyURLs containsObject:row[@"spotify"]];
+        NSString *state = SGAutomaticRowState(row, [self.readyURLs containsObject:row[@"spotify"]], active, [self.failedURLs containsObject:row[@"spotify"]]);
+        BOOL downloaded = [state isEqual:@"ready"], error = [state isEqual:@"error"];
+        NSString *status = downloaded ? @"Disponible hors ligne" : error ? @"À compléter · toucher pour choisir une source" : active ? engine.preparingAudio ? [NSString stringWithFormat:@"Téléchargement · %.0f %%", engine.transferProgress * 100] : @"Recherche et préparation…" : engine.userPaused ? @"En pause" : @"En attente";
+        SGFillCell(cell, row[@"title"], [NSString stringWithFormat:@"%@\n%@", row[@"artist"], status], nil, downloaded ? @"arrow.down.circle.fill" : error ? @"exclamationmark.circle" : @"clock");
+        UIListContentConfiguration *content = (id)cell.contentConfiguration;
+        content.imageProperties.tintColor = downloaded ? SGGreen() : error ? SGRed() : SGGrey();
+        content.secondaryTextProperties.numberOfLines = 2; cell.contentConfiguration = content;
+        cell.accessibilityLabel = [NSString stringWithFormat:@"%@, %@, %@", row[@"title"], row[@"artist"], status];
+        if (active) {
+            UIActivityIndicatorView *spinner = previousSpinner ?: [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
+            [spinner startAnimating]; cell.accessoryView = spinner;
+        }
+    } else if (path.section == 2) {
+        NSString *url = self.queuedURLs[path.row];
+        SGFillCell(cell, self.displayHistory[url][@"name"] ?: @"Sélection en attente", [NSString stringWithFormat:@"Position %lu · toucher pour retirer", (unsigned long)path.row + 1], nil, @"clock");
+    } else {
+        NSDictionary *job = self.displayHistory[self.historyURLs[path.row]];
+        SGFillCell(cell, job[@"name"], @"Ouvrir cette sélection", nil, @"music.note.list"); cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+    }
+}
+- (UISwipeActionsConfiguration *)tableView:(UITableView *)table trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)path {
+    if (path.section != 2 || path.row >= self.queuedURLs.count) return nil;
+    NSString *url = self.queuedURLs[path.row];
+    UIContextualAction *remove = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleDestructive title:@"Retirer" handler:^(UIContextualAction *action, UIView *view, void (^done)(BOOL)) {
+        [SGAutomaticDownloads.shared removeQueued:url]; done(YES);
+    }];
+    return [UISwipeActionsConfiguration configurationWithActions:@[remove]];
 }
 - (void)tableView:(UITableView *)table didSelectRowAtIndexPath:(NSIndexPath *)path {
     [table deselectRowAtIndexPath:path animated:YES];
     SGAutomaticDownloads *engine = SGAutomaticDownloads.shared;
     if (engine.clearing) return;
     if (path.section == 1) {
-        if ([engine.job[@"id"] isEqual:self.displayJob[@"id"]]) {
-            NSDictionary *row = self.displayJob[@"items"][path.row];
-            if (onPhone(row)) [engine play:path.row];
-            else [self repair:row selection:self.displayJob cell:[table cellForRowAtIndexPath:path]];
-        }
-        else [self refresh:nil];
+        if (path.row >= self.positions.count) return;
+        NSUInteger index = [self.positions[path.row] unsignedIntegerValue];
+        if (index >= [self.displayJob[@"items"] count]) return;
+        if ([engine.job[@"id"] isEqual:self.displayJob[@"id"]] && index < [engine.job[@"items"] count] &&
+            [engine.job[@"items"][index][@"spotify"] isEqual:self.displayJob[@"items"][index][@"spotify"]]) {
+            NSDictionary *row = self.displayJob[@"items"][index];
+            if (onPhone(row)) [engine play:index]; else [self repair:row selection:self.displayJob cell:[table cellForRowAtIndexPath:path]];
+        } else [self refresh:nil];
         return;
     }
-    if (path.section == 2) {
-        if (engine.busy) { tell(@"Arrête d’abord le transfert iPhone pour changer de sélection."); return; }
+    if (path.section == 2) { if (path.row < self.queuedURLs.count) [engine removeQueued:self.queuedURLs[path.row]]; return; }
+    if (path.section == 3) {
+        if (path.row >= self.historyURLs.count) return;
+        if (engine.busy) { tell(@"Mets la préparation en pause pour ouvrir une autre sélection."); return; }
         [engine selectJob:self.displayHistory[self.historyURLs[path.row]]]; [self refresh:nil]; return;
     }
-    if (path.row == 2) { if (engine.busy) [engine pause]; else [engine resume]; return; }
-    if (path.row == 3) { if (engine.job && !engine.busy) [engine resume]; return; }
-    if (path.row == 4) { [engine clearUnfinished]; return; }
-    if (path.row > 1 || engine.busy) return;
-    if (path.row == 0) { [self chooseMode:[table cellForRowAtIndexPath:path]]; return; }
-    BOOL pairing = path.row == 0;
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:pairing ? @"Connecter le PC" : @"Télécharger un lien"
-        message:pairing ? @"Colle le lien d’association fourni par le PC." : @"Lien Spotify d’un morceau ou d’une playlist publique. La flèche évite cette saisie quand elle reconnaît la page."
-        preferredStyle:UIAlertControllerStyleAlert];
-    [alert addTextFieldWithConfigurationHandler:^(UITextField *field) {
-        field.keyboardType = UIKeyboardTypeURL; field.autocorrectionType = UITextAutocorrectionTypeNo;
-        field.autocapitalizationType = UITextAutocapitalizationTypeNone;
-        if (pairing) field.text = [NSUserDefaults.standardUserDefaults stringForKey:pairKey];
-    }];
+    if (path.row == 0) return;
+    if (path.row == 2) { [self addLink]; return; }
+    if (path.row == 3) { [self showActions:[table cellForRowAtIndexPath:path]]; return; }
+    if (engine.busy) [engine pause];
+    else if ([self.summary[@"total"] unsignedIntegerValue] && [self.summary[@"ready"] isEqual:self.summary[@"total"]]) [engine play:0];
+    else if (engine.job || engine.devicePendingURL || engine.pending || engine.queuedURLs.count) [engine resume];
+    else [self addLink];
+}
+- (void)addLink {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Ajouter une sélection" message:@"Colle le lien Spotify d'un morceau ou d'une playlist." preferredStyle:UIAlertControllerStyleAlert];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *field) { field.keyboardType = UIKeyboardTypeURL; field.autocorrectionType = UITextAutocorrectionTypeNo; field.autocapitalizationType = UITextAutocapitalizationTypeNone; field.placeholder = @"https://open.spotify.com/…"; }];
     [alert addAction:[UIAlertAction actionWithTitle:@"Annuler" style:UIAlertActionStyleCancel handler:nil]];
     __weak UIAlertController *weak = alert;
-    [alert addAction:[UIAlertAction actionWithTitle:pairing ? @"Connecter" : @"Télécharger" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        if (pairing) [engine connect:weak.textFields.firstObject.text ?: @""];
-        else {
-            NSString *url = SGAutomaticSpotifyURL(weak.textFields.firstObject.text);
-            if (url) [engine start:url]; else [engine update:@"Lien de morceau ou playlist Spotify invalide."];
-        }
+    [alert addAction:[UIAlertAction actionWithTitle:SGAutomaticDownloads.shared.busy ? @"Ajouter à la file" : @"Télécharger" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        NSString *url = SGAutomaticSpotifyURL(weak.textFields.firstObject.text);
+        if (url) [SGAutomaticDownloads.shared start:url]; else [SGAutomaticDownloads.shared update:@"Lien invalide : utilise un lien de morceau ou de playlist Spotify."];
     }]];
     [self presentViewController:alert animated:YES completion:nil];
 }
+- (void)showActions:(UITableViewCell *)cell {
+    SGAutomaticDownloads *engine = SGAutomaticDownloads.shared;
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"Options" message:@"Le PC est conseillé pour préparer les grandes playlists. Les copies restent sur l'iPhone." preferredStyle:UIAlertControllerStyleActionSheet];
+    UIAlertAction *mode = [UIAlertAction actionWithTitle:@"Choisir PC ou iPhone" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) { [self chooseMode:cell]; }];
+    mode.enabled = !engine.busy; [sheet addAction:mode];
+    UIAlertAction *retry = [UIAlertAction actionWithTitle:@"Réessayer les titres manquants" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) { [engine resume]; }];
+    retry.enabled = !engine.busy && self.displayJob != nil; [sheet addAction:retry];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Nettoyer les téléchargements" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) { [engine clearUnfinished]; }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Fermer" style:UIAlertActionStyleCancel handler:nil]];
+    sheet.popoverPresentationController.sourceView = cell ?: self.view;
+    sheet.popoverPresentationController.sourceRect = cell ? cell.bounds : self.view.bounds;
+    [self presentViewController:sheet animated:YES completion:nil];
+}
 - (void)chooseMode:(UITableViewCell *)cell {
-    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"Préparer les morceaux" message:@"Le mode iPhone fonctionne sans PC. Le réseau mobile peut être utilisé." preferredStyle:UIAlertControllerStyleActionSheet];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Cet iPhone · sans PC" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        [NSUserDefaults.standardUserDefaults setObject:@"device" forKey:modeKey]; [self refresh:nil];
+    SGAutomaticDownloads *engine = SGAutomaticDownloads.shared;
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"Préparer les morceaux" message:@"PC conseillé : laisse-le allumé et accessible pendant la préparation. L'écoute hors ligne fonctionne ensuite sans PC." preferredStyle:UIAlertControllerStyleActionSheet];
+    if (engine.root) [sheet addAction:[UIAlertAction actionWithTitle:@"Utiliser le PC associé" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        [engine connect:[NSUserDefaults.standardUserDefaults stringForKey:pairKey] ?: @""];
     }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Utiliser le PC associé" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+    [sheet addAction:[UIAlertAction actionWithTitle:engine.root ? @"Associer un autre PC" : @"Associer le PC — conseillé" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
         UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Connecter le PC" message:@"Colle le lien d'association fourni par le PC." preferredStyle:UIAlertControllerStyleAlert];
         [alert addTextFieldWithConfigurationHandler:^(UITextField *field) {
             field.keyboardType = UIKeyboardTypeURL; field.autocorrectionType = UITextAutocorrectionTypeNo;
@@ -908,6 +1095,9 @@ static void tell(NSString *message) {
         [alert addAction:[UIAlertAction actionWithTitle:@"Connecter" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) { [SGAutomaticDownloads.shared connect:weak.textFields.firstObject.text ?: @""]; }]];
         [self presentViewController:alert animated:YES completion:nil];
     }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Cet iPhone — mode de secours" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        [NSUserDefaults.standardUserDefaults setObject:@"device" forKey:modeKey]; [self refresh:nil];
+    }]];
     [sheet addAction:[UIAlertAction actionWithTitle:@"Annuler" style:UIAlertActionStyleCancel handler:nil]];
     sheet.popoverPresentationController.sourceView = cell ?: self.view;
     sheet.popoverPresentationController.sourceRect = cell ? cell.bounds : self.view.bounds;
@@ -917,7 +1107,7 @@ static void tell(NSString *message) {
     SGAutomaticDownloads *engine = SGAutomaticDownloads.shared;
     if (engine.busy) { tell(@"Arrête d'abord le transfert en cours. Les fichiers déjà enregistrés seront conservés."); return; }
     UIAlertController *sheet = [UIAlertController alertControllerWithTitle:row[@"title"]
-        message:@"Ajoute le fichier correspondant à ce morceau. La flèche passera au vert après vérification et enregistrement."
+        message:engine.importErrors[row[@"spotify"]] ?: @"Choisis une source pour ce morceau. La flèche passera au vert après vérification."
         preferredStyle:UIAlertControllerStyleActionSheet];
     [sheet addAction:[UIAlertAction actionWithTitle:@"Choisir un fichier audio" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
         self.pickedRow = row; self.pickedSelection = selection;
@@ -1021,10 +1211,11 @@ NSDictionary *SGAutomaticDownloadStatus(id entity) {
     BOOL running = engine.busy && ([url isEqual:engine.activeCollection] || [url isEqual:engine.activeSpotify]);
     BOOL queued = [engine.queuedURLs containsObject:url];
     BOOL complete = job[@"completeMetadata"] ? [job[@"completeMetadata"] boolValue] : ![job[@"engine"] isEqual:@"device"];
-    NSString *state = running || queued ? @"running" : total && ready == total ? (complete ? @"ready" : @"incomplete") :
+    NSString *state = running ? @"running" : queued ? @"queued" : total && ready == total ? (complete ? @"ready" : @"incomplete") :
         [job[@"state"] isEqual:@"interrupted"] ? @"paused" : ready ? @"partial" : failed || engine.collectionErrors[url] ? @"error" : @"idle";
     double progress = total ? ((double)ready + (running ? engine.transferProgress : 0)) / total : 0;
     return @{@"state":state, @"completed":@(ready), @"total":@(total), @"progress":@(MIN(1, MAX(0, progress))),
+        @"queuePosition":@(queued ? [engine.queuedURLs indexOfObject:url] + 1 : 0),
         @"completeMetadata":job[@"completeMetadata"] ?: @NO};
 }
 BOOL SGAutomaticDownloadEntity(id entity, UIView *source) {
@@ -1033,14 +1224,17 @@ BOOL SGAutomaticDownloadEntity(id entity, UIView *source) {
     if (!url || ![NSUserDefaults.standardUserDefaults boolForKey:@"SGAutomaticDownloadsEnabled"]) return NO;
     dispatch_async(dispatch_get_main_queue(), ^{
         NSDictionary *saved = engine.history[url];
+        if (engine.clearing) return;
         BOOL current = engine.busy && [url isEqual:engine.activeCollection];
-        if (!saved && !current && ![engine.queuedURLs containsObject:url]) {
+        BOOL queued = [engine.queuedURLs containsObject:url];
+        if (!saved && !current && !queued && !engine.collectionErrors[url]) {
             [engine start:url]; [[[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight] impactOccurred]; return;
         }
         UIViewController *owner = SGTopController();
         if (!owner || owner.presentedViewController) return;
         NSDictionary *status = SGAutomaticDownloadStatus(url);
-        NSString *message = [NSString stringWithFormat:@"%@/%@ morceaux sur l'iPhone", status[@"completed"], status[@"total"]];
+        NSString *message = engine.collectionErrors[url] ?: [NSString stringWithFormat:@"%@/%@ morceaux sur l'iPhone", status[@"completed"], status[@"total"]];
+        if (queued) message = [message stringByAppendingFormat:@"\nPosition %@ dans la file", status[@"queuePosition"]];
         if (saved && ![saved[@"completeMetadata"] boolValue] && [saved[@"engine"] isEqual:@"device"])
             message = [message stringByAppendingString:@"\nLa page publique peut ne fournir qu'une partie de la playlist."];
         UIAlertController *sheet = [UIAlertController alertControllerWithTitle:saved[@"name"] ?: @"Téléchargement" message:message preferredStyle:UIAlertControllerStyleActionSheet];
@@ -1049,6 +1243,7 @@ BOOL SGAutomaticDownloadEntity(id entity, UIView *source) {
             if (![owner isKindOfClass:SGAutomaticDownloadsPage.class]) SGShowPage(owner, SGAutomaticDownloadsPageCreate());
         }]];
         if (current) [sheet addAction:[UIAlertAction actionWithTitle:@"Mettre en pause" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) { [engine pause]; }]];
+        else if (queued) [sheet addAction:[UIAlertAction actionWithTitle:@"Retirer de la file" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) { [engine removeQueued:url]; }]];
         else if (![status[@"state"] isEqual:@"ready"]) [sheet addAction:[UIAlertAction actionWithTitle:engine.busy ? @"Ajouter à la file" : @"Reprendre les titres manquants" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
             if (engine.busy || !saved) [engine start:url];
             else { [engine selectJob:saved]; [engine resume]; }

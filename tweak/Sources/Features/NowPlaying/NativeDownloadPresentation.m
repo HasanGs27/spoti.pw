@@ -9,6 +9,20 @@
 
 static char bindingKey, registrationKey, pageStateKey;
 
+static UIImage *downloadSymbol(NSString *name) {
+    static NSCache<NSString *, UIImage *> *images;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ images = [NSCache new]; images.countLimit = 8; });
+    UIImage *image = [images objectForKey:name];
+    if (!image) {
+        CGFloat size = [name isEqual:@"arrow.down"] ? 15 : 25;
+        image = [UIImage systemImageNamed:name withConfiguration:
+            [UIImageSymbolConfiguration configurationWithPointSize:size weight:UIImageSymbolWeightRegular]];
+        if (image) [images setObject:image forKey:name];
+    }
+    return image;
+}
+
 static id objectGetter(id object, NSString *name) {
     if (!object) return nil;
     SEL selector = NSSelectorFromString(name);
@@ -48,9 +62,12 @@ static BOOL knownTarget(id object) {
 
 @interface SGNativeDownloadArrow : UIControl
 @property(nonatomic, strong) UIImageView *symbol;
+@property(nonatomic, strong) CAShapeLayer *ringTrack;
 @property(nonatomic, strong) CAShapeLayer *ring;
 @property(nonatomic, strong) UIActivityIndicatorView *spinner;
 @property(nonatomic, copy) NSDictionary *renderedStatus;
+@property(nonatomic) CGRect renderedBounds;
+@property(nonatomic) BOOL hasRenderedBounds;
 - (void)showStatus:(NSDictionary *)status;
 @end
 
@@ -62,8 +79,11 @@ static BOOL knownTarget(id object) {
         self.isAccessibilityElement = YES;
         self.accessibilityTraits = UIAccessibilityTraitButton;
         self.accessibilityIdentifier = @"spoti.download.playlist";
-        _symbol = [UIImageView new]; _symbol.contentMode = UIViewContentModeScaleAspectFit;
+        _symbol = [UIImageView new]; _symbol.contentMode = UIViewContentModeCenter;
         _symbol.userInteractionEnabled = NO; [self addSubview:_symbol];
+        _ringTrack = [CAShapeLayer layer]; _ringTrack.fillColor = UIColor.clearColor.CGColor;
+        _ringTrack.lineWidth = 2; _ringTrack.strokeColor = [UIColor colorWithWhite:1 alpha:.2].CGColor;
+        [self.layer addSublayer:_ringTrack];
         _ring = [CAShapeLayer layer]; _ring.fillColor = UIColor.clearColor.CGColor;
         _ring.lineWidth = 2; _ring.lineCap = kCALineCapRound; [self.layer addSublayer:_ring];
         _spinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
@@ -73,40 +93,78 @@ static BOOL knownTarget(id object) {
 }
 - (void)layoutSubviews {
     [super layoutSubviews];
+    if (self.hasRenderedBounds && CGRectEqualToRect(self.renderedBounds, self.bounds)) return;
+    self.hasRenderedBounds = YES; self.renderedBounds = self.bounds;
     CGFloat side = MIN(28, MIN(self.bounds.size.width, self.bounds.size.height));
     _symbol.frame = CGRectMake((self.bounds.size.width-side)/2, (self.bounds.size.height-side)/2, side, side);
     _spinner.center = CGPointMake(CGRectGetMidX(self.bounds), CGRectGetMidY(self.bounds));
     CGFloat radius = MAX(4, side/2 - 1);
-    _ring.frame = self.bounds;
-    _ring.path = [UIBezierPath bezierPathWithArcCenter:_spinner.center radius:radius
-        startAngle:-M_PI_2 endAngle:3*M_PI_2 clockwise:YES].CGPath;
+    UIBezierPath *path = [UIBezierPath bezierPathWithArcCenter:_spinner.center radius:radius
+        startAngle:-M_PI_2 endAngle:3*M_PI_2 clockwise:YES];
+    [CATransaction begin]; [CATransaction setDisableActions:YES];
+    _ring.frame = self.bounds; _ringTrack.frame = self.bounds;
+    _ring.path = path.CGPath; _ringTrack.path = path.CGPath;
+    [CATransaction commit];
+}
+- (void)setHighlighted:(BOOL)highlighted {
+    [super setHighlighted:highlighted];
+    CGFloat alpha = highlighted ? .6 : 1;
+    if (highlighted || UIAccessibilityIsReduceMotionEnabled()) self.alpha = alpha;
+    else [UIView animateWithDuration:.12 delay:0 options:UIViewAnimationOptionBeginFromCurrentState | UIViewAnimationOptionAllowUserInteraction
+        animations:^{ self.alpha = alpha; } completion:nil];
+}
+- (BOOL)accessibilityActivate {
+    if (!self.enabled || self.hidden) return NO;
+    [self sendActionsForControlEvents:UIControlEventTouchUpInside];
+    return YES;
 }
 - (void)showStatus:(NSDictionary *)status {
     if ([self.renderedStatus isEqual:status]) return;
+    NSDictionary *previous = self.renderedStatus;
     self.renderedStatus = [status copy];
     NSString *state = status[@"state"];
     BOOL ready = [state isEqual:@"ready"], error = [state isEqual:@"error"] || [state isEqual:@"partial"];
     BOOL incomplete = [state isEqual:@"incomplete"];
-    BOOL running = [state isEqual:@"running"];
+    BOOL running = [state isEqual:@"running"], queued = [state isEqual:@"queued"], paused = [state isEqual:@"paused"];
     CGFloat progress = MAX(0, MIN(1, [status[@"progress"] doubleValue]));
     UIColor *green = [UIColor colorWithRed:0.114 green:0.843 blue:0.376 alpha:1];
     UIColor *tint = ready ? green : incomplete ? UIColor.systemOrangeColor : error ? UIColor.systemRedColor : UIColor.lightGrayColor;
-    NSString *symbol = ready || incomplete ? @"arrow.down.circle.fill" : [state isEqual:@"paused"] ? @"pause.circle" : @"arrow.down.circle";
+    NSString *symbol = ready || incomplete ? @"arrow.down.circle.fill" : paused ? @"pause.circle" : queued ? @"clock" : @"arrow.down.circle";
     if (running && progress > 0) symbol = @"arrow.down";
-    _symbol.image = [UIImage systemImageNamed:symbol withConfiguration:
-        [UIImageSymbolConfiguration configurationWithPointSize:25 weight:UIImageSymbolWeightRegular]];
+    UIImage *image = downloadSymbol(symbol);
+    if (_symbol.image != image) _symbol.image = image;
     _symbol.tintColor = tint;
     _symbol.hidden = running && progress <= 0;
     _ring.hidden = !running || progress <= 0;
+    _ringTrack.hidden = _ring.hidden;
+    // Only interpolate real forward progress on an already running transfer.
+    // New queues, a reset count and Reduce Motion always snap to the true value.
+    CGFloat oldProgress = [previous[@"progress"] doubleValue];
+    BOOL animate = running && [previous[@"state"] isEqual:@"running"] && oldProgress > 0 &&
+        progress > oldProgress && !UIAccessibilityIsReduceMotionEnabled() && self.window;
+    CGFloat visibleProgress = _ring.presentationLayer ? ((CAShapeLayer *)_ring.presentationLayer).strokeEnd : _ring.strokeEnd;
     [CATransaction begin]; [CATransaction setDisableActions:YES];
     _ring.strokeColor = green.CGColor; _ring.strokeEnd = progress; [CATransaction commit];
+    if (animate) {
+        CABasicAnimation *change = [CABasicAnimation animationWithKeyPath:@"strokeEnd"];
+        change.fromValue = @(visibleProgress); change.toValue = @(progress); change.duration = .2;
+        [_ring addAnimation:change forKey:@"spoti.download.progress"];
+    } else if (progress != oldProgress || !running) [_ring removeAnimationForKey:@"spoti.download.progress"];
     if (running && progress <= 0) [_spinner startAnimating]; else [_spinner stopAnimating];
     _spinner.color = tint;
     NSUInteger completed = [status[@"completed"] unsignedIntegerValue], total = [status[@"total"] unsignedIntegerValue];
     self.accessibilityLabel = ready ? @"Téléchargée sur cet iPhone" : incomplete ? @"Titres accessibles enregistrés ; liste possiblement incomplète" : error ? @"Téléchargement à compléter" :
-        running ? @"Téléchargement en cours" : [state isEqual:@"paused"] ? @"Téléchargement en pause" : @"Télécharger sur cet iPhone";
-    self.accessibilityValue = total ? [NSString stringWithFormat:@"%lu sur %lu morceaux", (unsigned long)completed, (unsigned long)total] : nil;
-    self.accessibilityHint = error ? @"Ouvrir les morceaux manquants et ajouter une source" : incomplete ? @"Voir les titres récupérés et vérifier les morceaux manquants" : @"Ouvrir les téléchargements de cette playlist";
+        running ? @"Téléchargement en cours" : queued ? @"En attente de téléchargement" : paused ? @"Téléchargement en pause" : @"Télécharger sur cet iPhone";
+    NSString *value = total ? [NSString stringWithFormat:@"%lu sur %lu morceaux enregistrés", (unsigned long)completed, (unsigned long)total] : nil;
+    NSUInteger queuePosition = [status[@"queuePosition"] unsignedIntegerValue];
+    if (queued && queuePosition) {
+        NSString *position = [NSString stringWithFormat:@"Position %lu dans la file", (unsigned long)queuePosition];
+        value = value ? [position stringByAppendingFormat:@". %@", value] : position;
+    }
+    self.accessibilityValue = value;
+    self.accessibilityHint = error ? @"Ouvrir les morceaux manquants et ajouter une source" : incomplete ? @"Voir les titres récupérés et vérifier les morceaux manquants" :
+        queued ? @"Voir la sélection en attente" : running ? @"Voir la progression ou mettre en pause" : paused ? @"Voir les téléchargements et reprendre" :
+        ready ? @"Voir les morceaux enregistrés sur cet iPhone" : @"Commencer le téléchargement de cette playlist";
 }
 @end
 
@@ -133,14 +191,21 @@ static BOOL knownTarget(id object) {
 }
 - (void)dealloc { [NSNotificationCenter.defaultCenter removeObserver:self]; }
 - (void)changed:(NSNotification *)note {
+    // The engine persists rows and progress in UserDefaults. Those writes are not
+    // setting changes and already have their own coalesced status notification.
+    if ([note.name isEqual:NSUserDefaultsDidChangeNotification] && SGAutomaticDownloadIsEnabled()) return;
     if (NSThread.isMainThread) [self refresh];
     else { __weak typeof(self) weak = self; dispatch_async(dispatch_get_main_queue(), ^{ [weak refresh]; }); }
 }
 - (void)refresh {
     UIView *host = self.host;
     if (!host) return;
+    if (!SGAutomaticDownloadIsEnabled()) { [self restore]; return; }
+    // Retain the binding while the page is on the navigation stack, without
+    // resolving its responder chain or touching an offscreen spinner every tick.
+    if (!host.window) return;
     NSString *current = pageURL(owningPage(host));
-    if (!SGAutomaticDownloadIsEnabled() || !current || ![current isEqual:self.url]) {
+    if (!current || ![current isEqual:self.url]) {
         [self restore]; return;
     }
     for (UIView *child in host.subviews) {
@@ -225,7 +290,11 @@ static void diagnostic(UIViewController *page, NSString *url, NSArray<UIView *> 
 
 @interface SGNativeDownloadPageState : NSObject
 @property(nonatomic, weak) UIViewController *page;
+@property(nonatomic, weak) UIView *nativeHost;
+@property(nonatomic, weak) UIView *nativeSuperview;
+@property(nonatomic, weak) UIWindow *nativeWindow;
 @property(nonatomic) BOOL pending;
+@property(nonatomic) BOOL enabled;
 @property(nonatomic) CFTimeInterval lastScan;
 @property(nonatomic, strong) UIBarButtonItem *fallback;
 @property(nonatomic, strong) SGNativeDownloadArrow *fallbackArrow;
@@ -235,6 +304,7 @@ static void diagnostic(UIViewController *page, NSString *url, NSArray<UIView *> 
 @implementation SGNativeDownloadPageState
 - (instancetype)init {
     if ((self = [super init])) {
+        _enabled = SGAutomaticDownloadIsEnabled();
         [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(changed:) name:@"SGAutomaticDownloadsDidChange" object:nil];
         [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(changed:) name:NSUserDefaultsDidChangeNotification object:nil];
     }
@@ -243,7 +313,22 @@ static void diagnostic(UIViewController *page, NSString *url, NSArray<UIView *> 
 - (void)dealloc { [NSNotificationCenter.defaultCenter removeObserver:self]; }
 - (void)changed:(NSNotification *)note {
     __weak typeof(self) weak = self;
-    dispatch_async(dispatch_get_main_queue(), ^{ SGNativeDownloadRefreshPage(weak.page); });
+    dispatch_async(dispatch_get_main_queue(), ^{
+        SGNativeDownloadPageState *state = weak;
+        if (!state) return;
+        if ([note.name isEqual:NSUserDefaultsDidChangeNotification]) {
+            BOOL enabled = SGAutomaticDownloadIsEnabled();
+            if (state.enabled == enabled) return;
+            state.enabled = enabled;
+            SGNativeDownloadRefreshPage(state.page);
+            return;
+        }
+        // Progress never changes where Spotify placed its download control.
+        // Native bindings update themselves; only the navigation fallback needs
+        // this status refresh. Structural discovery remains driven by page layout.
+        if (state.fallbackArrow && state.page.viewIfLoaded.window && state.enabled)
+            [state.fallbackArrow showStatus:SGAutomaticDownloadStatus(pageURL(state.page)) ?: @{@"state":@"idle"}];
+    });
 }
 - (void)scan {
     self.pending = NO;
@@ -252,8 +337,25 @@ static void diagnostic(UIViewController *page, NSString *url, NSArray<UIView *> 
     UIView *root = page.viewIfLoaded;
     NSString *url = pageURL(page);
     BOOL enabled = SGAutomaticDownloadIsEnabled();
-    if (!root.window || !url || !enabled) {
+    self.enabled = enabled;
+    if (!root.window || root.hidden || root.alpha < .02 || !url || !enabled) {
         [self removeFallback]; return;
+    }
+    UIView *known = self.nativeHost;
+    SGNativeDownloadBinding *knownBinding = known ? objc_getAssociatedObject(known, &bindingKey) : nil;
+    BOOL attached = known && knownBinding && known.window == root.window && [known isDescendantOfView:root] && [knownBinding.url isEqual:url];
+    CGRect knownFrame = attached ? [known convertRect:known.bounds toView:root] : CGRectNull;
+    BOOL sameContainer = known.superview == self.nativeSuperview && known.window == self.nativeWindow;
+    CGSize knownSize = known.bounds.size;
+    BOOL knownCompact = knownSize.width >= 16 && knownSize.width <= 90 && knownSize.height >= 16 && knownSize.height <= 90;
+    BOOL visible = attached && sameContainer && knownCompact && CGRectIntersectsRect(knownFrame, root.bounds) &&
+        CGRectGetMidY(knownFrame) < MIN(root.bounds.size.height * .78, 700);
+    for (UIView *ancestor = known; visible && ancestor && ancestor != root; ancestor = ancestor.superview)
+        if (ancestor.hidden || ancestor.alpha < .02) visible = NO;
+    if (visible) {
+        // The same view, on the same identified playlist, can be refreshed without
+        // walking up to 1400 descendants on every layout/scroll animation.
+        [self removeFallback]; [knownBinding refresh]; return;
     }
     NSMutableArray<UIView *> *queue = [NSMutableArray arrayWithObject:root], *candidates = [NSMutableArray array], *suspects = [NSMutableArray array];
     NSUInteger visited = 0;
@@ -267,14 +369,25 @@ static void diagnostic(UIViewController *page, NSString *url, NSArray<UIView *> 
             CGRect frame = [view convertRect:view.bounds toView:root];
             BOOL compact = size.width >= 16 && size.width <= 90 && size.height >= 16 && size.height <= 90;
             BOOL header = CGRectGetMidY(frame) < MIN(root.bounds.size.height * .78, 700);
-            if (compact && header) { [candidates addObject:view]; continue; }
+            if (compact && header && CGRectIntersectsRect(frame, root.bounds)) { [candidates addObject:view]; continue; }
         }
         [queue addObjectsFromArray:view.subviews];
     }
     if (candidates.count == 1) {
+        if (known && known != candidates.firstObject && [knownBinding.url isEqual:url]) [knownBinding restore];
+        self.nativeHost = candidates.firstObject;
+        self.nativeSuperview = self.nativeHost.superview; self.nativeWindow = self.nativeHost.window;
         [self removeFallback]; installArrow(candidates.firstObject, url);
         diagnostic(page, url, candidates, @"attached");
     } else {
+        // Scrolling a known header out of view is not a replacement. Keep its
+        // binding intact so scrolling back does not briefly reveal the native icon.
+        if (!candidates.count && attached && sameContainer && knownCompact && !CGRectIntersectsRect(knownFrame, root.bounds)) {
+            [self removeFallback]; return;
+        }
+        self.nativeHost = nil;
+        self.nativeSuperview = nil; self.nativeWindow = nil;
+        if ([knownBinding.url isEqual:url]) [knownBinding restore];
         diagnostic(page, url, candidates.count ? candidates : suspects, candidates.count ? @"ambiguous-native-control" : @"native-control-not-found");
         // A navigation fallback is visible only when Spotify actually shows that bar.
         // Preserve existing items and never add a second button next to an identified arrow.
