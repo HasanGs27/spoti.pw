@@ -79,7 +79,9 @@ if ! xcrun -sdk iphoneos --find clang >/dev/null 2>&1; then
          TARGET_STRIP=strip TARGET_LIPO=lipo TARGET_CODESIGN_ALLOCATE=codesign_allocate TARGET_LIBTOOL=libtool
 fi
 # Theos builds its Swift support tools only at MAKELEVEL 0, and `make release` hands this script MAKELEVEL 1.
-env -u MAKELEVEL gmake -C "$ROOT/tweak" clean package >/dev/null
+# Keep compiling independent objects after a failure so one CI run reports all
+# integration errors. Any failed object still prevents linking and packaging.
+env -u MAKELEVEL gmake -k -C "$ROOT/tweak" clean package >/dev/null
 TWEAK_DEB="$(ls -t "$ROOT"/tweak/packages/*.deb | head -1)"
 echo "    $TWEAK_DEB"
 
