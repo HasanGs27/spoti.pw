@@ -13,16 +13,28 @@ on:
         type: choice
         options: [artifacts, filebin, both]
 
+  push:
+    branches:
+      - HasanGs27-patch-1
+    paths:
+      - "tweak/Sources/Features/NowPlaying/**"
+      - "scripts/pipeline.sh"
+      - "docs/app-icon.jpg"
+      - ".github/workflows/build-ipa.yml"
+
 env:
   THEOS: ${{ github.workspace }}/theos
+  SPOTIFY_IPA_URL: ${{ github.event_name == 'workflow_dispatch' && inputs.ipa_url || 'https://files.catbox.moe/1qbbn8.ipa' }}
 
 jobs:
   build:
     runs-on: macos-latest
+
     steps:
       - uses: actions/checkout@v5
 
       - uses: levibostian/action-hide-sensitive-inputs@v1
+        if: github.event_name == 'workflow_dispatch'
 
       - uses: maxim-lobanov/setup-xcode@v1
         with:
@@ -37,30 +49,40 @@ jobs:
       - name: Install tools
         run: |
           brew install make dpkg ldid
-          python3 -m pip install --break-system-packages git+https://github.com/asdfzxcvbn/pyzule-rw.git
+          python3 -m pip install --break-system-packages Pillow git+https://github.com/asdfzxcvbn/pyzule-rw.git
 
       - name: Download IPA
         run: |
           mkdir -p ipa
-          curl -fsSL "${{ inputs.ipa_url }}" -o ipa/spotify.ipa
-          case "$(file --mime-type -b ipa/spotify.ipa)" in application/zip|application/x-ios-app) ;; *) echo "::error::Not an IPA"; exit 1 ;; esac
+          curl -fsSL "$SPOTIFY_IPA_URL" -o ipa/spotify.ipa
+          case "$(file --mime-type -b ipa/spotify.ipa)" in
+            application/zip|application/x-ios-app) ;;
+            *) echo "::error::Not an IPA"; exit 1 ;;
+          esac
 
-      - run: make release
+      - name: Build IPA
+        env:
+          CYAN_PYTHON: python3
+        # Explicit bash also works if a phone upload loses pipeline.sh's executable bit.
+        run: bash scripts/pipeline.sh ipa/spotify.ipa --no-flex
 
       - uses: actions/upload-artifact@v5
-        if: inputs.upload_method != 'filebin'
+        if: github.event_name == 'push' || inputs.upload_method != 'filebin'
         with:
           name: spoti.ipa
           path: out/*.ipa
           if-no-files-found: error
 
       - name: Upload to filebin.net
-        if: inputs.upload_method != 'artifacts'
+        if: github.event_name == 'workflow_dispatch' && inputs.upload_method != 'artifacts'
         run: |
           BIN="spotifyglass-${{ github.run_id }}"
           echo "### filebin.net download" >> "$GITHUB_STEP_SUMMARY"
           for f in out/*.ipa; do
-            curl -fsS -X POST -H "Content-Type: application/octet-stream" --data-binary "@$f" "https://filebin.net/$BIN/$(basename "$f")" >/dev/null
+            curl -fsS -X POST \
+              -H "Content-Type: application/octet-stream" \
+              --data-binary "@$f" \
+              "https://filebin.net/$BIN/$(basename "$f")" >/dev/null
             echo "- https://filebin.net/$BIN/$(basename "$f")" >> "$GITHUB_STEP_SUMMARY"
           done
           echo "- _filebin deletes bins after a few days of inactivity, download promptly._" >> "$GITHUB_STEP_SUMMARY"

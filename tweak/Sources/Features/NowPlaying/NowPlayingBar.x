@@ -1,4 +1,4 @@
-// Now playing bar: the album-coloured card becomes a glass card with round artwork and the
+// Design A: the album-coloured card becomes a glass card with rounded-square artwork and the
 // progress line under the text. Spotify's own labels, buttons and gestures stay in place.
 //
 // The full screen player does not fade in over the bar, it morphs the bar's own card and artwork
@@ -13,9 +13,9 @@
 #import "Core/SGCore.h"
 #import "NowPlaying.h"
 
-static const CGFloat kCardRadius = 24;
+static const CGFloat kCardRadius = 18, kArtworkRadius = 10;
 static const NSTimeInterval kFadeOut = 0.12, kFadeIn = 0.2;
-static char kGlassKey, kRadiusKey;
+static char kGlassKey, kRadiusKey, kProgressFrameKey, kProgressTargetKey, kLayoutPendingKey;
 
 // The view carrying the glass pane, so the transition hooks reach it without the controllers.
 static __weak UIView *sg_barGlassHost = nil;
@@ -92,27 +92,55 @@ static void restoreRounding(UIView *root) {
     SGForEachView(root, ^(UIView *v) {
         NSNumber *saved = objc_getAssociatedObject(v, &kRadiusKey);
         if (saved) v.layer.cornerRadius = saved.doubleValue;
+        NSValue *frame = objc_getAssociatedObject(v, &kProgressFrameKey);
+        if (frame) {
+            v.frame = frame.CGRectValue;
+            objc_setAssociatedObject(v, &kProgressFrameKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(v, &kProgressTargetKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
     });
 }
 
 static void restyleCardContent(UIView *card) {
+    __block CGFloat artworkRight = 0;
     SGForEachView(card, ^(UIView *v) {
         CGSize size = v.bounds.size;
         BOOL square = size.width >= 36 && size.width <= 48 && fabs(size.width - size.height) < 1;
-        if (!square || v.layer.cornerRadius <= 0 || v.layer.cornerRadius >= size.width / 2) return;
+        CGRect inCard = SGFrameIn(v, card);
+        if (!square || v.layer.cornerRadius <= 0 || CGRectGetMinX(inCard) > card.bounds.size.width * 0.25) return;
+        artworkRight = MAX(artworkRight, CGRectGetMaxX(inCard));
         for (UIView *u = v; u && u != card && CGSizeEqualToSize(u.bounds.size, size); u = u.superview) {
-            roundView(u, size.width / 2);
+            roundView(u, MIN(kArtworkRadius, size.width / 4));
             u.clipsToBounds = YES;
         }
     });
+    // Follow Spotify's actual text/button layout rather than a fixed 226 pt line.
+    __block CGFloat textLeft = CGFLOAT_MAX;
+    __block CGFloat controlsLeft = card.bounds.size.width - 12;
+    SGForEachView(card, ^(UIView *v) {
+        if (v.hidden || v.alpha <= 0) return;
+        CGRect frame = SGFrameIn(v, card);
+        CGFloat left = CGRectGetMinX(frame);
+        if ([v isKindOfClass:UILabel.class] && ((UILabel *)v).text.length &&
+            frame.size.width > 40 && left >= artworkRight + 2 && left < card.bounds.size.width * 0.65)
+            textLeft = MIN(textLeft, left);
+        if ([v isKindOfClass:UIControl.class] && frame.size.width >= 20 && frame.size.width <= 80 &&
+            left > card.bounds.size.width * 0.55) controlsLeft = MIN(controlsLeft, left - 12);
+    });
+    if (textLeft == CGFLOAT_MAX) textLeft = MAX(52, artworkRight + 10);
+    CGFloat right = MIN(controlsLeft, card.bounds.size.width - 104);
+    if (right - textLeft < 40) return;
     SGForEachView(card, ^(UIView *v) {
         CGRect f = v.frame;
-        if (f.size.height > 3 || f.size.width < 200 || v.superview.bounds.size.height < 40) return;
-        CGRect target = CGRectMake(52, card.bounds.size.height - 6, 226, 2);
+        NSValue *previousTarget = objc_getAssociatedObject(v, &kProgressTargetKey);
+        if (!previousTarget && (f.size.height <= 0 || f.size.height > 3 || f.size.width < 200 ||
+            v.superview.bounds.size.height < 40 || CGRectGetMinY(SGFrameIn(v, card)) < card.bounds.size.height - 8)) return;
+        CGRect target = [card convertRect:CGRectMake(textLeft, card.bounds.size.height - 6, right - textLeft, 2) toView:v.superview];
         if (CGRectEqualToRect(f, target)) return;
+        if (!previousTarget || !CGRectEqualToRect(f, previousTarget.CGRectValue))
+            objc_setAssociatedObject(v, &kProgressFrameKey, [NSValue valueWithCGRect:f], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(v, &kProgressTargetKey, [NSValue valueWithCGRect:target], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         v.frame = target;
-        [v setNeedsLayout];
-        [v layoutIfNeeded];
     });
 }
 
@@ -161,6 +189,18 @@ static void styleNowPlayingBar(UIViewController *container) {
     if (card) {
         roundView(card, radius);
         restyleCardContent(card);
+        // Reapply once after any pending stock child layout, without forcing it to
+        // immediately lay the progress view back across the card's bottom edge.
+        if (![objc_getAssociatedObject(card, &kLayoutPendingKey) boolValue]) {
+            objc_setAssociatedObject(card, &kLayoutPendingKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            __weak UIView *weakCard = card;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                UIView *current = weakCard;
+                if (!current) return;
+                objc_setAssociatedObject(current, &kLayoutPendingKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                if (!sg_nowPlayingStock && current == sg_nowPlayingCard && current.window) restyleCardContent(current);
+            });
+        }
     }
 
     UIVisualEffectView *glass = SGGlassFor(container.view, &kGlassKey);
