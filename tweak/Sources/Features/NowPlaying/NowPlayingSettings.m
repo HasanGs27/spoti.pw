@@ -7,6 +7,7 @@
 #import "Features/Karaoke/Karaoke.h"
 #import "Features/LockScreenLyrics/LockScreenLyrics.h"
 #import "Features/LyricsSources/LyricsSources.h"
+#import "AutomaticDownloads.h"
 
 extern UIViewController *SGLocalDownloadsPageCreate(void);
 extern void SGPresentNativeSpeedTest(void);
@@ -110,7 +111,9 @@ UIViewController *SGNowPlayingSettingsPage(void) {
 
     return [[SGModPage alloc] initWithTitle:@"Player" intro:@"Changes apply after you restart Spotify. Gestures and Blocked artists apply straight away." sections:@[
         SGSection(nil, @[
-            SGWithSymbol(SGPageRow(@"Fichiers du PC", ^UIViewController *{ return SGLocalDownloadsPageCreate(); }), @"arrow.down.circle"),
+            SGWithSymbol(SGPageRow(@"Téléchargements automatiques", ^UIViewController *{ return SGAutomaticDownloadsPageCreate(); }), @"arrow.down.circle.fill"),
+            SGOptionRow(@"Flèche : téléchargement via le PC", @"Utilise le PC associé pour préparer les copies locales", @"SGAutomaticDownloadsEnabled"),
+            SGWithSymbol(SGPageRow(@"Importer des fichiers existants", ^UIViewController *{ return SGLocalDownloadsPageCreate(); }), @"folder"),
             SGWithSymbol(SGActionRow(@"Vitesse native — test", @"Propose uniquement les vitesses autorisées par Spotify pour la lecture actuelle", ^{ SGPresentNativeSpeedTest(); }), @"speedometer"),
             SGWithSymbol(SGPageRow(@"Gestures", ^UIViewController *{ return SGGesturesSettingsPage(); }), @"hand.tap"),
             SGWithSymbol(SGPageRow(@"Lyrics", ^UIViewController *{ return lyricsPage(); }), @"quote.bubble"),

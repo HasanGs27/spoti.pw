@@ -5,6 +5,7 @@
 static const NSUInteger SGDownloadLimit = 100 * 1024 * 1024;
 
 NSURL *SGDownloadRoot(NSString *text) {
+    if (![text isKindOfClass:NSString.class] || !text.length) return nil;
     NSURLComponents *parts = [NSURLComponents componentsWithString:[text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]];
     if (![parts.scheme isEqual:@"http"] || parts.user || parts.password || parts.query || parts.fragment ||
         !parts.host.length || parts.port.integerValue < 1024 || parts.port.integerValue > 65535) return nil;
