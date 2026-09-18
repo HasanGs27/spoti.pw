@@ -90,6 +90,17 @@ echo "==> injecting"
 # -w drops the Watch app: its companion-app key would still name com.spotify.client and block the install.
 cyan -i "$IN" -o "$OUT" -f "${FILES[@]}" -l "$ROOT/plist/liquid-glass.plist" ${BUNDLE_ID:+-b "$BUNDLE_ID"} ${NAME:+-n "$NAME"} ${ICON:+-k "$ICON"} -w -s --overwrite
 
+# Preserve the notices for the embedded native resolver inside the delivered app.
+python3 - "$OUT" "$ROOT/tweak/Sources/Features/NowPlaying/NativeAudioLicenses.txt" <<'PY'
+import sys, zipfile
+with zipfile.ZipFile(sys.argv[1], 'a', compression=zipfile.ZIP_DEFLATED) as ipa:
+    apps = [n[:-len('Info.plist')] for n in ipa.namelist()
+            if n.startswith('Payload/') and n.count('/') == 2 and n.endswith('.app/Info.plist')]
+    if len(apps) != 1:
+        raise SystemExit('Expected one app for native audio license notices')
+    ipa.write(sys.argv[2], apps[0] + 'SpotiNativeAudio-Licenses.txt')
+PY
+
 echo "==> done: $OUT"
 [ "$INSTALL" = 1 ] && exec "$ROOT/scripts/install.sh" "$OUT"
 exit 0
