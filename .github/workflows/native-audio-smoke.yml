@@ -1,0 +1,40 @@
+name: Native audio source smoke
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [HasanGs27-patch-1]
+    paths:
+      - "tweak/Sources/Features/NowPlaying/NativeAudio*"
+      - "tweak/Sources/Features/NowPlaying/NativeYouTube*"
+      - "scripts/native_audio_smoke.swift"
+      - "scripts/native-audio-search.fixture.json"
+      - "scripts/test-native-audio.sh"
+      - ".github/workflows/native-audio-smoke.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  native-audio:
+    runs-on: macos-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v5
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+      - name: Compile and test native resolver
+        run: bash scripts/test-native-audio.sh
+      - name: Verify public source serves M4A without an extraction server
+        id: live
+        continue-on-error: true
+        timeout-minutes: 3
+        run: '"$RUNNER_TEMP/spoti-native-audio-smoke" --fixture scripts/native-audio-search.fixture.json --live'
+      - name: Report live source availability
+        if: always()
+        run: |
+          echo '### Native audio smoke' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Deterministic matching and parsing checks are mandatory.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Live source result: ${{ steps.live.outcome }}.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'A live failure can reflect source changes or hosting-network restrictions; it is not evidence of a successful download.' >> "$GITHUB_STEP_SUMMARY"
