@@ -16,11 +16,17 @@ L'entrée native de vitesse pour la musique est activée au prochain démarrage
 de Spotify, sauf si tu as explicitement désactivé son flag ou les commandes de
 vitesse. Cela ne force pas l'acceptation des changements par le lecteur.
 
-Les commandes se placent dans l'espace libre de la ligne du titre, au-dessus
-de la progression. Elles préservent le titre, l'artiste et le bouton J'aime.
-Leur disposition s'adapte à l'espace disponible.
+Dans le grand lecteur, ouvre le menu **⋯**, puis **Vitesse de lecture**.
+Les entrées se trouvent près de l'option de téléchargement, avec des icônes
+grises assorties. Elles sont également présentes pour les fichiers locaux,
+même si les téléchargements automatiques sont désactivés. Il n'y a plus de
+boutons ajoutés dans la ligne du titre.
 
-**Sans voix** indique actuellement que la réduction en direct n'est pas
+La vitesse concerne uniquement le morceau en cours. Si le menu appartient à
+un autre titre ou si la lecture a changé, lance ce morceau puis rouvre son
+menu. Aucune autre chanson ne sera modifiée.
+
+**Sans voix · indisponible** indique actuellement que la réduction en direct n'est pas
 disponible dans ce lecteur. Cette commande ne lance aucune préparation sur PC
 et n'active aucun effet. Les composants internes de Spotify liés aux voix ne
 fournissent pas de commande vérifiée utilisable ici sur tout le catalogue.
