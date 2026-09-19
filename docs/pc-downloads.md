@@ -33,6 +33,7 @@ Ces limites décrivent notre système. Elles ne garantissent pas qu'une source e
 ## Préparation
 
 - Deux morceaux distincts sont préparés simultanément ; les playlists attendent leur tour. Chaque fichier validé est proposé au téléphone sans attendre la fin de la playlist.
+- Le lancement du récupérateur audio ne charge plus SpotDL pour interpréter ses options. Sur ce PC, cinq essais isolés ont mesuré environ une seconde économisée par tentative à cette étape. Les options obtenues restent identiques ; le temps total dépend toujours de la recherche, de la source et du réseau.
 - Les doublons et les copies déjà vérifiées sont réutilisés après contrôle de leur empreinte, y compris après un redémarrage du compagnon.
 - Les métadonnées des morceaux sont mises en cache pendant six heures, dans une limite de 512 entrées. Les playlists sont relues pour conserver leur contenu à jour.
 - La recherche contrôle le titre, les artistes, les crédits invités connus, la durée et la version. Un résultat accepté n'est plus soumis à un second rapprochement contradictoire.
@@ -91,4 +92,29 @@ Ouvrir **Options et nettoyage → Stockage du PC**. Son nettoyage explicite cons
 
 Le lanceur `scripts/pc_companion_launcher.py` utilise un dossier d’association existant : il ne crée pas de nouvelle clé. L’option `--startup-enable` installe une entrée de démarrage pour cette installation ; `--startup-disable` enlève uniquement cette entrée. `--check --json` affiche un diagnostic sans clé ni lien privé. Le raccourci habituel du bureau continue à fonctionner.
 
-Le mode résident attend le réseau au démarrage et relance uniquement son propre processus serveur si nécessaire. Il n’allume pas un PC arrêté et n’empêche pas sa mise en veille. Les fichiers déjà téléchargés sur l’iPhone restent utilisables lorsque le PC est éteint.
+Le mode résident attend le réseau au démarrage et relance uniquement son propre processus serveur si nécessaire. Il n'allume pas un PC arrêté et n'empêche pas sa mise en veille. Les fichiers déjà téléchargés sur l'iPhone restent utilisables lorsque le PC est éteint.
+
+## Télécharger un seul morceau
+
+Ouvrir le menu **…** du morceau, puis **Télécharger ce morceau**. La demande vise ce titre, même lorsqu'un autre morceau est en lecture. Le simple appui sur une ligne continue à lancer la lecture. La flèche des playlists reste disponible pour une sélection entière.
+
+L'action indique aussi si le morceau est en attente, en cours ou déjà enregistré. Un fichier déjà vérifié sur l'iPhone est réutilisé, y compris s'il avait été téléchargé dans une autre playlist. Les demandes restent dans la même file, avec les mêmes contrôles et la même association au PC.
+
+L'entrée est ajoutée aux menus natifs identifiés dans cette version de Spotify. Si un autre type de menu ne l'affiche pas, **Ajouter un lien Spotify** dans les téléchargements accepte également le lien d'un seul morceau.
+
+## Créer une version audio
+
+Dans **Téléchargements automatiques**, faire glisser vers la gauche un morceau enregistré, puis ouvrir **Versions audio**. Le fichier original exact doit encore être disponible sur le PC associé.
+
+- **Vitesse ×0,75, ×1,25, ×1,5 ou ×2** prépare une copie en conservant la hauteur de la voix. Il s'agit d'une préparation préalable, pas d'un curseur qui modifie instantanément la musique en cours.
+- **Sans voix** prépare une copie instrumentale avec le module local de séparation. Cette option apparaît lorsque le PC confirme que le module est installé et validé.
+
+Le PC traite une version à la fois. L'app distingue la préparation sur le PC de l'enregistrement sur l'iPhone. Garder la page ouverte pour récupérer la copie ; revenir sur la page permet de reprendre son suivi. Une demande reçue par le PC peut continuer après la fermeture de la page. Une préparation interrompue par un redémarrage du PC se relance explicitement.
+
+Les copies se trouvent ensuite dans **Fichiers locaux**, avec un suffixe dans le titre, leur pochette et un album distinct. L'original, sa flèche verte et ses associations aux playlists restent conservés. Les copies utilisent du stockage supplémentaire et peuvent être supprimées séparément dans **Gérer les fichiers locaux**. Le nettoyage des téléchargements sur le PC ne supprime pas le dossier des versions audio.
+
+Changer la vitesse ou séparer la voix transforme l'audio et nécessite un nouvel encodage AAC. La séparation peut laisser des restes de voix ou altérer certains instruments ; elle ne reconstitue pas les pistes originales du studio. Ces fonctions ne changent pas le lecteur Spotify ni ses animations en ligne. Le réglage **Vitesse des podcasts** reste distinct et utilise uniquement les commandes natives autorisées par Spotify.
+
+Le module instrumental utilise un environnement Python séparé du compagnon et les poids officiels [MelBandRoformer de Kimberley](https://huggingface.co/KimberleyJSN/melbandroformer), publiés sous licence MIT. L'installation GPU et le modèle nécessitent plusieurs Go sur le PC ; l'inférence s'effectue localement. Les poids, l'environnement et la configuration propre au PC ne sont pas inclus dans le dépôt ni dans l'IPA.
+
+Voir les [instructions du module audio](audio-studio.md) pour l'installation isolée, les versions vérifiées et les limites. Une copie déjà prête avec la même source et les mêmes paramètres est vérifiée puis réutilisée. L'historique de l'iPhone garde jusqu'à 80 demandes : les plus anciennes terminées peuvent sortir du suivi, sans supprimer leurs fichiers ni les demandes encore actives.
