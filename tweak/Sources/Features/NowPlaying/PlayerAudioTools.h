@@ -2,4 +2,4 @@
 
 // Called only by an explicit tap. A captured URI pins preparation to that song.
 void SGPresentPlayerAudioVersions(UIViewController *owner, NSString *capturedURI, NSString *kind);
-void SGPlayerAudioToolsLayout(UIViewController *footer);
+void SGPlayerAudioToolsLayout(UIViewController *information);

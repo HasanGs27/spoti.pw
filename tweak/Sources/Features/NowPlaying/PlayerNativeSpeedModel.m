@@ -62,7 +62,7 @@ static BOOL validRestrictions(id value) {
 }
 static BOOL rateValue(id value) {
     return [value isKindOfClass:NSNumber.class] && CFGetTypeID((__bridge CFTypeRef)value) != CFBooleanGetTypeID() &&
-        isfinite([value doubleValue]) && [SGPlayerNativeSpeedRates() containsObject:value];
+        isfinite([value doubleValue]) && [value doubleValue] >= 0.5 && [value doubleValue] <= 2;
 }
 static NSString *identityString(id value) {
     if (!value) return @"";
@@ -70,6 +70,9 @@ static NSString *identityString(id value) {
 }
 NSArray<NSNumber *> *SGPlayerNativeSpeedRates(void) {
     return @[@0.75, @1, @1.25, @1.5, @2];
+}
+NSNumber *SGPlayerNativeSpeedNormalizedRate(id value) {
+    return rateValue(value) ? @(round([value doubleValue] * 100) / 100) : nil;
 }
 NSDictionary *SGPlayerNativeSpeedSnapshot(id object) {
     if (!nativeClass(object, @"SPTPlayerState") || !getter(object, @selector(track), @encode(id))) return nil;
@@ -130,6 +133,38 @@ id SGPlayerNativeSpeedOptions(id object, NSNumber *rate) {
     } @catch (NSException *exception) { return nil; }
 }
 
+@interface SGPlayerNativeSpeedCommandQueue ()
+@property(nonatomic, readwrite, strong) NSNumber *pendingRate;
+@property(nonatomic, readwrite, strong) NSNumber *inFlightRate;
+@property(nonatomic) NSTimeInterval readyAt;
+@property(nonatomic) NSTimeInterval sentAt;
+@end
+@implementation SGPlayerNativeSpeedCommandQueue
+- (BOOL)requestRate:(NSNumber *)rate atTime:(NSTimeInterval)time immediate:(BOOL)immediate {
+    NSNumber *normalized = SGPlayerNativeSpeedNormalizedRate(rate);
+    if (!normalized || !isfinite(time) || time < 0) return NO;
+    if ([normalized isEqual:self.inFlightRate]) {
+        self.pendingRate = nil;
+        return YES;
+    }
+    if (!self.pendingRate || immediate) self.readyAt = time + (immediate ? 0 : 0.15);
+    self.pendingRate = normalized;
+    return YES;
+}
+- (NSNumber *)takeRateAtTime:(NSTimeInterval)time {
+    if (!isfinite(time) || time < 0 || self.inFlightRate || !self.pendingRate || time < self.readyAt) return nil;
+    self.inFlightRate = self.pendingRate;
+    self.pendingRate = nil;
+    self.sentAt = time;
+    return self.inFlightRate;
+}
+- (BOOL)timedOutAtTime:(NSTimeInterval)time {
+    return self.inFlightRate && isfinite(time) && time - self.sentAt >= 4;
+}
+- (void)complete { self.inFlightRate = nil; }
+- (void)cancel { self.pendingRate = nil; self.inFlightRate = nil; }
+@end
+
 #ifdef SG_PLAYER_NATIVE_SPEED_TEST
 #include <assert.h>
 @interface SPTPlayerTrack : NSObject <SGNativeSpeedTrack>
@@ -178,20 +213,28 @@ int main(void) {
         state.playbackId = @"play-1"; state.sessionID = @"session-1"; state.playbackSpeed = 1;
         NSDictionary *snapshot = SGPlayerNativeSpeedSnapshot(state);
         assert([snapshot[@"available"] boolValue] && [snapshot[@"allowed"] boolValue]);
-        for (NSNumber *rate in SGPlayerNativeSpeedRates()) {
+        for (NSNumber *rate in [SGPlayerNativeSpeedRates() arrayByAddingObjectsFromArray:@[@0.5, @0.89, @1.01, @1.13, @1.99]]) {
             SPTPlayerOptionOverrides *override = SGPlayerNativeSpeedOptions(state, rate);
             assert([override isKindOfClass:SPTPlayerOptionOverrides.class] && [override.playbackSpeed isEqual:rate]);
             assert(!override.shufflingContext && !override.repeatingContext && !override.repeatingTrack && !override.modes);
             assert([options.playbackSpeed isEqual:@1] && state.playbackSpeed == 1 &&
                    [options.unrelated isEqual:unrelatedSnapshot]);
         }
-        for (id invalid in @[@YES, @0, @(-1), @1.1, @3, @(NAN), @(INFINITY), @"1.25", NSNull.null])
+        for (id invalid in @[@YES, @0, @(-1), @0.499, @2.001, @3, @(NAN), @(INFINITY), @"1.25", NSNull.null]) {
             assert(!SGPlayerNativeSpeedOptions(state, invalid));
+            assert(!SGPlayerNativeSpeedNormalizedRate(invalid));
+        }
+        assert([SGPlayerNativeSpeedNormalizedRate(@1.134) isEqual:@1.13]);
+        assert([SGPlayerNativeSpeedNormalizedRate(@1.136) isEqual:@1.14]);
+        assert([SGPlayerNativeSpeedNormalizedRate(@0.5) isEqual:@0.5]);
+        assert([SGPlayerNativeSpeedNormalizedRate(@2) isEqual:@2]);
         restrictions.disallowSettingPlaybackSpeed = YES; assert(!SGPlayerNativeSpeedOptions(state, @1.25)); restrictions.disallowSettingPlaybackSpeed = NO;
         context.disallowSettingPlaybackSpeed = YES; assert(!SGPlayerNativeSpeedOptions(state, @1.25)); context.disallowSettingPlaybackSpeed = NO;
         restrictions.disallowRemoteControl = YES; assert(!SGPlayerNativeSpeedOptions(state, @1.25)); restrictions.disallowRemoteControl = NO;
         assert(!SGPlayerNativeSpeedObserved(snapshot, state, @1.25));
         state.playbackSpeed = 1.25; assert(SGPlayerNativeSpeedObserved(snapshot, state, @1.25));
+        state.playbackSpeed = 1.13; assert(SGPlayerNativeSpeedObserved(snapshot, state, @1.13));
+        assert(!SGPlayerNativeSpeedObserved(snapshot, state, @1.14)); state.playbackSpeed = 1.25;
         state.playbackId = @"play-2"; assert(!SGPlayerNativeSpeedSamePlayback(snapshot, state) && !SGPlayerNativeSpeedObserved(snapshot, state, @1.25)); state.playbackId = @"play-1";
         state.sessionID = @"session-2"; assert(!SGPlayerNativeSpeedSamePlayback(snapshot, state)); state.sessionID = @"session-1";
         track.URI = @"spotify:local:Artist:Album:Track:180"; assert(!SGPlayerNativeSpeedSamePlayback(snapshot, state));
@@ -202,7 +245,34 @@ int main(void) {
         state.playbackSpeed = NAN; assert(![SGPlayerNativeSpeedSnapshot(state)[@"available"] boolValue]); state.playbackSpeed = 1;
         track.URI = @"https://example.com/song"; assert(!SGPlayerNativeSpeedSnapshot(state));
         assert(!SGPlayerNativeSpeedSnapshot(@{}) && !SGPlayerNativeSpeedSamePlayback(snapshot, nil));
-        puts("Native player speed options and playback identity: PASS");
+
+        SGPlayerNativeSpeedCommandQueue *commands = [SGPlayerNativeSpeedCommandQueue new];
+        assert([commands requestRate:@1.1 atTime:10 immediate:NO]);
+        assert([commands requestRate:@1.2 atTime:10.05 immediate:NO]);
+        assert([commands requestRate:@1.33 atTime:10.1 immediate:NO]);
+        assert(![commands takeRateAtTime:10.14]);
+        assert([[commands takeRateAtTime:10.16] isEqual:@1.33]);
+        // Dragging continues while one native command is outstanding. The
+        // newest target replaces intermediate values, never overlapping sends.
+        assert([commands requestRate:@1.4 atTime:10.2 immediate:NO]);
+        assert([commands requestRate:@1.51 atTime:10.3 immediate:YES]);
+        assert(![commands takeRateAtTime:11] && [commands.pendingRate isEqual:@1.51]);
+        assert(![commands timedOutAtTime:14.15] && [commands timedOutAtTime:14.17]);
+        [commands complete];
+        assert([[commands takeRateAtTime:14.2] isEqual:@1.51]);
+        assert([commands requestRate:@1.8 atTime:14.3 immediate:NO]);
+        assert([commands requestRate:@1.51 atTime:14.4 immediate:YES]);
+        assert(!commands.pendingRate); // returning to the in-flight rate cancels a superseded request
+        assert(![commands requestRate:@YES atTime:14.5 immediate:YES]);
+        assert(![commands requestRate:@1 atTime:NAN immediate:YES]);
+        assert(![commands takeRateAtTime:NAN] && ![commands timedOutAtTime:INFINITY]);
+        [commands cancel];
+        assert(!commands.pendingRate && !commands.inFlightRate && ![commands takeRateAtTime:100]);
+        assert([commands requestRate:@1 atTime:100 immediate:YES]);
+        assert([[commands takeRateAtTime:100] isEqual:@1]);
+        [commands complete];
+        assert(![commands takeRateAtTime:100.1] && ![commands timedOutAtTime:1000]);
+        puts("Native continuous speed, coalescing and playback identity: PASS");
     }
     return 0;
 }

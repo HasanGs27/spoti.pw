@@ -228,7 +228,8 @@ void SGPresentPlayerAudioVersions(UIViewController *owner, NSString *capturedURI
 @interface SGPlayerAudioButtons : UIView
 @property(nonatomic, strong) UIButton *speed;
 @property(nonatomic, strong) UIButton *vocals;
-@property(nonatomic) BOOL compact;
+@property(nonatomic, weak) UIStackView *row;
+@property(nonatomic, strong) NSLayoutConstraint *widthConstraint;
 @end
 @implementation SGPlayerAudioButtons
 - (UIButton *)button:(NSString *)title symbol:(NSString *)symbol action:(SEL)action {
@@ -247,60 +248,100 @@ void SGPresentPlayerAudioVersions(UIViewController *owner, NSString *capturedURI
         self.speed = [self button:@"Vitesse" symbol:@"speedometer" action:@selector(openSpeed)];
         self.vocals = [self button:@"Sans voix" symbol:@"mic.slash" action:@selector(openVocals)];
         self.speed.accessibilityIdentifier = @"spoti.player.speed"; self.vocals.accessibilityIdentifier = @"spoti.player.vocals";
+        self.speed.accessibilityHint = @"Régler la vitesse de lecture du morceau.";
+        self.vocals.accessibilityHint = @"Réduction en direct indisponible.";
+        UIButtonConfiguration *vocalsStyle = self.vocals.configuration;
+        vocalsStyle.baseForegroundColor = [UIColor colorWithWhite:.48 alpha:1];
+        self.vocals.configuration = vocalsStyle;
+        self.translatesAutoresizingMaskIntoConstraints = NO;
+        [self setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+        [self setContentCompressionResistancePriority:UILayoutPriorityRequired - 1 forAxis:UILayoutConstraintAxisHorizontal];
+        // A hidden arranged view receives a required zero-width constraint from
+        // UIKit. Keep our own width one point below required so it can collapse.
+        self.widthConstraint = [self.widthAnchor constraintEqualToConstant:104];
+        self.widthConstraint.priority = UILayoutPriorityRequired - 1;
+        self.widthConstraint.active = YES;
     } return self;
 }
+- (CGSize)intrinsicContentSize { return CGSizeMake(104,44); }
 - (void)layoutSubviews {
     [super layoutSubviews]; CGFloat width = self.bounds.size.width / 2.;
-    self.speed.frame = CGRectMake(0,0,width,self.bounds.size.height); self.vocals.frame = CGRectMake(width,0,width,self.bounds.size.height);
-    BOOL compact = self.bounds.size.height < 40;
-    if (self.compact != compact) {
-        self.compact = compact;
-        for (UIButton *button in @[self.speed,self.vocals]) {
-            UIButtonConfiguration *config = button.configuration;
-            config.imagePlacement = compact ? NSDirectionalRectEdgeLeading : NSDirectionalRectEdgeTop;
-            config.imagePadding = compact ? 4 : 2; button.configuration = config;
-        }
-    }
+    CGFloat height = MIN((CGFloat)44,self.bounds.size.height), y = (self.bounds.size.height-height)/2.;
+    self.speed.frame = CGRectMake(0,y,width,height); self.vocals.frame = CGRectMake(width,y,width,height);
 }
 - (void)openSpeed { SGPresentPlayerNativeSpeed(SGTopController()); }
-- (void)openVocals { SGPresentPlayerAudioVersions(SGTopController(),nil,@"instrumental"); }
+- (void)openVocals {
+    UIViewController *owner = SGTopController(); if (!owner || owner.presentedViewController) return;
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Réduction de voix indisponible"
+        message:@"La réduction de voix en direct n’est pas disponible dans ce lecteur. Le morceau continue avec sa voix d’origine."
+        preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Compris" style:UIAlertActionStyleCancel handler:nil]];
+    [owner presentViewController:alert animated:YES completion:nil];
+}
 @end
 
 static char buttonsKey;
-void SGPlayerAudioToolsLayout(UIViewController *footer) {
-    UIView *host = footer.viewIfLoaded; if (!host) return;
-    SGPlayerAudioButtons *buttons = objc_getAssociatedObject(host,&buttonsKey);
-    UIStackView *row = SGRowIn(host);
-    if (!row || !host.window || host.bounds.size.width < 200) { buttons.hidden = YES; return; }
-    NSMutableArray<NSValue *> *occupied = [NSMutableArray array];
-    for (UIView *item in row.arrangedSubviews) {
-        if (item.hidden || item.alpha < .1 || item.bounds.size.width < 16) continue;
-        if (item.bounds.size.width > 90) {
-            // Only a genuinely empty flexible spacer is available. A wide
-            // Connect label or accessible control must retain its hit area.
-            __block BOOL content = NO;
-            SGForEachView(item, ^(UIView *view) {
-                if (!view.hidden && view.alpha >= .1 && ([view isKindOfClass:UIControl.class] ||
-                    [view isKindOfClass:UILabel.class] || [view isKindOfClass:UIImageView.class] ||
-                    view.isAccessibilityElement || view.gestureRecognizers.count)) content = YES;
-            });
-            if (!content) continue;
+static BOOL SGPlayerAudioFixedWidth(UIView *view, UIView *host) {
+    for (UIView *owner = view; owner; owner = owner.superview) {
+        for (NSLayoutConstraint *constraint in owner.constraints) {
+            if (!constraint.active || constraint.relation != NSLayoutRelationEqual ||
+                constraint.priority < UILayoutPriorityRequired - 1) continue;
+            if ((constraint.firstItem == view && constraint.firstAttribute == NSLayoutAttributeWidth) ||
+                (constraint.secondItem == view && constraint.secondAttribute == NSLayoutAttributeWidth)) return YES;
         }
-        CGRect frame = SGFrameIn(item,host); if (frame.size.height >= 12) [occupied addObject:[NSValue valueWithCGRect:frame]];
+        if (owner == host) break;
     }
-    [occupied sortUsingComparator:^NSComparisonResult(NSValue *a, NSValue *b) {
-        CGFloat x = a.CGRectValue.origin.x, y = b.CGRectValue.origin.x; return x < y ? NSOrderedAscending : x > y ? NSOrderedDescending : NSOrderedSame;
-    }];
-    CGFloat start = 4, bestStart = 0, bestWidth = 0;
-    for (NSUInteger i = 0; i <= occupied.count; i++) {
-        CGFloat end = i < occupied.count ? CGRectGetMinX(occupied[i].CGRectValue) - 4 : host.bounds.size.width - 4;
-        if (end - start > bestWidth) { bestStart = start; bestWidth = end - start; }
-        if (i < occupied.count) start = MAX(start,CGRectGetMaxX(occupied[i].CGRectValue) + 4);
+    return NO;
+}
+static UIStackView *SGPlayerAudioInformationRow(UIView *host) {
+    __block UIStackView *found = nil;
+    SGForEachView(host, ^(UIView *view) {
+        if (found || ![view isKindOfClass:UIStackView.class]) return;
+        UIStackView *row = (UIStackView *)view;
+        if (row.axis != UILayoutConstraintAxisHorizontal || row.distribution != UIStackViewDistributionFill ||
+            row.arrangedSubviews.count < 2 || row.arrangedSubviews.count > 5) return;
+        BOOL text = NO, addTo = NO;
+        for (UIView *item in row.arrangedSubviews) {
+            text |= SGHasClass(item,@"TrackInfoContainerView");
+            addTo |= SGHasClass(item,@"AddToButton");
+        }
+        if (text && addTo) found = row;
+    });
+    return found;
+}
+void SGPlayerAudioToolsLayout(UIViewController *information) {
+    UIView *host = information.viewIfLoaded; if (!host) return;
+    SGPlayerAudioButtons *buttons = objc_getAssociatedObject(host,&buttonsKey);
+    UIStackView *row = buttons.row;
+    if (!row || ![row isDescendantOfView:host]) row = SGPlayerAudioInformationRow(host);
+    if (!row || !host.window || row.bounds.size.height < 44 || row.bounds.size.width < 240) { buttons.hidden = YES; return; }
+    UIView *text = nil, *addTo = nil;
+    CGFloat occupied = 0; NSUInteger count = 0;
+    for (UIView *item in row.arrangedSubviews) {
+        if (item == buttons) continue;
+        if (SGHasClass(item,@"TrackInfoContainerView")) { if (text) { buttons.hidden = YES; return; } text = item; }
+        else {
+            if (SGHasClass(item,@"AddToButton")) addTo = item;
+            if (!item.hidden) occupied += item.bounds.size.width;
+        }
+        if (!item.hidden) count++;
     }
-    CGFloat height = MIN((CGFloat)44,host.bounds.size.height);
-    if (bestWidth < 120 || height < 24) { buttons.hidden = YES; return; }
-    if (!buttons) { buttons = [[SGPlayerAudioButtons alloc] initWithFrame:CGRectZero]; [host addSubview:buttons]; objc_setAssociatedObject(host,&buttonsKey,buttons,OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
-    CGFloat width = MIN((CGFloat)160,bestWidth);
-    buttons.frame = CGRectMake(bestStart+(bestWidth-width)/2.,(host.bounds.size.height-height)/2.,width,height);
-    buttons.hidden = NO; [host bringSubviewToFront:buttons];
+    // The row, not an overlay, reserves space before the native AddTo button.
+    // Long titles retain Spotify's existing marquee/truncation behaviour.
+    CGFloat margins = row.layoutMarginsRelativeArrangement ? row.layoutMargins.left + row.layoutMargins.right : 0;
+    CGFloat available = row.bounds.size.width - margins - occupied - MAX((CGFloat)0,row.spacing) * count - 104;
+    if (!text || !addTo || text.hidden || SGPlayerAudioFixedWidth(text,host) || available < 92 ||
+        ([text contentCompressionResistancePriorityForAxis:UILayoutConstraintAxisHorizontal] >= UILayoutPriorityRequired &&
+            text.intrinsicContentSize.width > available)) { buttons.hidden = YES; return; }
+    if (!buttons) {
+        buttons = [[SGPlayerAudioButtons alloc] initWithFrame:CGRectZero];
+        objc_setAssociatedObject(host,&buttonsKey,buttons,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    NSUInteger position = [row.arrangedSubviews indexOfObjectIdenticalTo:addTo];
+    NSUInteger current = [row.arrangedSubviews indexOfObjectIdenticalTo:buttons];
+    if (buttons.superview != row || current == NSNotFound || current + 1 != position) {
+        [buttons.row removeArrangedSubview:buttons]; [buttons removeFromSuperview];
+        [row insertArrangedSubview:buttons atIndex:[row.arrangedSubviews indexOfObjectIdenticalTo:addTo]]; buttons.row = row;
+    }
+    buttons.hidden = NO;
 }
