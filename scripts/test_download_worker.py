@@ -29,15 +29,18 @@ COVER = "https://i.scdn.co/image/test-fixture"
 
 
 def setUpModule():
-    global _test_profile, _home_patch, _network_patch
+    global _test_profile, _home_patch, _network_patch, _avoid_patch
     _test_profile = tempfile.TemporaryDirectory()
     _home_patch = patch.object(Path, "home", classmethod(lambda cls: Path(_test_profile.name)))
     _home_patch.start()
     _network_patch = patch("requests.sessions.Session.send", side_effect=AssertionError("Offline tests must not request a network source"))
     _network_patch.start()
+    _avoid_patch = patch.dict(os.environ, {"SG_AVOID_SOURCES":"[]", "SG_VARIANT_LABEL":""})
+    _avoid_patch.start()
 
 
 def tearDownModule():
+    _avoid_patch.stop()
     _network_patch.stop()
     _home_patch.stop()
     _test_profile.cleanup()
@@ -60,6 +63,45 @@ def image_bytes(format="JPEG"):
 
 
 class MatchingTests(unittest.TestCase):
+    def test_alternative_exclusions_are_validated_and_normalized(self):
+        with patch.dict(os.environ, {"SG_AVOID_SOURCES":json.dumps([SOURCE, SOURCE.replace("music.", "www.")])}):
+            self.assertEqual(worker.avoided_sources(), frozenset([SOURCE]))
+        for value in ("", "not-json", "null", "true", "{}", json.dumps([SOURCE]*9),
+                      json.dumps([False]), json.dumps([SOURCE, "https://evil.example/watch?v=abcdef12345"]),
+                      json.dumps(["https://user:password@music.youtube.com/watch?v=abcdef12345"]),
+                      json.dumps(["x"*1001]), " "*8193):
+            with self.subTest(value=value[:60]), patch.dict(os.environ, {"SG_AVOID_SOURCES":value}):
+                with self.assertRaises(worker.WorkerFailure) as error: worker.avoided_sources()
+                self.assertEqual(error.exception.detail, "invalid_avoid_sources")
+        with patch.dict(os.environ, {"SG_AVOID_SOURCES":"[]"}):
+            self.assertFalse(worker.avoided_sources())
+
+    def test_excluded_candidates_do_not_consume_the_three_source_budget(self):
+        sources = ["https://music.youtube.com/watch?v="+f"{index:011d}" for index in range(10)]
+        provider = SimpleNamespace(get_results=Mock(return_value=[result(url=url) for url in sources]))
+        candidates = []
+        with patch.dict(os.environ, {"SG_AVOID_SOURCES":json.dumps(sources[:7])}):
+            self.assertEqual(list(worker.choose_sources(provider, song(), candidates)), sources[7:])
+        self.assertEqual(provider.get_results.call_count, 1)
+        self.assertTrue(all(row["excluded"] and not row["accepted"] for row in candidates[:7]))
+        self.assertTrue(all(row["accepted"] for row in candidates[7:]))
+
+    def test_exclusions_try_the_second_bounded_query_without_relaxing_match(self):
+        alternative = SOURCE[:-1]+"6"
+        expected = song(artists=["Moha La Squale", "Guest"])
+        old = result(name="Bandolero (feat. Guest)")
+        good = result(name="Bandolero (feat. Guest)", url=alternative)
+        provider = SimpleNamespace(get_results=Mock(side_effect=[[old], [old, good]]))
+        with patch.dict(os.environ, {"SG_AVOID_SOURCES":json.dumps([SOURCE])}):
+            self.assertEqual(worker.choose_source(provider, expected, []), alternative)
+        self.assertEqual(provider.get_results.call_count, 2)
+        provider.get_results = Mock(return_value=[old, result(name="Bandolero Remix (feat. Guest)", url=alternative)])
+        with patch.dict(os.environ, {"SG_AVOID_SOURCES":json.dumps([SOURCE])}):
+            with self.assertRaises(worker.WorkerFailure) as failure:
+                list(worker.choose_sources(provider, expected, []))
+        self.assertEqual((failure.exception.code, failure.exception.detail), ("no_match", "no_alternative"))
+        self.assertEqual(provider.get_results.call_count, 2)
+
     def test_candidate_fallbacks_are_distinct_bounded_and_keep_strict_rules(self):
         second, third, fourth = [SOURCE[:-1]+x for x in ("6", "7", "8")]
         good = result()
@@ -207,6 +249,15 @@ class CoverAndProgressTests(unittest.TestCase):
             with self.assertRaises(Exception): worker.fetch_cover(COVER, Mock(get=Mock(return_value=FakeResponse(b"<html>"))))
             self.assertEqual(file.read_bytes(), before)
             self.assertFalse(list(Path(name).glob("*.tmp")))
+
+    def test_no_alternative_failure_detail_reaches_json(self):
+        with tempfile.TemporaryDirectory() as folder:
+            failure = worker.WorkerFailure("no_match", "Aucune autre version fiable.", "no_alternative")
+            with patch.object(worker, "prepare", side_effect=failure), patch.object(sys, "argv", ["worker", TRACK, folder, "--ffmpeg", "unused"]):
+                with self.assertRaises(SystemExit) as stopped: worker.main()
+            self.assertEqual(stopped.exception.code, 1)
+            self.assertEqual(json.loads((Path(folder)/"failure.json").read_text(encoding="utf-8")),
+                {"code":"no_match", "message":"Aucune autre version fiable.", "detail":"no_alternative"})
 
     def test_cover_cache_concurrent_writes_are_atomic(self):
         from concurrent.futures import ThreadPoolExecutor
@@ -392,6 +443,64 @@ class AudioIntegrationTests(unittest.TestCase):
             path.write_text(json.dumps(marker | changes), encoding="utf-8")
             self.assertIsNone(worker.reusable_audio(self.folder, self.song))
 
+    def test_excluded_prepared_marker_is_never_reused_or_modified(self):
+        worker.remember_audio(self.folder, self.song, SOURCE, "mp3", {"sourceCodec":"mp3", "sourceBitrate":128})
+        marker = self.folder/"prepared-audio.json"
+        original_audio, original_marker = self.file.read_bytes(), marker.read_bytes()
+        with patch.dict(os.environ, {"SG_AVOID_SOURCES":json.dumps([SOURCE.replace("music.", "www.")])}), \
+                patch.object(worker, "file_digest", side_effect=AssertionError("Excluded cache must not even be hashed")):
+            self.assertIsNone(worker.reusable_audio(self.folder, self.song))
+        self.assertEqual(self.file.read_bytes(), original_audio)
+        self.assertEqual(marker.read_bytes(), original_marker)
+        self.assertEqual(worker.reusable_audio(self.folder, self.song), SOURCE)  # Default remains unchanged.
+        legacy = json.loads(original_marker); legacy["version"] = 1; legacy.pop("extension")
+        marker.write_text(json.dumps(legacy), encoding="utf-8")
+        with patch.dict(os.environ, {"SG_AVOID_SOURCES":json.dumps([SOURCE])}):
+            self.assertIsNone(worker.reusable_audio(self.folder, self.song))
+
+    def test_alternative_prepare_excludes_marker_and_leaves_old_audio_on_no_match(self):
+        metadata = dict(title="Bandolero", artists=[{"name":"Moha La Squale"}], duration=3000,
+                        id=TRACK.rsplit("/",1)[1], isExplicit=True,
+                        visualIdentity={"image":[{"maxWidth":640,"url":COVER}]})
+        worker.remember_audio(self.folder, self.song, SOURCE, "mp3", {"sourceCodec":"mp3", "sourceBitrate":128})
+        before, marker = self.file.read_bytes(), (self.folder/"prepared-audio.json").read_bytes()
+        provider = SimpleNamespace(get_results=Mock(return_value=[result(duration=3)]))
+        args = SimpleNamespace(url=TRACK, ffmpeg=self.ffmpeg)
+        original_home = Path.__dict__["home"]
+        try:
+            with patch.dict(os.environ, {"SG_AVOID_SOURCES":json.dumps([SOURCE])}), \
+                    patch("download_metadata.entity", return_value=metadata), \
+                    patch.object(worker, "create_provider", return_value=(provider, Mock())), \
+                    patch.object(worker, "download_source", side_effect=AssertionError("Excluded source may not be downloaded")):
+                with self.assertRaises(worker.WorkerFailure) as failure: worker.prepare(args, self.folder, worker.Progress(self.folder))
+            self.assertEqual((failure.exception.code, failure.exception.detail), ("no_match", "no_alternative"))
+            self.assertEqual(self.file.read_bytes(), before)
+            self.assertEqual((self.folder/"prepared-audio.json").read_bytes(), marker)
+            self.assertFalse((self.folder/"audio-ready.json").exists())
+            alternative = SOURCE[:-1]+"6"
+            provider.get_results = Mock(return_value=[result(duration=3), result(duration=3, url=alternative)])
+            calls = []
+            def download(url, folder, budget):
+                calls.append(url)
+                raw = folder/("source-"+"c"*16)/"source.m4a"; raw.parent.mkdir()
+                shutil.copyfile(self.aac, raw)
+                return raw, {"source":url,"sourceCodec":"mp4a.40.2","sourceBitrate":128}
+            with patch.dict(os.environ, {"SG_AVOID_SOURCES":json.dumps([SOURCE])}), \
+                    patch("download_metadata.entity", return_value=metadata), \
+                    patch.object(worker, "create_provider", return_value=(provider, Mock())), \
+                    patch.object(worker, "download_source", side_effect=download), \
+                    patch.object(worker, "fetch_cover", return_value=(image_bytes(), "image/jpeg")):
+                worker.prepare(args, self.folder, worker.Progress(self.folder))
+            self.assertEqual(calls, [alternative])
+            prepared = json.loads((self.folder/"prepared-audio.json").read_text(encoding="utf-8"))
+            ready = json.loads((self.folder/"audio-ready.json").read_text(encoding="utf-8"))
+            self.assertEqual((prepared["source"], ready["source"], ready["extension"]), (alternative, alternative, "m4a"))
+            self.assertEqual(prepared["sourceCodec"], "mp4a.40.2")
+            self.assertEqual(ready["sourceBitrate"], 128)
+            self.assertEqual(self.file.read_bytes(), before)
+        finally:
+            Path.home = original_home
+
     def test_fallback_success_never_repeats_bad_source_and_rate_limit_stops(self):
         second = SOURCE[:-1]+"6"
         provider = SimpleNamespace(get_results=Mock(return_value=[result(duration=3), result(duration=3,url=second), result(duration=3)]))
@@ -491,6 +600,27 @@ class AudioIntegrationTests(unittest.TestCase):
         self.file.write_bytes(before+b"changed")
         self.assertIsNone(worker.reusable_audio(self.folder, self.song))
 
+    def test_alternative_label_tags_album_after_matching_and_is_stable_on_retry(self):
+        metadata = dict(title="Bandolero", artists=[{"name":"Moha La Squale"}], duration=3000,
+                        id=TRACK.rsplit("/", 1)[1], isExplicit=True, album={"name":"Original album"},
+                        visualIdentity={"image":[{"maxWidth":640, "url":COVER}]})
+        worker.remember_audio(self.folder, self.song, SOURCE)
+        original_home = Path.__dict__["home"]
+        try:
+            with patch.dict(os.environ, {"SG_VARIANT_LABEL":"Version 2"}), \
+                 patch("download_metadata.entity", return_value=metadata), \
+                 patch.object(worker, "create_provider", side_effect=AssertionError("Cached valid audio must not download again")), \
+                 patch.object(worker, "fetch_cover", return_value=(image_bytes(), "image/jpeg")):
+                for _ in range(2):
+                    worker.prepare(SimpleNamespace(url=TRACK, ffmpeg=self.ffmpeg), self.folder, worker.Progress(self.folder))
+                    record = json.loads((self.folder/"audio-ready.json").read_text(encoding="utf-8"))
+                    self.assertEqual(record["album"], "Original album · Version 2")
+                    self.assertEqual(record["title"], "Bandolero")
+                    self.assertEqual(record["artist"], "Moha La Squale")
+                    self.assertEqual(str(MP3(self.file).tags["TALB"]), record["album"])
+        finally:
+            Path.home = original_home
+
     def test_prepare_bypasses_second_matcher_and_retry_never_redownloads(self):
         metadata = dict(title="Bandolero", artists=[{"name": "Moha La Squale"}], duration=3000,
                         id=TRACK.rsplit("/", 1)[1], isExplicit=True,
@@ -522,6 +652,16 @@ class AudioIntegrationTests(unittest.TestCase):
             self.assertEqual(record["extension"], "mp3")
         finally:
             Path.home = original_home
+
+
+class AlternativeLabelTests(unittest.TestCase):
+    def test_only_human_bounded_version_labels(self):
+        for label in ("", "Version 2", "Version 32", "Version 999999"):
+            with patch.dict(os.environ, {"SG_VARIANT_LABEL":label}):
+                self.assertEqual(worker.alternative_label(), label)
+        for label in ("Version 1", "Version 0", "Version 02", "Version 1000000", "Version 2\n", "anything"):
+            with patch.dict(os.environ, {"SG_VARIANT_LABEL":label}):
+                with self.assertRaises(ValueError): worker.alternative_label()
 
 
 if __name__ == "__main__":

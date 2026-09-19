@@ -7,10 +7,12 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 from collections import Counter
 from contextlib import contextmanager
+from contextlib import nullcontext, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.request import Request, urlopen
@@ -20,7 +22,7 @@ from PIL import Image
 from mutagen.mp3 import MP3
 from mutagen.mp4 import MP4, MP4Cover
 from mutagen.id3 import TIT2, TPE1, TALB, APIC
-from automatic_downloads import Queue, handler_for, lan_address, audio_record, byte_range, file_stamp
+from automatic_downloads import Queue, handler_for, lan_address, audio_record, byte_range, file_stamp, request_fields, main
 from download_metadata import canonical, collection
 from download_worker import acceptable, remember_audio, reusable_audio, finish_audio
 
@@ -29,6 +31,8 @@ OTHER = 'https://open.spotify.com/track/7sL89oFc1AcgjG5Q6tCkID'
 PLAYLIST = 'https://open.spotify.com/playlist/1Imj2Uc2NVvyHgrAouKQo3'
 THIRD = TRACK[:-1]+'U'
 FOURTH = TRACK[:-1]+'V'
+SOURCE_A = 'https://music.youtube.com/watch?v=aaaaaaaaaaa'
+SOURCE_B = 'https://music.youtube.com/watch?v=bbbbbbbbbbb'
 
 class MetadataTests(unittest.TestCase):
     def test_urls_and_playlist_validation(self):
@@ -128,7 +132,7 @@ class QueueTests(unittest.TestCase):
             self.assertEqual((row['extension'], row['title'], row['artist'], row['album']), ('m4a', 'AAC track', 'AAC artist', 'AAC album'))
             self.assertEqual((row['sourceCodec'], row['sourceBitrate']), ('mp4a.40.2', 128))
             folder = Path(self.folder.name)/first['id']/str(row['position'])
-            self.assertEqual((folder/'audio.m4a').read_bytes(), expected)
+            self.assertEqual(queue.row_path(row, folder).read_bytes(), expected)
             self.assertFalse((folder/'audio.mp3').exists())
         queue.pool.shutdown(wait=True)
         restored = self.m4a_queue(calls)
@@ -243,8 +247,9 @@ class QueueTests(unittest.TestCase):
         queue = self.m4a_queue([])
         first = self.settled(queue, {'url':TRACK, 'request_id':'aac-invalid-restore', 'track_urls':[TRACK, OTHER]})
         queue.pool.shutdown(wait=True)
-        bad = Path(self.folder.name)/first['id']/'1'/'audio.m4a'
-        audio = MP4(bad); del audio['covr']; audio.save()
+        # A corrupt declaration must not invalidate another reference to the same bytes.
+        first['items'][0]['extension'] = 'mp3'
+        queue.save(first)
         restored = self.m4a_queue([])
         self.assertEqual([row['state'] for row in restored.snapshot(first['id'])['items']], ['error', 'ready'])
         self.assertNotIn(TRACK, restored.reusable)
@@ -360,7 +365,7 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(second['items'][0]['title'], 'Repaired title')
         self.assertEqual(source.read_bytes(), original) # Retagging the new copy preserves the old file.
         self.assertFalse(MP3(source).tags.getall('APIC'))
-        target = Path(self.folder.name)/second['id']/'1'/'audio.mp3'
+        target = queue.row_path(second['items'][0], Path(self.folder.name)/second['id']/'1')
         self.assertTrue(MP3(target).tags.getall('APIC'))
         self.assertEqual(hashlib.sha256(target.read_bytes()).hexdigest(), second['items'][0]['id'])
     def test_cover_retry_restores_unfinished_audio_after_restart(self):
@@ -473,8 +478,8 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(queue.snapshot(first['id'])['state'], 'complete')
         self.assertEqual(queue.snapshot(second['id'])['state'], 'complete')
         self.assertEqual([row['position'] for row in queue.snapshot(first['id'])['items']], [1,2,3,4])
-        for position in (1,2,3,4):
-            self.assertTrue((Path(self.folder.name)/first['id']/str(position)/'audio.mp3').is_file())
+        for row in queue.snapshot(first['id'])['items']:
+            self.assertTrue(queue.row_path(row, Path(self.folder.name)/first['id']/str(row['position'])).is_file())
     def test_failed_duplicate_is_prepared_once_and_does_not_block_other_tracks(self):
         calls = []; barrier = threading.Barrier(2)
         def prepare(url, folder):
@@ -587,11 +592,11 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(calls, [TRACK, OTHER])
         self.assertEqual(second['state'], 'complete')
         self.assertEqual(second['items'][0]['source'], 'verified synthetic fixture')
-        one = Path(self.folder.name)/first['id']/'1'/'audio.mp3'
-        duplicate = Path(self.folder.name)/first['id']/'2'/'audio.mp3'
+        one = queue.row_path(first['items'][0], Path(self.folder.name)/first['id']/'1')
+        duplicate = queue.row_path(first['items'][1], Path(self.folder.name)/first['id']/'2')
         original = duplicate.read_bytes()
-        one.write_bytes(one.read_bytes()+b'changed')
-        self.assertEqual(duplicate.read_bytes(), original) # Copies are independent, not hard links.
+        self.assertEqual(one, duplicate) # Immutable verified bytes have one canonical copy.
+        self.assertEqual(len(list(queue.store.directory.glob('*.mp3'))), 1)
         self.assertEqual(hashlib.sha256(original).hexdigest(), first['items'][1]['id'])
     def test_reuses_verified_audio_after_restart(self):
         calls = []; queue = self.cached_queue(calls)
@@ -605,19 +610,19 @@ class QueueTests(unittest.TestCase):
     def test_modified_cached_audio_is_not_reused(self):
         calls = []; queue = self.cached_queue(calls)
         first = self.settled(queue, {'url':TRACK, 'request_id':'before-modified-request'})
-        source = Path(self.folder.name)/first['id']/'1'/'audio.mp3'
+        source = queue.row_path(first['items'][0], Path(self.folder.name)/first['id']/'1')
         original = source.read_bytes(); changed = original[:-1]+bytes([original[-1]^1])
         source.write_bytes(changed) # Same size: checking only a file size would accept the wrong bytes.
         second = self.settled(queue, {'url':TRACK, 'request_id':'after-modified-request'})
         self.assertEqual(calls, [TRACK, TRACK])
-        self.assertEqual(source.read_bytes(), changed)
+        self.assertEqual(source.read_bytes(), original) # Reprepared verified bytes repair the corrupt blob.
         self.assertEqual(second['items'][0]['id'], hashlib.sha256(original).hexdigest())
         self.assertFalse(list((Path(self.folder.name)/second['id']/'1').glob('reuse-*.tmp')))
     def test_modified_audio_is_not_restored_as_reusable(self):
         calls = []; queue = self.cached_queue(calls)
         first = self.settled(queue, {'url':TRACK, 'request_id':'cache-restart-first'})
         queue.pool.shutdown(wait=True)
-        source = Path(self.folder.name)/first['id']/'1'/'audio.mp3'
+        source = queue.row_path(first['items'][0], Path(self.folder.name)/first['id']/'1')
         original = source.read_bytes(); source.write_bytes(original[:-1]+bytes([original[-1]^1]))
         restored = self.cached_queue(calls)
         self.assertEqual(restored.snapshot(first['id'])['items'][0]['state'], 'error')
@@ -642,7 +647,283 @@ class QueueTests(unittest.TestCase):
         self.assertIn(done['items'][0]['id'],restored.files)
         done['state']='running'; queue.save(done)
         restarted=self.queue()
-        self.assertEqual(restarted.snapshot(job['id'])['state'],'interrupted')
+        restarted.pool.submit(lambda: None).result(timeout=10)
+        self.assertEqual(restarted.snapshot(job['id'])['state'],'partial')
+    def stored_job(self, queue, key, state='queued', rows=None, **extra):
+        fields = request_fields({'url':TRACK, 'request_id':key})
+        job = dict(fields, id=hashlib.md5(key.encode(), usedforsecurity=False).hexdigest(), version=2,
+                   name='Restart fixture', state=state, created=time.time(), scope='test', message='', items=rows or [])
+        job.update(extra)
+        queue.save(job)
+        return job
+    def test_restart_resumes_queued_and_running_without_repreparing_ready(self):
+        calls = []; queue = self.cached_queue(calls)
+        complete = self.settled(queue, {'url':TRACK, 'request_id':'resume-existing-ready'})
+        queue.pool.shutdown(wait=True)
+        ready = dict(complete['items'][0])
+        ready['position'] = 1
+        waiting = {'spotify':OTHER, 'position':2, 'state':'running', 'attempts':1}
+        active = self.stored_job(queue, 'resume-running-request', 'running', [ready, waiting])
+        queued = self.stored_job(queue, 'resume-queued-request')
+        resolutions = []
+        def resolve(url, tracks):
+            resolutions.append(url)
+            return 'Selection','test',[TRACK]
+        def prepare(url, folder):
+            calls.append(url)
+            target=folder/'audio.mp3'; shutil.copyfile(self.fixture,target)
+            return target, {}
+        restored = self.queue(prepare=prepare, resolve=resolve, retry_delays=(0,))
+        restored.pool.submit(lambda: None).result(timeout=10)
+        self.assertEqual(calls, [TRACK, OTHER])
+        self.assertEqual(resolutions, [TRACK]) # Persisted running rows do not refetch metadata.
+        self.assertEqual(restored.snapshot(active['id'])['state'], 'complete')
+        self.assertEqual(restored.snapshot(queued['id'])['state'], 'complete')
+        self.assertEqual(restored.snapshot(active['id'])['items'][0]['id'], ready['id'])
+        self.assertEqual(restored.snapshot(active['id'])['items'][1]['attempts'], 2)
+        self.assertEqual(restored.submit({'url':TRACK,'request_id':'resume-running-request'})['id'], active['id'])
+    def test_restart_does_not_resurrect_cancel_pause_historical_interruption_or_invalid_input(self):
+        queue = self.cached_queue([]); queue.pool.shutdown(wait=True)
+        expected = {}
+        for index, fields in enumerate(({'state':'interrupted'}, {'state':'cancelled'}, {'state':'paused'},
+                                       {'state':'running','cancelled':True}, {'state':'queued','userPaused':True})):
+            job = self.stored_job(queue, f'resume-stopped-{index:04}', **fields)
+            expected[job['id']] = 'cancelled' if fields.get('cancelled') else 'paused' if fields.get('userPaused') else fields['state']
+        bad = self.stored_job(queue, 'resume-invalid-request', rows=[{'position':1,'spotify':'file:///secret','state':'waiting'}])
+        def forbidden(*args): raise AssertionError('Must not resume this snapshot')
+        restored = self.queue(prepare=forbidden, resolve=forbidden)
+        restored.pool.submit(lambda: None).result(timeout=10)
+        self.assertEqual({key:restored.snapshot(key)['state'] for key in expected}, expected)
+        self.assertNotIn(bad['id'], restored.jobs)
+        self.assertFalse(restored.storage_status()['cleanup_available']) # Unknown history protects its files.
+    def test_transient_worker_retry_is_bounded_and_permanent_failure_is_not_retried(self):
+        attempts = Counter()
+        def prepare(url, folder):
+            attempts[url] += 1
+            if url == TRACK and attempts[url] == 1: raise TimeoutError('Synthetic connection loss')
+            if url == OTHER:
+                (folder/'failure.json').write_text(json.dumps({'code':'no_match','message':'Aucune correspondance fiable.'}))
+                raise ValueError('Permanent match failure')
+            target=folder/'audio.mp3'; shutil.copyfile(self.fixture,target)
+            return target, {}
+        queue = self.queue(prepare=prepare, resolve=lambda u,t:('Selection','test',[TRACK,OTHER]), retry_delays=(0,))
+        done = self.settled(queue, {'url':PLAYLIST,'request_id':'retry-transient-worker'})
+        self.assertEqual(done['state'], 'partial')
+        self.assertEqual(attempts, Counter({TRACK:2, OTHER:1}))
+        self.assertEqual([row['attempts'] for row in done['items']], [2,1])
+        queue.pool.shutdown(wait=True)
+        exhausted = self.stored_job(queue, 'resume-exhausted-budget', 'running',
+            [{'spotify':THIRD,'position':1,'state':'running','attempts':2}])
+        restored = self.queue(prepare=prepare, retry_delays=(0,))
+        restored.pool.submit(lambda: None).result(timeout=10)
+        self.assertEqual(restored.snapshot(exhausted['id'])['state'], 'error')
+        self.assertNotIn(THIRD, attempts) # Crashes cannot reset the durable attempt budget.
+    def test_transient_resolver_retry_and_persisted_network_worker_error(self):
+        import requests
+        resolved, prepared = [], []
+        def resolve(url, tracks):
+            resolved.append(url)
+            if len(resolved) == 1: raise requests.ConnectionError('Synthetic network loss')
+            return 'Selection','test',[TRACK]
+        def prepare(url, folder):
+            prepared.append(url)
+            if len(prepared) == 1:
+                (folder/'failure.json').write_text(json.dumps({'code':'network','message':'Connexion indisponible.'}))
+                raise subprocess.CalledProcessError(1, ['synthetic-worker'])
+            self.assertFalse((folder/'failure.json').exists()) # Do not inherit a stale retry classification.
+            target=folder/'audio.mp3'; shutil.copyfile(self.fixture,target)
+            return target, {}
+        queue=self.queue(prepare=prepare, resolve=resolve, retry_delays=(0,))
+        done=self.settled(queue, {'url':TRACK,'request_id':'retry-resolver-network'})
+        self.assertEqual((done['state'], done['resolveAttempts'], done['items'][0]['attempts']), ('complete',2,2))
+        self.assertEqual((len(resolved), len(prepared)), (2,2))
+    def test_alternative_isolated_until_explicit_idempotent_acceptance_and_persists(self):
+        calls=[]
+        def prepare(url, folder):
+            calls.append(url)
+            fixture, extension, source = (self.fixture,'mp3',SOURCE_A) if len(calls)==1 else (self.m4a_fixture,'m4a',SOURCE_B)
+            target=folder/('audio.'+extension); shutil.copyfile(fixture,target)
+            if extension == 'm4a':
+                tagged=MP4(target); tagged['\xa9alb']=[f'AAC album · Version {len(calls)}']; tagged.save()
+            return target, {'extension':extension,'source':source}
+        queue=self.queue(prepare=prepare, resolve=lambda u,t:('Selection','test',[u]))
+        first=self.settled(queue, {'url':TRACK,'request_id':'alternative-default-first'})
+        candidate=self.settled(queue, {'url':TRACK,'request_id':'alternative-candidate-one','kind':'alternative'})
+        self.assertEqual(candidate['state'], 'complete')
+        self.assertEqual(candidate['variant_number'], 2)
+        self.assertEqual(candidate['effective_avoid_sources'], [SOURCE_A]) # Old iPhone rows lacked provenance.
+        ordinary=self.settled(queue, {'url':TRACK,'request_id':'alternative-before-accept'})
+        self.assertEqual(ordinary['items'][0]['id'], first['items'][0]['id'])
+        digest=candidate['items'][0]['id']
+        with self.assertRaises(ValueError): queue.accept_version({'job_id':candidate['id'],'sha256':'0'*64})
+        with self.assertRaises(ValueError): queue.accept_version({'job_id':first['id'],'sha256':first['items'][0]['id']})
+        accepted=queue.accept_version({'job_id':candidate['id'],'sha256':digest})
+        self.assertEqual(accepted, queue.accept_version({'job_id':candidate['id'],'sha256':digest}))
+        self.assertEqual(accepted, {'accepted':True,'spotify':TRACK,'sha256':digest,'extension':'m4a'})
+        ordinary=self.settled(queue, {'url':TRACK,'request_id':'alternative-after-accept'})
+        self.assertEqual(ordinary['items'][0]['id'], digest)
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(queue.row_path(first['items'][0], queue.root/first['id']/'1').is_file())
+        queue.pool.shutdown(wait=True)
+        restored=self.queue(prepare=prepare, resolve=lambda u,t:('Selection','test',[u]))
+        ordinary=self.settled(restored, {'url':TRACK,'request_id':'alternative-after-restart'})
+        self.assertEqual((ordinary['items'][0]['id'], len(calls)), (digest,2))
+        next_candidate=self.settled(restored, {'url':TRACK,'request_id':'alternative-candidate-two','kind':'alternative'})
+        self.assertEqual(next_candidate['variant_number'], 3)
+        self.assertEqual(next_candidate['effective_avoid_sources'], [SOURCE_B])
+        self.assertEqual(next_candidate['state'], 'error') # Same known source must not masquerade as another version.
+        self.assertEqual(restored.reusable[TRACK][1]['id'], digest)
+    def test_alternative_http_capabilities_storage_and_worker_env_contract(self):
+        queue=self.cached_queue([])
+        folder=queue.root/'environment-test'; folder.mkdir()
+        (folder/'audio-ready.json').write_text(json.dumps({'spotify':TRACK,'extension':'mp3'}))
+        with patch.dict(os.environ, {'SG_AVOID_SOURCES':'stale','SG_VARIANT_LABEL':'stale'}), patch('automatic_downloads.subprocess.run') as run:
+            queue.worker(TRACK,folder)
+            self.assertEqual(run.call_args.kwargs['env']['SG_AVOID_SOURCES'], '[]')
+            self.assertEqual(run.call_args.kwargs['env']['SG_VARIANT_LABEL'], '')
+            queue.worker(TRACK,folder,[SOURCE_A],3)
+            self.assertEqual(json.loads(run.call_args.kwargs['env']['SG_AVOID_SOURCES']), [SOURCE_A])
+            self.assertEqual(run.call_args.kwargs['env']['SG_VARIANT_LABEL'], 'Version 3')
+        with self.http_service(queue) as origin:
+            with urlopen(origin+'/hello') as response:
+                self.assertEqual(json.load(response), {'version':2,'service':'spoti-auto-downloads'})
+            with urlopen(origin+'/capabilities') as response:
+                self.assertTrue(json.load(response)['alternativeVersions'])
+            with urlopen(origin+'/storage') as response: self.assertEqual(json.load(response)['audio_files'], 0)
+            request=Request(origin+'/storage/cleanup',data=b'{}',headers={'Content-Type':'application/json'})
+            with urlopen(request) as response: self.assertEqual(json.load(response)['removed_files'], 0)
+            for suffix in ('/capabilities','/storage'):
+                with self.assertRaises(HTTPError): urlopen(origin.replace('x'*32,'wrong')+suffix)
+            for payload in ({'url':PLAYLIST,'kind':'alternative','request_id':'invalid-alternative-playlist'},
+                            {'url':TRACK,'kind':'alternative','request_id':'invalid-alternative-source','avoid_sources':['file:///private']},
+                            {'url':TRACK,'refresh':True,'track_urls':[TRACK],'request_id':'invalid-refresh-explicit'}):
+                with self.assertRaises(ValueError): queue.submit(payload)
+    def test_legacy_audio_consolidation_is_explicit_and_preserves_all_completed_references(self):
+        queue=self.cached_queue([]); queue.pool.shutdown(wait=True)
+        original_paths=[]
+        for index in range(2):
+            job=self.stored_job(queue, f'legacy-storage-{index:04}', 'complete')
+            folder=queue.root/job['id']/'1'; folder.mkdir()
+            path=folder/'audio.mp3'; shutil.copyfile(self.fixture,path); original_paths.append(path)
+            job['items']=[dict(audio_record(path,{}), spotify=TRACK,position=1,state='ready')]
+            job['items'][0].pop('extension') # Genuine old protocol-2 snapshot.
+            queue.save(job)
+        restored=self.cached_queue([])
+        self.assertTrue(all(path.exists() for path in original_paths)) # No automatic migration deletion.
+        status=restored.storage_status()
+        self.assertEqual((status['audio_files'],status['reclaimable_files']), (2,1))
+        report=restored.cleanup_storage({})
+        self.assertEqual((report['removed_files'],report['removed_bytes'],report['consolidated_files']), (1,self.fixture.stat().st_size,2))
+        self.assertFalse(any(path.exists() for path in original_paths))
+        self.assertEqual(report['storage']['audio_files'],1)
+        for job in restored.jobs.values():
+            self.assertEqual(job['items'][0]['storage'],'blob')
+            self.assertEqual(job['items'][0]['id'],hashlib.sha256(self.fixture.read_bytes()).hexdigest())
+        restored.pool.shutdown(wait=True)
+        again=self.cached_queue([])
+        self.assertTrue(all(job['items'][0]['state']=='ready' for job in again.jobs.values()))
+        self.assertEqual(again.storage_status()['audio_files'],1)
+    def test_cleanup_preserves_legacy_file_when_reference_commit_fails(self):
+        queue=self.cached_queue([]); queue.pool.shutdown(wait=True)
+        job=self.stored_job(queue,'legacy-storage-failure','complete')
+        folder=queue.root/job['id']/'1'; folder.mkdir()
+        original=folder/'audio.mp3'; shutil.copyfile(self.fixture,original)
+        job['items']=[dict(audio_record(original,{}),spotify=TRACK,position=1,state='ready')]
+        queue.save(job)
+        restored=self.cached_queue([])
+        with patch.object(restored,'save',side_effect=OSError('Synthetic disk failure')):
+            report=restored.cleanup_storage({})
+        self.assertEqual(report['consolidated_files'],0)
+        self.assertEqual(original.read_bytes(), self.fixture.read_bytes())
+        persisted=json.loads((folder.parent/'job.json').read_text(encoding='utf-8'))
+        self.assertNotIn('storage',persisted['items'][0])
+        self.assertNotIn('storage',restored.jobs[job['id']]['items'][0])
+    def test_cleanup_only_removes_aged_unreferenced_owned_audio_and_rejects_active_jobs(self):
+        queue=self.cached_queue([])
+        done=self.settled(queue,{'url':TRACK,'request_id':'storage-protected-reference'})
+        kept=queue.row_path(done['items'][0],queue.root/done['id']/'1')
+        orphan=queue.store.directory/('1'*64+'.mp3'); orphan.write_bytes(b'old owned artifact')
+        recent=queue.store.directory/('2'*64+'.mp3'); recent.write_bytes(b'recent owned artifact')
+        unknown=queue.store.directory/'personal-note.txt'; unknown.write_text('Untouched')
+        old=time.time()-25*3600; os.utime(orphan,(old,old)); os.utime(kept,(old,old))
+        queue.running_jobs.add('synthetic-active')
+        with self.assertRaises(ValueError): queue.cleanup_storage({})
+        queue.running_jobs.clear()
+        report=queue.cleanup_storage({})
+        self.assertEqual(report['removed_files'],1)
+        self.assertFalse(orphan.exists())
+        self.assertTrue(recent.exists()); self.assertTrue(unknown.exists())
+        self.assertEqual(kept.read_bytes(),self.fixture.read_bytes())
+        self.assertEqual(queue.snapshot(done['id'])['state'],'complete')
+    def test_deferred_start_preserves_pending_intent_without_issuing_traffic(self):
+        queue=self.cached_queue([]); queue.pool.shutdown(wait=True)
+        job=self.stored_job(queue,'deferred-server-start')
+        calls=[]
+        def prepare(url,folder):
+            calls.append(url)
+            target=folder/'audio.mp3'; shutil.copyfile(self.fixture,target)
+            return target,{}
+        restored=self.queue(prepare=prepare,resolve=lambda u,t:('Selection','test',[u]),start=False)
+        restored.pool.submit(lambda: None).result(timeout=10)
+        self.assertEqual(calls,[])
+        self.assertEqual(restored.snapshot(job['id'])['state'],'queued')
+        restored.resume_pending(); restored.resume_pending()
+        restored.pool.submit(lambda: None).result(timeout=10)
+        self.assertEqual(calls,[TRACK])
+        self.assertEqual(restored.snapshot(job['id'])['state'],'complete')
+    def test_main_preserves_pairing_extra_fields_and_closes_queue_on_bind_failure(self):
+        session=Path(self.folder.name)/'session.json'
+        original={'url':'http://192.168.1.10:8768/'+'x'*32+'/', 'autostart':True, 'privateField':'unchanged'}
+        session.write_text(json.dumps(original))
+        arguments=['automatic_downloads.py','--bind','192.168.1.20','--port','8768','--data',self.folder.name,
+                   '--ffmpeg','unused','--session',str(session),'--lifetime-seconds','0']
+        with patch('sys.argv',arguments), patch('automatic_downloads.Queue') as queue_factory, \
+             patch('automatic_downloads.ThreadingHTTPServer',side_effect=OSError('Port occupied')):
+            with self.assertRaises(OSError): main()
+            queue_factory.assert_called_once_with(Path(self.folder.name),'unused',start=False)
+            queue_factory.return_value.resume_pending.assert_not_called()
+            queue_factory.return_value.pool.shutdown.assert_called_once_with(wait=True,cancel_futures=True)
+        self.assertEqual(json.loads(session.read_text()),original)
+        with patch('sys.argv',arguments), patch('automatic_downloads.Queue') as queue_factory, \
+             patch('automatic_downloads.ThreadingHTTPServer') as server_factory, \
+             patch('companion_discovery.advertise',return_value=nullcontext()), redirect_stdout(io.StringIO()):
+            main()
+            queue_factory.return_value.resume_pending.assert_called_once_with()
+            server_factory.return_value.serve_forever.assert_called_once_with()
+            server_factory.return_value.server_close.assert_called_once_with()
+        stored=json.loads(session.read_text())
+        self.assertEqual(stored,dict(original,url='http://192.168.1.20:8768/'+'x'*32+'/'))
+    def test_rate_limit_is_not_retried_without_server_backoff(self):
+        import requests
+        calls=[]
+        def limited(url,tracks):
+            calls.append(url)
+            response=requests.Response(); response.status_code=429
+            raise requests.HTTPError('Rate limited',response=response)
+        queue=self.queue(resolve=limited,retry_delays=(0,))
+        result=self.settled(queue,{'url':TRACK,'request_id':'respect-rate-limit-test'})
+        self.assertEqual(result['state'],'error')
+        self.assertEqual(calls,[TRACK])
+    def test_alternative_without_distinct_actual_album_never_becomes_ready(self):
+        def untagged(url,folder):
+            target=folder/'audio.mp3'; shutil.copyfile(self.fixture,target)
+            return target,{'source':SOURCE_B}
+        queue=self.queue(prepare=untagged,resolve=lambda u,t:('Selection','test',[u]))
+        result=self.settled(queue,{'url':TRACK,'kind':'alternative','request_id':'alternative-missing-label'})
+        self.assertEqual(result['state'],'error')
+        self.assertFalse(queue.files); self.assertFalse(queue.reusable)
+    def test_store_and_cleanup_refuse_symlink_to_unrelated_file(self):
+        queue=self.cached_queue([])
+        digest=hashlib.sha256(self.fixture.read_bytes()).hexdigest()
+        link=queue.store.directory/(digest+'.mp3')
+        try: link.symlink_to(self.fixture)
+        except (OSError,NotImplementedError): self.skipTest('Symlink creation unavailable on this host.')
+        result=self.settled(queue,{'url':TRACK,'request_id':'storage-symlink-reject'})
+        self.assertEqual(result['state'],'error')
+        self.assertTrue(link.is_symlink())
+        before=self.fixture.read_bytes()
+        queue.cleanup_storage({})
+        self.assertTrue(link.is_symlink()); self.assertEqual(self.fixture.read_bytes(),before)
     def test_api_authorization_transfer_and_modified_file(self):
         queue=self.queue()
         server=ThreadingHTTPServer(('127.0.0.1',0),handler_for(queue,'127.0.0.1',0,'x'*32))

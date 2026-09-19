@@ -89,8 +89,29 @@ FILES=("$TWEAK_DEB")
 [ "$WITH_FLEX" = 1 ] && FILES+=("$FLEX_DEB")
 
 echo "==> injecting"
+# Merge discovery declarations with the app's existing Bonjour services so
+# Spotify Connect remains declared. No multicast entitlement is needed for a
+# specific Bonjour service declared in NSBonjourServices.
+NETWORK_PLIST="$ROOT/out/.network-overrides.plist"
+python3 - "$IN" "$ROOT/plist/liquid-glass.plist" "$NETWORK_PLIST" <<'PY'
+import plistlib, sys, zipfile
+with zipfile.ZipFile(sys.argv[1]) as ipa:
+    infos = [n for n in ipa.namelist() if n.startswith('Payload/') and n.count('/') == 2 and n.endswith('.app/Info.plist')]
+    if len(infos) != 1:
+        raise SystemExit('Expected one app for local network declarations')
+    original = plistlib.loads(ipa.read(infos[0]))
+with open(sys.argv[2], 'rb') as stream:
+    overrides = plistlib.load(stream)
+services = original.get('NSBonjourServices', [])
+if not isinstance(services, list):
+    services = []
+overrides['NSBonjourServices'] = list(dict.fromkeys([s for s in services if isinstance(s, str)] + ['_spoti-pc._tcp']))
+overrides['NSLocalNetworkUsageDescription'] = 'Spotify utilise le réseau local pour Spotify Connect et pour retrouver le PC associé aux téléchargements.'
+with open(sys.argv[3], 'wb') as stream:
+    plistlib.dump(overrides, stream)
+PY
 # -w drops the Watch app: its companion-app key would still name com.spotify.client and block the install.
-cyan -i "$IN" -o "$OUT" -f "${FILES[@]}" -l "$ROOT/plist/liquid-glass.plist" ${BUNDLE_ID:+-b "$BUNDLE_ID"} ${NAME:+-n "$NAME"} ${ICON:+-k "$ICON"} -w -s --overwrite
+cyan -i "$IN" -o "$OUT" -f "${FILES[@]}" -l "$NETWORK_PLIST" ${BUNDLE_ID:+-b "$BUNDLE_ID"} ${NAME:+-n "$NAME"} ${ICON:+-k "$ICON"} -w -s --overwrite
 
 # Preserve the notices for the embedded native resolver inside the delivered app.
 python3 - "$OUT" "$ROOT/tweak/Sources/Features/NowPlaying/NativeAudioLicenses.txt" <<'PY'

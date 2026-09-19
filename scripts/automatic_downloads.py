@@ -18,17 +18,55 @@ from concurrent.futures import ThreadPoolExecutor, wait
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
+import requests
 from mutagen import MutagenError
 from mutagen.mp3 import MP3
 from mutagen.mp4 import MP4
 from PIL import Image
 from download_metadata import canonical, collection
 from download_worker import source_url
+from download_storage import AudioStore, atomic_document, safe_path
 
 LIMIT = 100 * 1024 * 1024
 ACTIVE = {"queued", "resolving", "running"}
 PHASES = {'metadata', 'search', 'download', 'cover', 'verify'}
 FAILURES = {'network', 'unavailable', 'no_match', 'invalid_audio', 'cover', 'error'}
+TERMINAL = {'complete', 'partial', 'error', 'interrupted', 'paused', 'cancelled'}
+CAPABILITIES = {'version':1, 'resumeJobs':True, 'storage':True, 'alternativeVersions':True, 'refreshPlaylists':True}
+
+
+def request_fields(request):
+    if not isinstance(request, dict): raise ValueError('Requête invalide.')
+    url = canonical(request.get('url'))
+    key = request.get('request_id', '')
+    if not isinstance(key, str) or not re.fullmatch('[A-Za-z0-9-]{16,64}', key): raise ValueError('Identifiant de requête invalide.')
+    kind = request.get('kind', 'download')
+    if kind not in ('download', 'alternative'): raise ValueError('Type de demande invalide.')
+    refresh = request.get('refresh', False)
+    if type(refresh) is not bool: raise ValueError('Actualisation invalide.')
+    tracks = request.get('track_urls')
+    if tracks is not None:
+        if not isinstance(tracks, list) or not 1 <= len(tracks) <= 500: raise ValueError('Au maximum 500 morceaux par demande.')
+        tracks = [canonical(track) for track in tracks]
+        if not all('/track/' in track for track in tracks): raise ValueError('Liste de morceaux attendue.')
+    if refresh and (tracks is not None or kind != 'download'): raise ValueError('Une actualisation relit la playlist.')
+    avoid = request.get('avoid_sources', [])
+    if not isinstance(avoid, list) or len(avoid) > 8: raise ValueError('Au maximum 8 sources exclues.')
+    normalized = []
+    for value in avoid:
+        source = source_url(value) if isinstance(value, str) else None
+        if not source: raise ValueError('Lien audio exclu invalide.')
+        if source not in normalized: normalized.append(source)
+    if kind == 'alternative':
+        if '/track/' not in url or tracks is not None: raise ValueError('Une autre version concerne un seul titre.')
+    elif avoid: raise ValueError('Sources exclues réservées aux autres versions.')
+    return {'url':url, 'request_id':key, 'kind':kind, 'refresh':refresh, 'track_urls':tracks, 'avoid_sources':normalized}
+
+
+def transient(error):
+    if isinstance(error, (TimeoutError, ConnectionError, subprocess.TimeoutExpired, requests.Timeout,
+                          requests.ConnectionError, requests.exceptions.ChunkedEncodingError)): return True
+    return isinstance(error, requests.HTTPError) and error.response is not None and error.response.status_code in (408, 500, 502, 503, 504)
 
 
 def audio_extension(metadata):
@@ -93,12 +131,12 @@ def byte_range(header, size):
     return start, end
 
 
-def worker_document(path):
+def worker_document(path, limit=16384):
     """Best-effort bounded reads: workers can still be writing metadata on failure."""
     try:
-        if path.is_symlink() or path.stat().st_size > 16384: return {}
-        with path.open('rb') as stream: data = stream.read(16385)
-        if len(data) > 16384: return {}
+        if path.is_symlink() or path.stat().st_size > limit: return {}
+        with path.open('rb') as stream: data = stream.read(limit+1)
+        if len(data) > limit: return {}
         result = json.loads(data)
         return result if isinstance(result, dict) else {}
     except (ValueError, OSError): return {}
@@ -153,26 +191,56 @@ def audio_record(path, metadata):
 
 
 class Queue:
-    def __init__(self, root, ffmpeg, prepare=None, resolve=collection):
+    def __init__(self, root, ffmpeg, prepare=None, resolve=collection, retry_delays=(2.0,), start=True):
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.ffmpeg, self.resolve, self.prepare = ffmpeg, resolve, prepare or self.worker
+        self.custom_prepare = prepare is not None
+        self.retry_delays = tuple(retry_delays)[:2]
         self.lock, self.jobs, self.files = threading.RLock(), {}, {}
+        self.running_jobs = set()
         self.reusable, self.repairable = {}, {}
+        self.store, self.preferred = AudioStore(self.root, audio_record), {}
         self.pool = ThreadPoolExecutor(max_workers=1)
+        resumed = []
         for path in self.root.glob('*/job.json'):
             try:
                 if (not re.fullmatch('[a-f0-9]{32}', path.parent.name) or path.is_symlink() or
                     path.resolve() != path or path.stat().st_size > 8 * 1024 * 1024): continue
                 job = json.loads(path.read_text(encoding='utf-8'))
-                if job['id'] != path.parent.name: continue
+                if not isinstance(job, dict) or job.get('version') != 2 or job.get('id') != path.parent.name: continue
+                fields = request_fields(job)
+                if 'effective_avoid_sources' in job:
+                    job['effective_avoid_sources'] = request_fields(dict(fields, avoid_sources=job['effective_avoid_sources']))['avoid_sources']
+                if job.get('state') not in ACTIVE | TERMINAL: continue
+                rows = job.get('items')
+                if not isinstance(rows, list) or len(rows) > 500: continue
+                created = job.get('created', 0)
+                if type(created) not in (float, int) or not math.isfinite(created): continue
+                for index, item in enumerate(rows, 1):
+                    if (not isinstance(item, dict) or type(item.get('position')) is not int or item['position'] != index or
+                        '/track/' not in canonical(item.get('spotify')) or item.get('state') not in {'waiting', 'running', 'ready', 'error'}):
+                        raise ValueError('Lignes de téléchargement invalides.')
+                    item['spotify'] = canonical(item['spotify'])
+                    attempts = item.get('attempts', 0)
+                    if type(attempts) is not int or not 0 <= attempts <= 3: raise ValueError('Compteur invalide.')
+                if fields['kind'] == 'alternative' and (len(rows) > 1 or any(item['spotify'] != fields['url'] for item in rows)):
+                    raise ValueError('Identité de version incohérente.')
+                if fields['kind'] == 'alternative' and (type(job.get('variant_number')) is not int or not 2 <= job['variant_number'] <= 999999):
+                    raise ValueError('Numéro de version invalide.')
+                if fields['track_urls'] is not None and rows and [item['spotify'] for item in rows] != fields['track_urls']:
+                    raise ValueError('Sélection persistée incohérente.')
+                if type(job.get('resolveAttempts', 0)) is not int or not 0 <= job.get('resolveAttempts', 0) <= 3:
+                    raise ValueError('Compteur invalide.')
+                job.update(fields)
                 if 'completeMetadata' not in job:
                     tracks = job.get('track_urls')
                     job['completeMetadata'] = ('/track/' in canonical(job['url']) or
                         isinstance(tracks, list) and 1 <= len(tracks) <= 500 and
                         all('/track/' in canonical(track) for track in tracks))
-                if job['state'] in ACTIVE:
-                    job.update(state='interrupted', message='PC redémarré : relance ce téléchargement.')
+                was_active = job['state'] in ACTIVE
+                if job.get('cancelled') is True: job['state'] = 'cancelled'; was_active = False
+                elif job.get('paused') is True or job.get('userPaused') is True: job['state'] = 'paused'; was_active = False
                 for item in job.get('items', []):
                     position = item.get('position')
                     if isinstance(position, bool) or not isinstance(position, int) or not 1 <= position <= 500:
@@ -181,22 +249,195 @@ class Queue:
                     if item['state'] == 'ready':
                         record = None
                         try:
-                            audio = folder / ('audio.' + audio_extension(item))
+                            audio = self.row_path(item, folder)
                             if audio.is_file() and audio.resolve(strict=True) == audio:
                                 record = audio_record(audio, item)
                         except (OSError, ValueError, KeyError, MutagenError): pass
                         if record and record['id'] == item['id']:
                             self.register(item['id'], audio, record['extension'])
-                            self.remember_audio(item['spotify'], audio, record)
+                            if job['kind'] != 'alternative': self.remember_audio(item['spotify'], audio, record)
                             item.update(record)
                         else:
                             item.update(state='error', message='Fichier absent ou modifié sur le PC.')
-                            job.update(state='partial', message='Certains fichiers ne sont plus disponibles sur le PC.')
+                            if not was_active and not self.stopped(job): job.update(state='partial', message='Certains fichiers ne sont plus disponibles sur le PC.')
                     if item['state'] != 'ready':
-                        self.remember_repair(item['spotify'], folder)
+                        if job['kind'] != 'alternative': self.remember_repair(item['spotify'], folder)
+                        if was_active and item['state'] == 'running': item['state'] = 'waiting'
+                if was_active:
+                    job.update(state='queued', message='Reprise automatique après redémarrage du PC.')
+                    resumed.append(job)
                 self.jobs[job['id']] = job
                 self.save(job)
             except (ValueError, KeyError, TypeError, OSError, MutagenError): continue
+        self.restore_preferences()
+        self.pending_resume = sorted(resumed, key=lambda value: value.get('created', 0))
+        if start: self.resume_pending()
+
+    def resume_pending(self):
+        # main() binds and publishes the service before any persisted job issues traffic.
+        with self.lock:
+            pending, self.pending_resume = self.pending_resume, []
+            for job in pending:
+                try:
+                    if job['kind'] == 'alternative' and 'effective_avoid_sources' not in job:
+                        job['effective_avoid_sources'] = self.effective_avoid(job)
+                        self.save(job)
+                    self.pool.submit(self.run, job['id'])
+                except (ValueError, OSError):
+                    job.update(state='error', message='Cette demande ne peut pas être reprise. Relance-la depuis l’iPhone.')
+                    self.save(job)
+
+    def row_path(self, row, folder):
+        return self.store.path(row) if row.get('storage') == 'blob' else folder / ('audio.' + audio_extension(row))
+
+    def stopped(self, job):
+        return job.get('state') in {'paused', 'cancelled'} or any(job.get(key) is True for key in ('paused', 'userPaused', 'cancelled'))
+
+    def effective_avoid(self, fields):
+        values = list(fields.get('avoid_sources', []))
+        cached = self.reusable.get(fields['url'])
+        current = self.preferred.get(fields['url']) or (cached[1] if cached else {})
+        source = source_url(current.get('source'))
+        if source and source not in values: values.append(source)
+        if len(values) > 8: raise ValueError('Au maximum 8 sources, version actuelle comprise.')
+        return values
+
+    def restore_preferences(self):
+        document = worker_document(self.root / 'preferred-audio.json', 8 * 1024 * 1024)
+        if document.get('version') != 1 or not isinstance(document.get('tracks'), dict): return
+        for url, row in document['tracks'].items():
+            try:
+                if '/track/' not in canonical(url) or not isinstance(row, dict): continue
+                path = self.store.path(row)
+                checked = self.store.verified(path, row)
+                self.preferred[url] = dict(row, **checked)
+                self.register(checked['id'], path, checked['extension'])
+                self.remember_audio(url, path, checked)
+            except (ValueError, KeyError, TypeError, OSError, MutagenError): continue
+
+    def accept_version(self, request):
+        if not isinstance(request, dict): raise ValueError('Demande invalide.')
+        ident, digest = request.get('job_id'), request.get('sha256')
+        if not isinstance(ident, str) or not re.fullmatch('[a-f0-9]{32}', ident) or not isinstance(digest, str) or not re.fullmatch('[a-f0-9]{64}', digest):
+            raise ValueError('Version invalide.')
+        with self.lock:
+            job = self.jobs.get(ident)
+            if not job or job.get('kind') != 'alternative' or job['state'] != 'complete' or len(job['items']) != 1:
+                raise ValueError('Cette autre version n’est pas prête.')
+            row = job['items'][0]
+            if row.get('state') != 'ready' or row.get('id') != digest or row['spotify'] != job['url']:
+                raise ValueError('Identité de version incohérente.')
+            path = self.row_path(row, self.root / ident / '1')
+            path, checked = self.store.install(path, row)
+            preferred = dict(self.preferred)
+            preferred[job['url']] = dict(checked, storage='blob')
+            atomic_document(self.root / 'preferred-audio.json', {'version':1, 'tracks':preferred})
+            self.preferred = preferred
+            self.remember_audio(job['url'], path, checked)
+            self.register(digest, path, checked['extension'])
+            return {'accepted':True, 'spotify':job['url'], 'sha256':digest, 'extension':checked['extension']}
+
+    def storage_inventory(self):
+        # Hold self.lock. Any unrecognized job prevents cleanup rather than
+        # guessing which canonical files its missing metadata might reference.
+        protected, legacy, uncertain = set(), {}, False
+        for path in self.root.glob('*/job.json'):
+            if path.parent.name not in self.jobs or path.is_symlink() or path.resolve() != path: uncertain = True
+            elif worker_document(path, 8 * 1024 * 1024) != self.jobs[path.parent.name]: uncertain = True
+        for job in self.jobs.values():
+            for row in job['items']:
+                if row['state'] != 'ready': continue
+                try:
+                    path = self.row_path(row, self.root / job['id'] / str(row['position']))
+                    protected.add(path)
+                    protected.add(self.store.path(row))
+                    if row.get('storage') != 'blob':
+                        safe_path(path, self.root)
+                        info = path.stat()
+                        if stat.S_ISREG(info.st_mode): legacy[path] = info
+                except (OSError, ValueError): pass
+        for row in self.preferred.values(): protected.add(self.store.path(row))
+        entries = self.store.inventory()
+        audio = [(path, info) for path, info in entries if path.suffix in ('.mp3', '.m4a')]
+        audio.extend(legacy.items())
+        # Recent orphans may come from a crash just before committing a job.
+        cutoff = time.time() - 24 * 3600
+        reclaim = [(path, info) for path, info in entries if path not in protected and info.st_mtime <= cutoff]
+        for job in self.jobs.values():
+            if job['state'] in ACTIVE or self.stopped(job) and job['state'] != 'cancelled': continue
+            for row in job['items']:
+                folder = self.root / job['id'] / str(row['position'])
+                for extension in ('mp3', 'm4a'):
+                    path = folder / ('audio.'+extension)
+                    if path in protected: continue
+                    try:
+                        safe_path(path, self.root)
+                        info = path.stat()
+                        if stat.S_ISREG(info.st_mode) and 0 <= info.st_size <= LIMIT and info.st_mtime <= cutoff:
+                            reclaim.append((path, info))
+                    except (OSError, ValueError): pass
+        return audio, reclaim, uncertain
+
+    def storage_status(self):
+        with self.lock, self.store.lock:
+            audio, reclaim, uncertain = self.storage_inventory()
+            active = len({job['id'] for job in self.jobs.values() if job['state'] in ACTIVE} | self.running_jobs)
+            identities = {}
+            for job in self.jobs.values():
+                for row in job['items']:
+                    if row['state'] == 'ready':
+                        path = self.row_path(row, self.root/job['id']/str(row['position']))
+                        identities[path] = row['id']+'.'+audio_extension(row)
+            groups = {}
+            for path, info in audio:
+                identity = identities.get(path, path.name if path.parent == self.store.directory else str(path))
+                groups.setdefault(identity, []).append(info.st_size)
+            duplicates = sum(len(sizes)-1 for sizes in groups.values())
+            duplicate_bytes = sum(sum(sizes)-max(sizes) for sizes in groups.values())
+            return {'version':1, 'audio_bytes':sum(info.st_size for _, info in audio), 'audio_files':len(audio),
+                'reclaimable_bytes':sum(info.st_size for _, info in reclaim)+duplicate_bytes if not uncertain else 0,
+                'reclaimable_files':len(reclaim)+duplicates if not uncertain else 0,
+                'active_jobs':active, 'cleanup_available':not active and not uncertain}
+
+    def cleanup_storage(self, request):
+        if not isinstance(request, dict) or request: raise ValueError('Nettoyage invalide.')
+        with self.lock, self.store.lock:
+            status = self.storage_status()
+            if not status['cleanup_available']: raise ValueError('Attends la fin des préparations avant le nettoyage.')
+            audio, reclaim, uncertain = self.storage_inventory()
+            if uncertain: raise ValueError('Historique incomplet : aucun fichier supprimé.')
+            before = {path:info.st_size for path, info in audio+reclaim}
+            consolidated = 0
+            for job in self.jobs.values():
+                for row in job['items']:
+                    if row['state'] != 'ready' or row.get('storage') == 'blob': continue
+                    original = self.row_path(row, self.root/job['id']/str(row['position']))
+                    old_row = dict(row)
+                    try:
+                        snapshot = original.stat()
+                        target, checked = self.store.install(original, row)
+                        row.update(checked, storage='blob')
+                        try: self.save(job)
+                        except (OSError, ValueError):
+                            row.clear(); row.update(old_row)
+                            raise
+                        self.register(row['id'], target, row['extension'])
+                        if job.get('kind') != 'alternative': self.remember_audio(row['spotify'], target, checked)
+                        if self.store.remove_snapshot(original, snapshot): consolidated += 1
+                    except (OSError, ValueError, MutagenError): continue
+            _, reclaim, _ = self.storage_inventory()
+            removed_files = removed_bytes = 0
+            for path, snapshot in reclaim:
+                try:
+                    if self.store.remove_snapshot(path, snapshot):
+                        removed_files += 1; removed_bytes += snapshot.st_size
+                except (OSError, ValueError): continue
+            # Unfinished repair references may have pointed at removed staging files.
+            self.repairable = {url:record for url, record in self.repairable.items() if record[0].is_file()}
+            after_audio, after_reclaim, _ = self.storage_inventory()
+            after = {path:info.st_size for path, info in after_audio+after_reclaim}
+            return {'removed_bytes':max(0, sum(before.values())-sum(after.values())),
+                'removed_files':max(0, len(before)-len(after)), 'consolidated_files':consolidated, 'storage':self.storage_status()}
 
     def register(self, ident, path, extension='mp3'):
         if (path.is_symlink() or path.resolve(strict=True) != path or not path.is_relative_to(self.root) or
@@ -211,42 +452,27 @@ class Queue:
         if '/track/' not in url: return
         path = path.resolve(strict=True)
         if not path.is_relative_to(self.root): raise ValueError('Chemin audio invalide.')
+        if url in self.preferred and self.preferred[url]['id'] != record['id']: return
         self.reusable[url] = (path, dict(record))
 
     def reuse_audio(self, url, folder):
-        """Reuse only the exact previously verified file for this Spotify identity."""
+        """Reuse a verified canonical file, without creating a copy per playlist."""
         url = canonical(url)
         with self.lock: cached = self.reusable.get(url)
         if not cached: return None
         source, metadata = cached
-        temporary = None
         try:
             if (source.is_symlink() or source.resolve(strict=True) != source or
                 not source.is_relative_to(self.root) or source.stat().st_size != metadata['bytes'] or
                 folder.is_symlink() or folder.resolve(strict=True) != folder or not folder.is_relative_to(self.root)):
                 raise ValueError('Copie locale indisponible.')
-            temporary = folder / ('reuse-' + secrets.token_hex(8) + '.tmp')
-            # A separate copy keeps playlist files independent. Bound the copy even if
-            # the source is changed while reading, then verify the destination itself.
-            with source.open('rb') as incoming, temporary.open('xb') as outgoing:
-                copied = 0
-                while chunk := incoming.read(131072):
-                    copied += len(chunk)
-                    if copied > LIMIT: raise ValueError('Fichier audio trop volumineux.')
-                    outgoing.write(chunk)
-            record = audio_record(temporary, metadata)
-            if record['id'] != metadata['id']:
-                raise ValueError('Le fichier audio a changé.')
-            target = folder / ('audio.' + record['extension'])
-            if target.is_symlink(): raise ValueError('Chemin audio invalide.')
-            temporary.replace(target)
+            target, record = self.store.install(source, metadata)
+            record['storage'] = 'blob'
             return target, record
         except (OSError, ValueError, KeyError, MutagenError):
             with self.lock:
                 if self.reusable.get(url) is cached: self.reusable.pop(url, None)
             return None
-        finally:
-            if temporary is not None: temporary.unlink(missing_ok=True)
 
     def repair_record(self, url, folder):
         """Matched unfinished audio is never an entry in self.files/self.reusable."""
@@ -334,9 +560,8 @@ class Queue:
     def save(self, job):
         path = self.root / job['id']
         path.mkdir(exist_ok=True)
-        tmp = path / 'job.tmp'
-        tmp.write_text(json.dumps(job, ensure_ascii=False), encoding='utf-8')
-        tmp.replace(path / 'job.json')
+        safe_path(path, self.root)
+        atomic_document(path / 'job.json', job)
 
     def snapshot(self, ident):
         with self.lock:
@@ -344,42 +569,40 @@ class Queue:
             return copy.deepcopy(self.jobs[ident])
 
     def submit(self, request):
-        if not isinstance(request, dict): raise ValueError('Requête invalide.')
-        url = canonical(request.get('url'))
-        key = request.get('request_id', '')
-        if not isinstance(key, str) or not re.fullmatch('[A-Za-z0-9-]{16,64}', key):
-            raise ValueError('Identifiant de requête invalide.')
-        tracks = request.get('track_urls')
-        if tracks is not None:
-            if not isinstance(tracks, list) or not 1 <= len(tracks) <= 500:
-                raise ValueError('Au maximum 500 morceaux par demande.')
-            tracks = [canonical(track) for track in tracks]
-            if not all('/track/' in track for track in tracks): raise ValueError('Liste de morceaux attendue.')
+        fields = request_fields(request)
+        url, key, tracks = fields['url'], fields['request_id'], fields['track_urls']
         with self.lock:
             for job in self.jobs.values():
                 if job['request_id'] == key:
-                    if job['url'] != url or job.get('track_urls') != tracks:
+                    if request_fields(job) != fields:
                         raise ValueError('Cet identifiant correspond à une autre demande.')
                     return copy.deepcopy(job)
-                if job['url'] == url and job['state'] in ACTIVE:
+                if (job['state'] in ACTIVE and all(job.get(name) == fields[name] for name in
+                    ('url', 'track_urls', 'kind', 'avoid_sources', 'refresh'))):
                     return copy.deepcopy(job)
             if sum(j['state'] in ACTIVE for j in self.jobs.values()) >= 10:
                 raise ValueError('La file est pleine : attends un téléchargement en cours.')
             ident = secrets.token_hex(16)
-            job = dict(version=2, id=ident, request_id=key, url=url, track_urls=tracks,
+            job = dict(fields, version=2, id=ident,
                 completeMetadata=tracks is not None or '/track/' in url,
                 name='Téléchargement', state='queued', items=[], message='En attente.', scope='', created=time.time())
-            self.jobs[ident] = job
+            if fields['kind'] == 'alternative':
+                job['effective_avoid_sources'] = self.effective_avoid(fields)
+                job['variant_number'] = max((existing.get('variant_number', 1) for existing in self.jobs.values()
+                    if existing.get('kind') == 'alternative' and existing['url'] == url), default=1) + 1
+                if job['variant_number'] > 999999: raise ValueError('Nombre de versions trop élevé.')
             self.save(job)
+            self.jobs[ident] = job
             self.pool.submit(self.run, ident)
             return copy.deepcopy(job)
 
-    def worker(self, url, folder):
+    def worker(self, url, folder, avoid_sources=(), variant_number=None):
         with (folder / 'engine.log').open('w', encoding='utf-8') as log:
             subprocess.run([sys.executable, '-X', 'utf8', str(Path(__file__).with_name('download_worker.py')),
                 url, str(folder), '--ffmpeg', self.ffmpeg], stdout=log, stderr=subprocess.STDOUT,
                 timeout=240, check=True, env={**os.environ, 'SG_METADATA_CACHE_DIR':str(self.root / '.metadata-cache'),
-                    'SG_ARTWORK_CACHE_DIR':str(self.root / '.artwork-cache')},
+                    'SG_ARTWORK_CACHE_DIR':str(self.root / '.artwork-cache'), 'SG_AVOID_SOURCES':json.dumps(list(avoid_sources)),
+                    'SG_VARIANT_LABEL':f'Version {variant_number}' if variant_number is not None else ''},
                 creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
         metadata = worker_document(folder / 'audio-ready.json')
         if metadata.get('spotify') != url: raise ValueError('Mauvaise identité audio.')
@@ -416,63 +639,131 @@ class Queue:
                         item.update(fields); changed = True
             if changed: self.save_progress(job)
 
+    def prepare_with_retry(self, job, item, folder):
+        maximum = 1 + len(self.retry_delays)
+        while item.get('attempts', 0) < maximum:
+            if self.stopped(job): raise InterruptedError('Préparation arrêtée.')
+            attempt = item.get('attempts', 0)
+            if attempt:
+                with self.lock:
+                    item['message'] = 'Connexion interrompue. Nouvel essai automatique.'
+                    self.save_progress(job)
+                time.sleep(self.retry_delays[attempt-1])
+                if self.stopped(job): raise InterruptedError('Préparation arrêtée.')
+            with self.lock:
+                item['attempts'] = attempt + 1
+                self.save(job) # Persist the budget before issuing any network request.
+            for name in ('failure.json', 'progress.json'):
+                path = folder / name
+                if path.is_symlink(): raise ValueError('Dossier de préparation invalide.')
+                path.unlink(missing_ok=True)
+            try:
+                if self.custom_prepare: return self.prepare(item['spotify'], folder)
+                return self.worker(item['spotify'], folder, job.get('effective_avoid_sources', []),
+                    job.get('variant_number') if job['kind'] == 'alternative' else None)
+            except Exception as error:
+                detail = worker_document(folder / 'failure.json')
+                if not (transient(error) or detail.get('code') == 'network') or attempt + 1 >= maximum: raise
+        raise ValueError('Essais automatiques épuisés. Réessaie depuis l’iPhone.')
+
     def prepare_group(self, job, items):
-        """One preparation per Spotify identity; duplicate positions keep separate files."""
-        failure, labels = None, {}
+        """One preparation per identity; positions refer to verified canonical files."""
+        failure, labels, detail = None, {}, {}
         failure_message = 'Source introuvable, non conforme ou inaccessible.'
         for index, item in enumerate(items):
             folder = self.root / job['id'] / str(item['position'])
+            if self.stopped(job): return
+            if item['state'] in ('ready', 'error'): continue
             try:
                 folder.mkdir(exist_ok=True)
+                safe_path(folder, self.root)
                 if failure is not None: raise failure
                 with self.lock:
                     item.update(state='running')
                     self.save_progress(job)
-                reused = self.reuse_audio(item['spotify'], folder)
+                alternative = job.get('kind') == 'alternative'
+                reused = None if alternative else self.reuse_audio(item['spotify'], folder)
+                prepared_source = None
                 if reused:
                     path, record = reused
                 elif index == 0:
-                    self.seed_repair(item['spotify'], folder)
-                    path, metadata = self.prepare(item['spotify'], folder)
+                    if not alternative: self.seed_repair(item['spotify'], folder)
+                    path, metadata = self.prepare_with_retry(job, item, folder)
                     record = audio_record(path, metadata)
+                    if alternative:
+                        provenance = source_url(record.get('source'))
+                        if not provenance or provenance in job.get('effective_avoid_sources', job['avoid_sources']):
+                            raise ValueError('La source alternative est absente ou déjà exclue.')
+                        label = f"Version {job['variant_number']}"
+                        if record['album'] != label and not record['album'].endswith(' · ' + label):
+                            raise ValueError('La version ne contient pas son album distinct.')
+                    prepared_source = path
+                    path, record = self.store.install(path, record)
+                    record['storage'] = 'blob'
                 else:
                     # A duplicate must not launch another search if its verified copy
                     # was removed or changed between positions.
                     raise ValueError('Copie locale indisponible ou modifiée.')
                 with self.lock:
                     self.register(record['id'], path, record['extension'])
-                    self.remember_audio(item['spotify'], path, record)
+                    if not alternative: self.remember_audio(item['spotify'], path, record)
                     item.update(record, state='ready')
                     item.pop('message', None)
                     self.save_progress(job)
+                # Consume only this worker's successful staging file after saving
+                # the canonical reference. Legacy completed files are untouched.
+                if prepared_source is not None and prepared_source.parent == folder and prepared_source != path:
+                    try:
+                        safe_path(prepared_source, self.root)
+                        prepared_source.unlink()
+                    except (OSError, ValueError): pass
             except Exception as error:
                 if index == 0:
                     failure = error
-                    self.remember_repair(item['spotify'], folder)
+                    if job.get('kind') != 'alternative': self.remember_repair(item['spotify'], folder)
                     labels = worker_labels(folder)
                     detail = worker_document(folder / 'failure.json')
                     if detail.get('code') in FAILURES and isinstance(detail.get('message'), str) and detail['message'].strip():
                         failure_message = detail['message'][:240]
                 with self.lock:
+                    if self.stopped(job): return
                     item.update(labels, state='error', message=failure_message)
+                    if detail.get('detail') == 'no_alternative': item['detail'] = 'no_alternative'
                     self.save_progress(job)
                 try: (folder / 'error.txt').write_text(str(error), encoding='utf-8')
                 except OSError: pass # Diagnostics must not prevent the remaining tracks from running.
 
     def run(self, ident):
+        with self.lock: self.running_jobs.add(ident)
         try:
             with self.lock:
                 job = self.jobs[ident]
-                job.update(state='resolving', message='Lecture de la sélection Spotify.')
-                self.save(job)
-            name, scope, urls = self.resolve(job['url'], job.get('track_urls'))
-            urls = [canonical(url) for url in urls]
-            if not urls or not all('/track/' in url for url in urls):
-                raise ValueError('Liste de morceaux attendue.')
+                if self.stopped(job): return
+            if not job['items']:
+                maximum = 1 + len(self.retry_delays)
+                while True:
+                    attempt = job.get('resolveAttempts', 0)
+                    if attempt >= maximum: raise ValueError('Essais de lecture épuisés.')
+                    if attempt: time.sleep(self.retry_delays[attempt-1])
+                    with self.lock:
+                        if self.stopped(job): return
+                        job.update(state='resolving', message='Lecture de la sélection Spotify.', resolveAttempts=attempt+1)
+                        self.save(job)
+                    try:
+                        name, scope, urls = self.resolve(job['url'], job.get('track_urls'))
+                        urls = [canonical(url) for url in urls]
+                        if not 1 <= len(urls) <= 500 or not all('/track/' in url for url in urls): raise ValueError('Liste de morceaux attendue.')
+                        if job['kind'] == 'alternative' and urls != [job['url']]: raise ValueError('Identité de version incohérente.')
+                        break
+                    except Exception as error:
+                        if not transient(error) or attempt + 1 >= maximum: raise
+                with self.lock:
+                    if self.stopped(job): return
+                    job.update(name=name, scope=scope, items=[dict(position=i, spotify=url,
+                        title='Recherche du morceau…', artist='', state='waiting') for i, url in enumerate(urls, 1)])
             with self.lock:
-                job.update(name=name, scope=scope, state='running', items=[
-                    dict(position=i, spotify=url, title='Recherche du morceau…', artist='', state='waiting')
-                    for i, url in enumerate(urls, 1)])
+                if self.stopped(job): return
+                job['state'] = 'running'
                 self.save(job)
             groups = {}
             for item in job['items']: groups.setdefault(item['spotify'], []).append(item)
@@ -486,15 +777,19 @@ class Queue:
                     self.publish_worker_progress(job)
                 for future in futures: future.result()
             with self.lock:
+                if self.stopped(job): return
                 ready = sum(item['state'] == 'ready' for item in job['items'])
-                job.update(state='complete' if ready == len(urls) else 'partial' if ready else 'error',
-                    message=f'{ready}/{len(urls)} fichiers préparés sur le PC.')
+                job.update(state='complete' if ready == len(job['items']) else 'partial' if ready else 'error',
+                    message=f"{ready}/{len(job['items'])} fichiers préparés sur le PC.")
                 self.save(job)
         except Exception as error:
             with self.lock:
+                if self.stopped(self.jobs[ident]): return
                 self.jobs[ident].update(state='error', message='Sélection inaccessible ou non prise en charge.')
                 self.save(self.jobs[ident])
             (self.root / ident / 'error.txt').write_text(str(error), encoding='utf-8')
+        finally:
+            with self.lock: self.running_jobs.discard(ident)
 
 
 def handler_for(queue, host, port, token):
@@ -646,7 +941,7 @@ p{margin:8px 0;color:#b6c2ba}.connection{display:inline-flex;gap:8px;align-items
         def do_POST(self):
             path = urlsplit(self.path)
             if (self.headers.get('Host') != f'{host}:{port}' or path.query or path.fragment or
-                path.path != base + '/jobs' or self.headers.get('Origin') not in (None, origin) or
+                path.path not in (base+'/jobs', base+'/accept-version', base+'/storage/cleanup') or self.headers.get('Origin') not in (None, origin) or
                 self.headers.get('Content-Type', '').split(';')[0] != 'application/json'):
                 return self.reply(403, {'error':'Requête refusée.'})
             try:
@@ -655,17 +950,27 @@ p{margin:8px 0;color:#b6c2ba}.connection{display:inline-flex;gap:8px;align-items
                 self.connection.settimeout(15)
                 payload = self.rfile.read(size)
                 if len(payload) != size: raise ValueError('Requête incomplète.')
-                return self.reply(202, queue.submit(json.loads(payload)))
+                request = json.loads(payload)
+                if path.path == base+'/accept-version': return self.reply(200, queue.accept_version(request))
+                if path.path == base+'/storage/cleanup': return self.reply(200, queue.cleanup_storage(request))
+                return self.reply(202, queue.submit(request))
             except (ValueError, OSError): return self.reply(400, {'error':'Demande invalide ou file pleine.'})
         def do_GET(self):
             parsed = urlsplit(self.path)
-            if (self.headers.get('Host') != f'{host}:{port}' or parsed.query or parsed.fragment or
+            if (self.headers.get('Host') != f'{host}:{port}' or parsed.fragment or
                 self.headers.get('Origin') not in (None, origin)):
                 return self.reply(404, {})
+            if parsed.path == '/discover':
+                from companion_discovery import discovery_reply
+                result = discovery_reply(self.path, host, port, token)
+                return self.reply(200, result) if result is not None else self.reply(404, {})
+            if parsed.query: return self.reply(404, {})
             path = parsed.path
             if path in (base, base + '/'):
                 return self.reply(200, page, 'text/html; charset=utf-8')
             if path == base + '/hello': return self.reply(200, {'version':2,'service':'spoti-auto-downloads'})
+            if path == base + '/capabilities': return self.reply(200, CAPABILITIES)
+            if path == base + '/storage': return self.reply(200, queue.storage_status())
             if path == base + '/status': return self.reply(200, status_summary())
             ident = path.removeprefix(base + '/jobs/')
             if re.fullmatch('[a-f0-9]{32}', ident):
@@ -737,30 +1042,42 @@ def main():
     parser.add_argument('--data', type=Path, required=True)
     parser.add_argument('--ffmpeg', required=True)
     parser.add_argument('--session', type=Path, required=True)
+    parser.add_argument('--lifetime-seconds', type=int, default=21600)
     args = parser.parse_args()
     if not 1024 <= args.port <= 65535: raise ValueError('Port invalide.')
+    if not 0 <= args.lifetime_seconds <= 86400: raise ValueError('Durée de service invalide.')
     token = secrets.token_urlsafe(24)
+    session_fields = {}
     if args.session.is_file() and not args.session.is_symlink():
         try:
-            previous = urlsplit(json.loads(args.session.read_text(encoding='utf-8'))['url'])
+            session_fields = worker_document(args.session)
+            previous = urlsplit(session_fields['url'])
             candidate = previous.path.strip('/')
-            if previous.netloc == f'{args.bind}:{args.port}' and re.fullmatch('[A-Za-z0-9_-]{32}', candidate):
+            if (previous.scheme == 'http' and not previous.username and not previous.password and
+                not previous.query and not previous.fragment and previous.port == args.port and
+                lan_address(previous.hostname) and re.fullmatch('[A-Za-z0-9_-]{32}', candidate)):
                 token = candidate
-        except (ValueError, KeyError, OSError): pass
-    queue = Queue(args.data, args.ffmpeg)
-    server = ThreadingHTTPServer((args.bind, args.port), handler_for(queue, args.bind, args.port, token))
-    url = f'http://{args.bind}:{args.port}/{token}/'
-    args.session.parent.mkdir(parents=True, exist_ok=True)
-    args.session.write_text(json.dumps({'url':url}), encoding='utf-8')
-    print(url, flush=True)
-    timer = threading.Timer(6*3600, server.shutdown)
-    timer.daemon = True
-    timer.start()
-    try: server.serve_forever()
+        except (ValueError, KeyError, TypeError, OSError): pass
+    queue = Queue(args.data, args.ffmpeg, start=False)
+    server = timer = None
+    try:
+        server = ThreadingHTTPServer((args.bind, args.port), handler_for(queue, args.bind, args.port, token))
+        url = f'http://{args.bind}:{args.port}/{token}/'
+        args.session.parent.mkdir(parents=True, exist_ok=True)
+        atomic_document(args.session, dict(session_fields, url=url))
+        print(url, flush=True)
+        from companion_discovery import advertise
+        with advertise(args.bind, args.port, token):
+            queue.resume_pending()
+            timer = threading.Timer(args.lifetime_seconds, server.shutdown) if args.lifetime_seconds else None
+            if timer:
+                timer.daemon = True
+                timer.start()
+            server.serve_forever()
     finally:
-        timer.cancel()
-        server.server_close()
-        queue.pool.shutdown(wait=True)
+        if timer: timer.cancel()
+        if server: server.server_close()
+        queue.pool.shutdown(wait=True, cancel_futures=True)
 
 
 if __name__ == '__main__': main()

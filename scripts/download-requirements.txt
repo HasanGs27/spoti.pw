@@ -6,3 +6,4 @@ requests==2.34.2
 beautifulsoup4==4.15.0
 mutagen==1.48.1
 Pillow==12.3.0
+zeroconf==0.151.3

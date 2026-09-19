@@ -117,8 +117,8 @@ def acceptable(result, song):
 
 
 class WorkerFailure(Exception):
-    def __init__(self, code, message):
-        self.code = code
+    def __init__(self, code, message, detail=None):
+        self.code, self.detail = code, detail
         super().__init__(message)
 
 
@@ -209,7 +209,27 @@ def source_url(value):
     return None
 
 
-def choose_sources(provider, song, candidates, budget=None):
+def avoided_sources():
+    raw = os.environ.get("SG_AVOID_SOURCES")
+    if raw is None: return frozenset()
+    try:
+        if len(raw) > 8192: raise ValueError("Oversized exclusions")
+        values = json.loads(raw)
+        if not isinstance(values, list) or len(values) > 8: raise ValueError("Invalid exclusions")
+        normalized = []
+        for value in values:
+            if not isinstance(value, str) or len(value) > 1000: raise ValueError("Invalid source")
+            url = source_url(value)
+            if not url: raise ValueError("Invalid source")
+            normalized.append(url)
+        return frozenset(normalized)
+    except (ValueError, TypeError):
+        raise WorkerFailure("error", "La demande d’autre version est invalide. Relance-la depuis l’application.",
+                            "invalid_avoid_sources") from None
+
+
+def choose_sources(provider, song, candidates, budget=None, excluded=None):
+    excluded = avoided_sources() if excluded is None else excluded
     # Installed SpotDL's provider controls: no videos and no three-attempt repetition.
     provider.SEARCH_ATTEMPTS = 1
     _, _, title = title_identity(song.name, song.artists)
@@ -220,10 +240,14 @@ def choose_sources(provider, song, candidates, budget=None):
         rows = provider.get_results(query, filter="songs", ignore_spelling=True, limit=20)
         matches = []
         for row in rows:
-            accepted = acceptable(row, song) and source_url(row.url) is not None
+            url = source_url(row.url)
+            avoided = url in excluded
+            accepted = acceptable(row, song) and url is not None and not avoided
             duration = row.duration if isinstance(row.duration, (int, float)) and math.isfinite(row.duration) else None
-            candidates.append({"title": row.name, "artists": row.artists, "duration": duration,
-                               "url": source_url(row.url), "accepted": accepted})
+            candidate = {"title": row.name, "artists": row.artists, "duration": duration,
+                         "url": url, "accepted": accepted}
+            if avoided: candidate["excluded"] = True
+            candidates.append(candidate)
             if accepted:
                 matches.append(row)
         for match in sorted(matches, key=lambda row: abs(row.duration - song.duration)):
@@ -233,6 +257,9 @@ def choose_sources(provider, song, candidates, budget=None):
             yield url
             if len(seen) >= 3: return
     if not yielded:
+        if excluded:
+            raise WorkerFailure("no_match", "Aucune autre version avec le bon titre, les bons artistes et la bonne durée n’a été trouvée.",
+                                "no_alternative")
         raise WorkerFailure("no_match", "Aucune version avec le bon titre, les bons artistes et la bonne durée. Ajoute un fichier audio pour ce titre.")
 
 
@@ -518,13 +545,16 @@ def prepared_marker(folder):
     return marker if marker.get("extension") in ("mp3", "m4a") else {}
 
 
-def reusable_audio(folder, song):
+def reusable_audio(folder, song, excluded=None):
+    excluded = avoided_sources() if excluded is None else excluded
     try:
         marker = prepared_marker(folder)
+        source = source_url(marker.get("source"))
+        if source in excluded: return None
         file = folder / ("audio." + marker.get("extension", "mp3"))
         if (marker.get("spotify") == song.url and not file.is_symlink()
                 and 1024 <= file.stat().st_size <= 100 * 1024 * 1024
-                and source_url(marker.get("source")) and marker.get("sha256") == file_digest(file)):
+                and source and marker.get("sha256") == file_digest(file)):
             verify_audio(file, song.duration)
             return source_url(marker["source"])
     except (OSError, ValueError, TypeError, WorkerFailure):
@@ -664,10 +694,10 @@ def install_source(raw, record, folder, song, ffmpeg, budget):
         temporary.unlink(missing_ok=True)
 
 
-def prepare_sources(provider, song, folder, ffmpeg, budget, candidates, progress):
+def prepare_sources(provider, song, folder, ffmpeg, budget, candidates, progress, excluded=None):
     failures = []
     try:
-        for selected in choose_sources(provider, song, candidates, budget):
+        for selected in choose_sources(provider, song, candidates, budget, excluded):
             progress.set("download")
             raw = None
             try:
@@ -707,6 +737,8 @@ def create_provider(budget):
 
 
 def prepare(args, folder, progress):
+    excluded = avoided_sources()  # Validate before metadata requests or touching prepared audio.
+    label = alternative_label()
     budget = Budget()
     profile = folder / "profile"
     profile.mkdir(exist_ok=True)
@@ -733,15 +765,20 @@ def prepare(args, folder, progress):
         publisher="", url=url, isrc="", cover_url=cover, copyright_text=None, album_id="")
     candidates, session = [], None
     try:
-        selected = reusable_audio(folder, song)
+        selected = reusable_audio(folder, song, excluded)
         if selected is None:
             provider, session = create_provider(budget)
             progress.set("search")
-            selected, file, source_info = prepare_sources(provider, song, folder, args.ffmpeg, budget, candidates, progress)
+            selected, file, source_info = prepare_sources(provider, song, folder, args.ffmpeg, budget, candidates, progress, excluded)
             remember_audio(folder, song, selected, file.suffix[1:], source_info)
         else:
             source_info = prepared_marker(folder)
             file = folder / ("audio." + source_info["extension"])
+        # Spotify's local URI includes album, but not file hash/source. Distinguish
+        # a deliberately chosen alternative without changing matching metadata,
+        # title, artist or audio samples, or deleting the previous local version.
+        if label:
+            song.album_name = (song.album_name + " · " if song.album_name else "") + label
         progress.set("cover")
         budget.remaining()
         finish_audio(file, song, selected, lambda url: fetch_cover(url, budget=budget))
@@ -761,6 +798,13 @@ def prepare(args, folder, progress):
         if session is not None: session.close()
 
 
+def alternative_label():
+    label = os.environ.get("SG_VARIANT_LABEL", "")
+    if label and (not re.fullmatch(r"Version [1-9][0-9]{0,5}", label) or int(label.split()[-1]) < 2):
+        raise ValueError("Identifiant de version alternative invalide.")
+    return label
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("url")
@@ -775,7 +819,9 @@ def main():
         prepare(args, folder, progress)
     except Exception as error:
         failure = failure_for(error, progress.phase)
-        atomic_json(folder / "failure.json", {"code": failure.code, "message": str(failure)[:400]})
+        detail = {"code":failure.code, "message":str(failure)[:400]}
+        if failure.detail: detail["detail"] = failure.detail
+        atomic_json(folder / "failure.json", detail)
         print(str(failure))
         raise SystemExit(1) from None
 
