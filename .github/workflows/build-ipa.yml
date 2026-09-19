@@ -101,6 +101,14 @@ jobs:
             tweak/Sources/Features/NowPlaying/LocalDownloadManifest.m -o "$RUNNER_TEMP/manual-audio-test"
           "$RUNNER_TEMP/manual-audio-test"
 
+      - name: Test resumable PC audio transfer
+        run: |
+          clang -fobjc-arc -fblocks -Wall -Werror -fsyntax-only \
+            tweak/Sources/Features/NowPlaying/AutomaticDownloadTransfer.m
+          clang -fobjc-arc -fblocks -Wall -Werror -framework Foundation -DSG_AUTOMATIC_TRANSFER_TEST=1 \
+            tweak/Sources/Features/NowPlaying/AutomaticDownloadTransfer.m -o "$RUNNER_TEMP/automatic-transfer-test"
+          "$RUNNER_TEMP/automatic-transfer-test"
+
       - name: Download IPA
         run: |
           mkdir -p ipa
