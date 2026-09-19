@@ -878,13 +878,16 @@ class QueueTests(unittest.TestCase):
         arguments=['automatic_downloads.py','--bind','192.168.1.20','--port','8768','--data',self.folder.name,
                    '--ffmpeg','unused','--session',str(session),'--lifetime-seconds','0']
         with patch('sys.argv',arguments), patch('automatic_downloads.Queue') as queue_factory, \
+             patch('download_variants.VariantQueue') as variants_factory, \
              patch('automatic_downloads.ThreadingHTTPServer',side_effect=OSError('Port occupied')):
             with self.assertRaises(OSError): main()
             queue_factory.assert_called_once_with(Path(self.folder.name),'unused',start=False)
             queue_factory.return_value.resume_pending.assert_not_called()
             queue_factory.return_value.pool.shutdown.assert_called_once_with(wait=True,cancel_futures=True)
+            variants_factory.return_value.shutdown.assert_called_once_with(wait=True)
         self.assertEqual(json.loads(session.read_text()),original)
         with patch('sys.argv',arguments), patch('automatic_downloads.Queue') as queue_factory, \
+             patch('download_variants.VariantQueue'), \
              patch('automatic_downloads.ThreadingHTTPServer') as server_factory, \
              patch('companion_discovery.advertise',return_value=nullcontext()), redirect_stdout(io.StringIO()):
             main()

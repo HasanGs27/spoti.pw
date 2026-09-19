@@ -15,8 +15,7 @@ class QuietLogger:
 
 def fetch(url, folder, seconds):
     from download_worker import atomic_json, downloader_arguments, source_url
-    from spotdl.utils.formatter import args_to_ytdlp_options
-    from yt_dlp import YoutubeDL
+    from yt_dlp import YoutubeDL, parse_options
     import shlex
     if source_url(url) != url:
         raise ValueError("Unsupported source identity")
@@ -26,7 +25,9 @@ def fetch(url, folder, seconds):
         if time.monotonic() >= deadline:
             raise TimeoutError("Audio deadline exceeded")
 
-    options = args_to_ytdlp_options(shlex.split(downloader_arguments()), {})
+    # SpotDL's empty-defaults wrapper returns these exact options, but importing
+    # it also initializes its full downloader/CLI in every isolated source process.
+    options = parse_options(shlex.split(downloader_arguments())).ydl_opts
     options.update(format="bestaudio/best", outtmpl=str(folder / "source.%(ext)s"),
                    quiet=True, no_warnings=True, logger=QuietLogger(), noplaylist=True,
                    cookiefile=None, cookiesfrombrowser=None, usenetrc=False,

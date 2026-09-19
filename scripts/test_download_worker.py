@@ -544,7 +544,7 @@ class AudioIntegrationTests(unittest.TestCase):
             def prepare_filename(self, info): return str(raw)
         from spotdl.utils.formatter import args_to_ytdlp_options
         parsed = args_to_ytdlp_options(["--ignore-config", "--retries", "1"], {})
-        with patch("yt_dlp.YoutubeDL", Client), patch("spotdl.utils.formatter.args_to_ytdlp_options", return_value=parsed):
+        with patch("yt_dlp.YoutubeDL", Client), patch("yt_dlp.parse_options", return_value=SimpleNamespace(ydl_opts=parsed)):
             download_source.fetch(SOURCE, folder.resolve(), 20)
         self.assertEqual(options[0]["format"], "bestaudio/best")
         self.assertIsNone(options[0]["cookiesfrombrowser"])

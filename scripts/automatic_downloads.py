@@ -792,7 +792,7 @@ class Queue:
             with self.lock: self.running_jobs.discard(ident)
 
 
-def handler_for(queue, host, port, token):
+def handler_for(queue, host, port, token, variants=None):
     base, origin = '/' + token, f'http://{host}:{port}'
     nonce = secrets.token_urlsafe(18)
     page = r'''<!doctype html>
@@ -941,7 +941,7 @@ p{margin:8px 0;color:#b6c2ba}.connection{display:inline-flex;gap:8px;align-items
         def do_POST(self):
             path = urlsplit(self.path)
             if (self.headers.get('Host') != f'{host}:{port}' or path.query or path.fragment or
-                path.path not in (base+'/jobs', base+'/accept-version', base+'/storage/cleanup') or self.headers.get('Origin') not in (None, origin) or
+                path.path not in (base+'/jobs', base+'/accept-version', base+'/storage/cleanup', base+'/audio-variants') or self.headers.get('Origin') not in (None, origin) or
                 self.headers.get('Content-Type', '').split(';')[0] != 'application/json'):
                 return self.reply(403, {'error':'Requête refusée.'})
             try:
@@ -951,6 +951,11 @@ p{margin:8px 0;color:#b6c2ba}.connection{display:inline-flex;gap:8px;align-items
                 payload = self.rfile.read(size)
                 if len(payload) != size: raise ValueError('Requête incomplète.')
                 request = json.loads(payload)
+                if path.path == base+'/audio-variants':
+                    if variants is None: return self.reply(503, {'error':'Les versions audio ne sont pas disponibles sur ce compagnon.'})
+                    from download_variants import VariantRequestError
+                    try: return self.reply(202, variants.submit(request))
+                    except VariantRequestError as error: return self.reply(400, {'error':str(error)[:300]})
                 if path.path == base+'/accept-version': return self.reply(200, queue.accept_version(request))
                 if path.path == base+'/storage/cleanup': return self.reply(200, queue.cleanup_storage(request))
                 return self.reply(202, queue.submit(request))
@@ -969,7 +974,14 @@ p{margin:8px 0;color:#b6c2ba}.connection{display:inline-flex;gap:8px;align-items
             if path in (base, base + '/'):
                 return self.reply(200, page, 'text/html; charset=utf-8')
             if path == base + '/hello': return self.reply(200, {'version':2,'service':'spoti-auto-downloads'})
-            if path == base + '/capabilities': return self.reply(200, CAPABILITIES)
+            if path == base + '/capabilities': return self.reply(200, dict(CAPABILITIES, audioVariants=variants is not None))
+            if path == base + '/audio-variants':
+                return self.reply(200, variants.listing()) if variants is not None else self.reply(404, {})
+            variant_id = path.removeprefix(base + '/audio-variants/')
+            if re.fullmatch('[a-f0-9]{32}', variant_id):
+                if variants is None: return self.reply(404, {})
+                try: return self.reply(200, variants.get(variant_id))
+                except KeyError: return self.reply(404, {})
             if path == base + '/storage': return self.reply(200, queue.storage_status())
             if path == base + '/status': return self.reply(200, status_summary())
             ident = path.removeprefix(base + '/jobs/')
@@ -1059,9 +1071,11 @@ def main():
                 token = candidate
         except (ValueError, KeyError, TypeError, OSError): pass
     queue = Queue(args.data, args.ffmpeg, start=False)
-    server = timer = None
+    server = timer = variants = None
     try:
-        server = ThreadingHTTPServer((args.bind, args.port), handler_for(queue, args.bind, args.port, token))
+        from download_variants import VariantQueue
+        variants = VariantQueue(queue, args.ffmpeg)
+        server = ThreadingHTTPServer((args.bind, args.port), handler_for(queue, args.bind, args.port, token, variants))
         url = f'http://{args.bind}:{args.port}/{token}/'
         args.session.parent.mkdir(parents=True, exist_ok=True)
         atomic_document(args.session, dict(session_fields, url=url))
@@ -1077,6 +1091,7 @@ def main():
     finally:
         if timer: timer.cancel()
         if server: server.server_close()
+        if variants: variants.shutdown(wait=True)
         queue.pool.shutdown(wait=True, cancel_futures=True)
 
 
