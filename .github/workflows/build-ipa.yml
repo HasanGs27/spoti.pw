@@ -83,7 +83,7 @@ jobs:
       - name: Test native audio resolver
         run: bash scripts/test-native-audio.sh
 
-      - name: Test local audio deduplication and restore
+      - name: Test local audio reuse and selected file deletion
         run: |
           clang -fobjc-arc -fblocks -framework Foundation -framework AVFoundation -framework CoreMedia -framework AudioToolbox -framework ImageIO -framework CoreGraphics -DSG_AUTOMATIC_LIBRARY_TEST=1 \
             tweak/Sources/Features/NowPlaying/AutomaticAudioLibrary.m \
