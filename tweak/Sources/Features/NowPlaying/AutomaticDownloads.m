@@ -2,6 +2,7 @@
 #import "AutomaticDownloads.h"
 #import "AutomaticDownloadModel.h"
 #import "AutomaticAudioFile.h"
+#import "AutomaticAudioLibrary.h"
 #import "NativeDownloadCollection.h"
 #import "NativeAudioResolver.h"
 #import "LocalDownloadManifest.h"
@@ -59,12 +60,13 @@ static NSURL *downloadsDirectory(void) {
 }
 static NSURL *rowFile(NSDictionary *row) {
     if (![row[@"state"] isEqual:@"ready"]) return nil;
-    return [downloadsDirectory() URLByAppendingPathComponent:[row[@"id"] stringByAppendingPathExtension:row[@"extension"] ?: @"mp3"]];
+    return SGAutomaticLibraryFile(row);
 }
 static BOOL onPhone(NSDictionary *row) {
     NSURL *file = rowFile(row);
     if (!file || !row[@"id"]) return NO;
-    NSDictionary *stamp = [verifiedFiles() objectForKey:row[@"id"]];
+    NSString *key = [row[@"id"] stringByAppendingPathExtension:row[@"extension"] ?: @"mp3"];
+    NSDictionary *stamp = [verifiedFiles() objectForKey:key];
     if (!stamp) return NO;
     NSDictionary *attrs = [NSFileManager.defaultManager attributesOfItemAtPath:file.path error:nil];
     return [attrs[NSFileType] isEqual:NSFileTypeRegular] && [attrs[NSFileSize] isEqual:row[@"bytes"]] &&
@@ -74,7 +76,7 @@ static void markVerified(NSDictionary *row) {
     NSURL *file = rowFile(row);
     NSDictionary *attrs = file ? [NSFileManager.defaultManager attributesOfItemAtPath:file.path error:nil] : nil;
     if (row[@"id"] && [attrs[NSFileType] isEqual:NSFileTypeRegular] && [attrs[NSFileSize] isEqual:row[@"bytes"]])
-        [verifiedFiles() setObject:attrs forKey:row[@"id"]];
+        [verifiedFiles() setObject:attrs forKey:[row[@"id"] stringByAppendingPathExtension:row[@"extension"] ?: @"mp3"]];
     [statusCounts() removeAllObjects];
 }
 static BOOL verifyRow(NSDictionary *row) {
@@ -130,6 +132,8 @@ static void tell(NSString *message) {
 - (void)resume;
 - (void)pause;
 - (void)clearUnfinished;
+- (void)organizeDuplicates:(BOOL)restore;
+- (void)refreshLibraryAssociations;
 - (void)removeQueued:(NSString *)url;
 - (void)play:(NSUInteger)position;
 - (void)submitPending;
@@ -199,6 +203,7 @@ static void tell(NSString *message) {
         audioConfig.allowsCellularAccess = YES;
         engine.audioSession = [NSURLSession sessionWithConfiguration:audioConfig delegate:engine delegateQueue:nil];
         dispatch_async(engine.worker, ^{
+            [engine refreshLibraryAssociations];
             // Hashes are checked off the UI thread after launch; an old green state is not trusted.
             NSMutableDictionary *candidates = [engine.localRows mutableCopy];
             for (NSDictionary *job in engine.history.allValues)
@@ -262,6 +267,7 @@ static void tell(NSString *message) {
     NSMutableDictionary *record = [row mutableCopy]; record[@"position"] = @1;
     NSMutableDictionary *local = [self.localRows mutableCopy] ?: [NSMutableDictionary dictionary];
     local[SGAutomaticSpotifyURL(row[@"spotify"])] = record; self.localRows = local;
+    self.verificationRevision += 1;
     [NSUserDefaults.standardUserDefaults setObject:local forKey:@"spotifyglass.automaticDownloads.localRows"];
     NSMutableDictionary *errors = [self.importErrors mutableCopy]; [errors removeObjectForKey:row[@"spotify"]];
     self.importErrors = errors; [NSUserDefaults.standardUserDefaults setObject:errors forKey:@"spotifyglass.automaticDownloads.errors"];
@@ -591,7 +597,12 @@ static void tell(NSString *message) {
         [self follow:job root:root generation:generation];
     });
 }
-- (BOOL)importRow:(NSDictionary *)row root:(NSURL *)root generation:(NSUInteger)generation {
+- (NSDictionary *)importRow:(NSDictionary *)row root:(NSURL *)root generation:(NSUInteger)generation {
+    if (verifyRow(row)) return row;
+    BOOL (^cancelled)(void) = ^BOOL { return generation != self.generation; };
+    NSDictionary *existing = SGAutomaticLibraryReuse(nil, row, cancelled);
+    if (existing) { markVerified(existing); return existing; }
+    if (cancelled()) return nil;
     NSFileManager *fm = NSFileManager.defaultManager;
     NSURL *directory = downloadsDirectory();
     [fm createDirectoryAtURL:directory withIntermediateDirectories:NO attributes:nil error:nil];
@@ -599,14 +610,15 @@ static void tell(NSString *message) {
     [directory getResourceValue:&dir forKey:NSURLIsDirectoryKey error:nil];
     [directory getResourceValue:&link forKey:NSURLIsSymbolicLinkKey error:nil];
     if (!dir.boolValue || link.boolValue || ![[directory URLByResolvingSymlinksInPath].URLByDeletingLastPathComponent.path
-        isEqual:[directory.URLByDeletingLastPathComponent URLByResolvingSymlinksInPath].path]) return NO;
-    NSURL *target = rowFile(row);
-    if (verifyRow(row)) return YES;
+        isEqual:[directory.URLByDeletingLastPathComponent URLByResolvingSymlinksInPath].path]) return nil;
+    // New writes always use our own canonical destination, never an old mapping
+    // to a manually imported file which the user may since have replaced.
+    NSURL *target = [directory URLByAppendingPathComponent:[row[@"id"] stringByAppendingPathExtension:row[@"extension"] ?: @"mp3"]];
     NSURL *url = [[root URLByAppendingPathComponent:@"file"] URLByAppendingPathComponent:row[@"id"]];
     self.preparingAudio = YES; self.transferProgress = 0;
     NSURL *file = [self fetch:[NSURLRequest requestWithURL:url] limit:[row[@"bytes"] unsignedIntegerValue] generation:generation];
     self.preparingAudio = NO; self.transferProgress = 0;
-    if (!file) return NO;
+    if (!file) return nil;
     NSNumber *bytes = nil; [file getResourceValue:&bytes forKey:NSURLFileSizeKey error:nil];
     BOOL valid = [bytes isEqual:row[@"bytes"]] && [fileHash(file) isEqual:row[@"id"]];
 #pragma clang diagnostic push
@@ -617,11 +629,19 @@ static void tell(NSString *message) {
         valid = asset.playable && [asset tracksWithMediaType:AVMediaTypeAudio].count && isfinite(duration) && fabs(duration - [row[@"seconds"] doubleValue]) < 2;
     }
 #pragma clang diagnostic pop
+    if (valid && !cancelled()) {
+        existing = SGAutomaticLibraryReuse(file, row, cancelled);
+        if (existing) {
+            markVerified(existing);
+            [fm removeItemAtURL:file error:nil];
+            return existing;
+        }
+    }
     BOOL imported = valid && generation == self.generation && [fm moveItemAtURL:file toURL:target error:nil];
     if (imported) [fm setAttributes:@{NSFileProtectionKey:NSFileProtectionCompleteUntilFirstUserAuthentication} ofItemAtPath:target.path error:nil];
-    if (imported) markVerified(row);
+    if (imported) { SGAutomaticLibraryRegister(row, target); markVerified(row); }
     [fm removeItemAtURL:file error:nil];
-    return imported;
+    return imported ? row : nil;
 }
 - (void)follow:(NSDictionary *)initial root:(NSURL *)root generation:(NSUInteger)generation {
     NSDictionary *job = initial;
@@ -631,10 +651,12 @@ static void tell(NSString *message) {
         [self saveJob:job];
         for (NSDictionary *row in job[@"items"]) {
             if (generation != self.generation) return;
-            if (![row[@"state"] isEqual:@"ready"] || [checked containsObject:row[@"id"]]) continue;
+            NSString *attempt = [NSString stringWithFormat:@"%@|%@", row[@"spotify"], row[@"id"]];
+            if (![row[@"state"] isEqual:@"ready"] || [checked containsObject:attempt]) continue;
             self.activeSpotify = row[@"spotify"];
             [self update:[@"Enregistrement sur l’iPhone : " stringByAppendingString:row[@"title"]]];
-            if (![self importRow:row root:root generation:generation]) {
+            NSDictionary *installed = [self importRow:row root:root generation:generation];
+            if (!installed) {
                 if (generation == self.generation) {
                     NSMutableDictionary *errors = [self.importErrors mutableCopy] ?: [NSMutableDictionary dictionary];
                     errors[row[@"spotify"]] = @"Transfert échoué · toucher pour réessayer ou ajouter un fichier";
@@ -642,12 +664,14 @@ static void tell(NSString *message) {
                     [NSUserDefaults.standardUserDefaults setObject:errors forKey:@"spotifyglass.automaticDownloads.errors"];
                 }
                 if (generation != self.generation) return;
-                [checked addObject:row[@"id"]]; self.activeSpotify = nil; continue;
+                [checked addObject:attempt]; self.activeSpotify = nil; continue;
             }
-            [checked addObject:row[@"id"]];
-            [self remember:row];
+            [checked addObject:attempt];
+            [self remember:installed];
             self.activeSpotify = nil;
         }
+        job = [self merged:job];
+        [self saveJob:job];
         NSUInteger local = 0, failures = 0;
         for (NSDictionary *row in job[@"items"]) {
             BOOL exists = onPhone(row); local += exists;
@@ -789,6 +813,60 @@ static void tell(NSString *message) {
         if (last) [prefs setObject:last forKey:@"spotifyglass.automaticDownloads.last"];
         else [prefs removeObjectForKey:@"spotifyglass.automaticDownloads.last"];
         [self finish:@"Attentes et échecs retirés. Tes morceaux téléchargés sont conservés." generation:generation];
+    });
+}
+- (void)refreshLibraryAssociations {
+    // The library journal survives a quit between moving a duplicate and saving
+    // the queue. Reconcile only against the replacement's verified real file.
+    NSDictionary *replacements = SGAutomaticLibraryReplacements();
+    if (!replacements.count) return;
+    [verifiedFiles() removeAllObjects]; [statusCounts() removeAllObjects];
+    NSDictionary *(^remap)(NSDictionary *) = ^NSDictionary *(NSDictionary *row) {
+        if (![row[@"state"] isEqual:@"ready"]) return row;
+        NSString *key = [row[@"id"] stringByAppendingPathExtension:row[@"extension"] ?: @"mp3"];
+        NSDictionary *replacement = replacements[key];
+        if (!replacement) return row;
+        NSMutableDictionary *candidate = [row mutableCopy];
+        for (NSString *field in @[@"id", @"bytes", @"seconds", @"title", @"artist", @"album", @"extension"])
+            if (replacement[field]) candidate[field] = replacement[field];
+        return verifyRow(candidate) ? candidate : row;
+    };
+    NSMutableDictionary *locals = [NSMutableDictionary dictionary];
+    for (NSString *identity in self.localRows) locals[identity] = remap(self.localRows[identity]);
+    NSMutableDictionary *history = [NSMutableDictionary dictionary];
+    for (NSString *url in self.history) {
+        NSMutableDictionary *job = [self.history[url] mutableCopy];
+        NSMutableArray *items = [NSMutableArray array];
+        for (NSDictionary *row in job[@"items"]) {
+            NSDictionary *copy = remap(row); [items addObject:copy];
+            if (!verifyRow(locals[copy[@"spotify"]]) && verifyRow(copy)) {
+                NSMutableDictionary *local = [copy mutableCopy]; local[@"position"] = @1;
+                locals[copy[@"spotify"]] = local;
+            }
+        }
+        job[@"items"] = items; history[url] = job;
+    }
+    self.localRows = locals; self.history = history;
+    if (self.job[@"url"]) self.job = history[self.job[@"url"]] ?: self.job;
+    NSUserDefaults *prefs = NSUserDefaults.standardUserDefaults;
+    [prefs setObject:locals forKey:@"spotifyglass.automaticDownloads.localRows"];
+    [prefs setObject:history forKey:@"spotifyglass.automaticDownloads.history"];
+    self.verificationRevision += 1;
+}
+- (void)organizeDuplicates:(BOOL)restore {
+    if (self.busy || self.clearing) { tell(@"Mets les téléchargements en pause avant de ranger les fichiers."); return; }
+    self.busy = YES; self.clearing = YES; self.userPaused = YES;
+    NSUInteger generation = ++self.generation;
+    [self update:restore ? @"Restauration des copies mises de côté…" : @"Vérification des doublons sur l'iPhone…"];
+    dispatch_async(self.worker, ^{
+        BOOL (^cancelled)(void) = ^BOOL { return generation != self.generation; };
+        void (^progress)(NSString *) = ^(NSString *message) { [self update:message]; };
+        NSDictionary *result = restore ? SGAutomaticLibraryRestore(cancelled, progress) : SGAutomaticLibraryClean(cancelled, progress);
+        [self refreshLibraryAssociations];
+        [verifiedFiles() removeAllObjects]; [statusCounts() removeAllObjects];
+        for (NSDictionary *row in self.localRows.allValues) verifyRow(row);
+        self.verificationRevision += 1;
+        [self finish:result[@"message"] ?: @"Vérification terminée. Rouvre Fichiers locaux pour actualiser la liste." generation:generation];
     });
 }
 - (void)play:(NSUInteger)position {
@@ -1076,6 +1154,17 @@ static void tell(NSString *message) {
     UIAlertAction *retry = [UIAlertAction actionWithTitle:@"Réessayer les titres manquants" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) { [engine resume]; }];
     retry.enabled = !engine.busy && self.displayJob != nil; [sheet addAction:retry];
     [sheet addAction:[UIAlertAction actionWithTitle:@"Nettoyer les téléchargements" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) { [engine clearUnfinished]; }]];
+    UIAlertAction *duplicates = [UIAlertAction actionWithTitle:@"Ranger les doublons" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        UIAlertController *explanation = [UIAlertController alertControllerWithTitle:@"Ranger les doublons"
+            message:@"Les copies avec le même contenu audio seront mises de côté. Une copie restera disponible. Les versions différentes seront conservées. Tu pourras annuler avec « Restaurer les doublons ». Garde Spotify ouvert pendant la vérification."
+            preferredStyle:UIAlertControllerStyleAlert];
+        [explanation addAction:[UIAlertAction actionWithTitle:@"Annuler" style:UIAlertActionStyleCancel handler:nil]];
+        [explanation addAction:[UIAlertAction actionWithTitle:@"Ranger" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) { [engine organizeDuplicates:NO]; }]];
+        [self presentViewController:explanation animated:YES completion:nil];
+    }];
+    duplicates.enabled = !engine.busy; [sheet addAction:duplicates];
+    UIAlertAction *restore = [UIAlertAction actionWithTitle:@"Restaurer les doublons" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) { [engine organizeDuplicates:YES]; }];
+    restore.enabled = !engine.busy; [sheet addAction:restore];
     [sheet addAction:[UIAlertAction actionWithTitle:@"Fermer" style:UIAlertActionStyleCancel handler:nil]];
     sheet.popoverPresentationController.sourceView = cell ?: self.view;
     sheet.popoverPresentationController.sourceRect = cell ? cell.bounds : self.view.bounds;

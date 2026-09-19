@@ -1,4 +1,5 @@
 #import "AutomaticAudioFile.h"
+#import "AutomaticAudioLibrary.h"
 #import "AutomaticDownloadModel.h"
 #import <AVFoundation/AVFoundation.h>
 #import <CommonCrypto/CommonDigest.h>
@@ -271,6 +272,12 @@ NSDictionary *SGAutomaticInstallAudioCancellable(NSURL *staging, NSDictionary *r
         NSMutableDictionary *validation = [wrapper mutableCopy]; validation[@"items"] = @[validationRow];
         if (![NSJSONSerialization isValidJSONObject:validation] || !SGAutomaticJob([NSJSONSerialization dataWithJSONObject:validation options:0 error:nil]))
             return failure(reason, @"Les informations de la source sont invalides.");
+        // Reuse audio already imported manually or by another playlist, including
+        // copies whose only difference is container metadata. The library requires
+        // identical compressed audio, never just a matching title.
+        NSDictionary *existing = SGAutomaticLibraryReuse(prepared, result, cancelled);
+        if (existing) return existing;
+        if (stopped(cancelled)) return failure(reason, @"Transfert arrêté.");
         NSURL *docs = [fm URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask].firstObject;
         NSURL *directory = [docs URLByAppendingPathComponent:@"Spoti Downloads" isDirectory:YES];
         [fm createDirectoryAtURL:directory withIntermediateDirectories:NO attributes:nil error:nil];
@@ -292,6 +299,7 @@ NSDictionary *SGAutomaticInstallAudioCancellable(NSURL *staging, NSDictionary *r
         }
         // Installation is the commit point: return its record even if cancellation races just afterwards.
         [fm setAttributes:@{NSFileProtectionKey:NSFileProtectionCompleteUntilFirstUserAuthentication} ofItemAtPath:target.path error:nil];
+        SGAutomaticLibraryRegister(result, target);
         return result;
     } @finally {
         [fm removeItemAtURL:probe error:nil]; [fm removeItemAtURL:retagged error:nil];
