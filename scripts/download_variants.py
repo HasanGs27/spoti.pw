@@ -29,13 +29,23 @@ def request_fields(request):
         raise VariantRequestError('Identifiant de demande invalide.')
     if not isinstance(digest, str) or not re.fullmatch('[a-f0-9]{64}', digest):
         raise VariantRequestError('Identifiant du fichier source invalide.')
-    try: spotify = canonical(request.get('spotify'))
-    except ValueError: raise VariantRequestError('Un lien de morceau Spotify valide est requis.') from None
-    if request.get('spotify') != spotify or '/track/' not in spotify:
-        raise VariantRequestError('Un lien de morceau Spotify canonique est requis.')
+    if ('spotify' in request) == ('source_local_id' in request):
+        raise VariantRequestError('Choisis un morceau Spotify ou un import personnel, pas les deux.')
+    identity = {}
+    if 'source_local_id' in request:
+        local_id = request['source_local_id']
+        if not isinstance(local_id, str) or not re.fullmatch('[a-f0-9]{32}', local_id):
+            raise VariantRequestError('Identifiant d’import personnel invalide.')
+        identity['source_local_id'] = local_id
+    else:
+        try: spotify = canonical(request.get('spotify'))
+        except ValueError: raise VariantRequestError('Un lien de morceau Spotify valide est requis.') from None
+        if request.get('spotify') != spotify or '/track/' not in spotify:
+            raise VariantRequestError('Un lien de morceau Spotify canonique est requis.')
+        identity['spotify'] = spotify
     kind = request.get('kind')
     if kind not in ('speed', 'instrumental'): raise VariantRequestError('Type de copie audio invalide.')
-    fields = {'request_id':key, 'source_id':digest, 'spotify':spotify, 'kind':kind}
+    fields = dict(identity, request_id=key, source_id=digest, kind=kind)
     if kind == 'speed':
         speed = request.get('speed')
         if type(speed) not in (float, int) or speed not in SPEEDS:
@@ -51,9 +61,12 @@ class VariantQueue:
     Public snapshots never contain filesystem paths. The existing queue lock also
     serializes source selection/register with its explicit storage cleanup.
     """
-    def __init__(self, queue, ffmpeg, worker=None, instrumental_worker=None):
+    def __init__(self, queue, ffmpeg, worker=None, instrumental_worker=None, local_imports=None):
         self.queue, self.ffmpeg = queue, ffmpeg
         self.root, self.lock = Path(queue.root), queue.lock
+        if local_imports is not None and (local_imports.queue is not queue or local_imports.lock is not self.lock):
+            raise ValueError('La file d’imports doit appartenir au même compagnon.')
+        self.local_imports = local_imports
         self.directory = self.root / '.audio-variants'
         safe_path(self.directory, self.root, exists=False)
         self.directory.mkdir(exist_ok=True)
@@ -72,7 +85,8 @@ class VariantQueue:
         return create_speed_variant(root, source, fields['speed'], ffmpeg)
 
     def capabilities(self):
-        return {'speeds':list(SPEEDS), 'instrumental':self._instrumental_ready()}
+        return {'speeds':list(SPEEDS), 'instrumental':self._instrumental_ready(),
+                'localSources':self.local_imports is not None}
 
     def _instrumental_ready(self):
         if self.instrumental_worker is not None: return True
@@ -133,6 +147,33 @@ class VariantQueue:
         if path.suffix not in ('.mp3', '.m4a'): raise ValueError('Format de copie invalide.')
         return path
 
+    @staticmethod
+    def _row_identity(row, fields, ident):
+        if not isinstance(row, dict) or row.get('state') != 'ready' or row.get('position') != 1:
+            return False
+        if 'spotify' in fields:
+            return row.get('spotify') == fields['spotify'] and 'source_local_id' not in row
+        return ('spotify' not in row and row.get('local_id') == ident and
+                row.get('source_local_id') == fields['source_local_id'] and row.get('source_id') == fields['source_id'] and
+                row.get('variant_kind') == fields['kind'] and
+                (row.get('variant_speed') == fields['speed'] if fields['kind'] == 'speed' else 'variant_speed' not in row))
+
+    @staticmethod
+    def _ready_row(checked, fields, ident, provenance=None):
+        if not 1 <= checked['seconds'] <= 2701: raise ValueError('Durée de copie invalide.')
+        if 'spotify' in fields:
+            return dict(checked, spotify=fields['spotify'], position=1, state='ready')
+        from local_import_media import source_url
+        url, kind = source_url(provenance['source_url'])
+        if (url != provenance['source_url'] or provenance.get('sourceKind') != kind or
+                provenance.get('sourceURL', url) != url): raise ValueError('Provenance de copie invalide.')
+        row = {key:value for key, value in checked.items() if key not in ('source', 'spotify')}
+        row.update(state='ready', position=1, local_id=ident, source_local_id=fields['source_local_id'],
+                   source_id=fields['source_id'], source_url=url, sourceURL=url, sourceKind=kind,
+                   variant_kind=fields['kind'])
+        if fields['kind'] == 'speed': row['variant_speed'] = fields['speed']
+        return row
+
     def _restore(self):
         from automatic_downloads import audio_record, worker_document
         with self.lock:
@@ -155,13 +196,12 @@ class VariantQueue:
                     elif job['state'] == 'ready':
                         try:
                             row = job['row']
-                            if (row.get('spotify') != fields['spotify'] or row.get('position') != 1 or
-                                    row.get('state') != 'ready'): raise ValueError('Copie incohérente.')
+                            if not self._row_identity(row, fields, path.stem): raise ValueError('Copie incohérente.')
                             output = self._output_path(job['_audio'])
                             checked = audio_record(output, row)
                             if (checked['id'] != row['id'] or checked['bytes'] != row['bytes'] or
                                     checked['id'] == fields['source_id']): raise ValueError('Copie modifiée.')
-                            clean.update(row=dict(checked, spotify=fields['spotify'], position=1, state='ready'),
+                            clean.update(row=self._ready_row(checked, fields, path.stem, row),
                                          _audio=job['_audio'], message='Copie prête à importer.')
                             self.queue.register(checked['id'], output, checked['extension'])
                         except (OSError, ValueError, KeyError, TypeError, AttributeError, MutagenError):
@@ -174,6 +214,19 @@ class VariantQueue:
 
     def _source(self, fields):
         from automatic_downloads import audio_record, file_stamp
+        if 'source_local_id' in fields:
+            # A registered SHA alone is insufficient: it must be the exact ready
+            # personal import requested, with its own verified private file.
+            local_id = fields['source_local_id']
+            job = self.local_imports.jobs.get(local_id) if self.local_imports is not None else None
+            row = job.get('row') if isinstance(job, dict) and job.get('state') == 'ready' else None
+            if (not isinstance(row, dict) or row.get('local_id') != local_id or 'spotify' in row or
+                    row.get('state') != 'ready' or row.get('id') != fields['source_id']):
+                raise ValueError('Cet import personnel doit être disponible sur le PC.')
+            source = self.local_imports._path(job['_audio'])
+            checked = self.local_imports._verified(source, row, job, local_id)
+            if not 1 <= checked['seconds'] <= 1800: raise ValueError('Choisis un morceau de 30 minutes maximum.')
+            return source, checked
         digest, spotify = fields['source_id'], fields['spotify']
         rows = (row for job in self.queue.jobs.values() for row in job.get('items', []))
         row = next((row for row in rows if row.get('state') == 'ready' and
@@ -213,7 +266,7 @@ class VariantQueue:
             recipe = self._recipe(fields)
             if recipe is not None:
                 job['_recipe'] = recipe
-                reusable = self._reuse(fields, recipe)
+                reusable = self._reuse(fields, recipe, job['id'])
                 if reusable is not None:
                     output, row = reusable
                     job.update(state='ready', row=row, _audio=output.relative_to(self.root).as_posix(),
@@ -228,21 +281,22 @@ class VariantQueue:
             self.pool.submit(self._run, job['id'])
             return self._public(job)
 
-    def _reuse(self, fields, recipe):
+    def _reuse(self, fields, recipe, ident):
         from automatic_downloads import audio_record
         for prior in sorted(self.jobs.values(), key=lambda value:value['created'], reverse=True):
             if (prior['state'] != 'ready' or prior.get('_recipe') != recipe or
-                    any(prior.get(key) != fields.get(key) for key in ('source_id', 'spotify', 'kind', 'speed'))): continue
+                    any(prior.get(key) != fields.get(key) for key in ('source_id', 'spotify', 'source_local_id', 'kind', 'speed'))): continue
             try:
                 output = self._output_path(prior['_audio'])
                 old = prior['row']
+                if not self._row_identity(old, fields, prior['id']): continue
                 checked = audio_record(output, old)
                 if checked['id'] != old['id'] or checked['bytes'] != old['bytes']: continue
-                return output, dict(checked, spotify=fields['spotify'], position=1, state='ready')
+                return output, self._ready_row(checked, fields, ident, old)
             except (OSError, ValueError, KeyError, TypeError, MutagenError): continue
         return None
 
-    def _result(self, result, fields, source, original):
+    def _result(self, result, fields, source, original, ident):
         from automatic_downloads import audio_record
         if (not isinstance(result, dict) or result.get('kind') != fields['kind'] or
                 result.get('source', {}).get('sha256') != fields['source_id']):
@@ -270,7 +324,7 @@ class VariantQueue:
         # Recheck the registered original after processing. No cache promotion follows.
         current, again = self._source(fields)
         if current != source or again['id'] != original['id']: raise ValueError('Le fichier original a changé.')
-        return output, dict(checked, spotify=fields['spotify'], position=1, state='ready')
+        return output, self._ready_row(checked, fields, ident, original)
 
     def _run(self, ident):
         try:
@@ -286,7 +340,7 @@ class VariantQueue:
             with self.lock:
                 if job.get('_recipe') is not None and job['_recipe'] != self._recipe(fields):
                     raise ValueError('La configuration de traitement a changé.')
-                output, row = self._result(result, fields, source, original)
+                output, row = self._result(result, fields, source, original, ident)
                 job.update(state='ready', row=row, _audio=output.relative_to(self.root).as_posix(),
                            message='Copie prête à importer.')
                 self._save(job)

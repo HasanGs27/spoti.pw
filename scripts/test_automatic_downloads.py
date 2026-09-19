@@ -883,6 +883,7 @@ class QueueTests(unittest.TestCase):
              patch('automatic_downloads.ThreadingHTTPServer',side_effect=OSError('Port occupied')):
             with self.assertRaises(OSError): main()
             queue_factory.assert_called_once_with(Path(self.folder.name),'unused',start=False)
+            variants_factory.assert_called_once_with(queue_factory.return_value,'unused',local_imports=local_factory.return_value)
             queue_factory.return_value.resume_pending.assert_not_called()
             queue_factory.return_value.pool.shutdown.assert_called_once_with(wait=True,cancel_futures=True)
             variants_factory.return_value.shutdown.assert_called_once_with(wait=True)

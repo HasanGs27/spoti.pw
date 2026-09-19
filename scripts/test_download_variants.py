@@ -25,6 +25,7 @@ from PIL import Image
 from automatic_downloads import Queue, audio_record, handler_for
 from download_storage import atomic_document
 from download_variants import VariantQueue, VariantRequestError, request_fields
+from local_imports import LocalImportQueue
 
 TRACK = 'https://open.spotify.com/track/3DaGnKmAAmyZGIbC0KjmxT'
 OTHER = 'https://open.spotify.com/track/7sL89oFc1AcgjG5Q6tCkID'
@@ -74,10 +75,11 @@ class VariantTests(unittest.TestCase):
         self.queue.jobs['a' * 32] = {'id':'a' * 32, 'items':[self.row], 'state':'complete'}
         self.queue.register(self.row['id'], self.source)
         self.queue.remember_audio(TRACK, self.source, self.record)
-        self.variants, self.calls = [], []
+        self.variants, self.calls, self.imports = [], [], []
 
     def tearDown(self):
         for variants in self.variants: variants.shutdown()
+        for imports in self.imports: imports.shutdown()
         self.queue.pool.shutdown(wait=True)
         self.temp.cleanup()
 
@@ -100,6 +102,22 @@ class VariantTests(unittest.TestCase):
         return dict({'request_id':'synthetic-request-01', 'spotify':TRACK, 'source_id':self.row['id'],
             'kind':'speed', 'speed':1.25}, **changes)
 
+    def personal_source(self):
+        def imported(folder, fields, cancelled, progress):
+            path = folder / 'audio.mp3'; shutil.copyfile(self.original, path)
+            record = audio_record(path, {'extension':'mp3'})
+            return path, dict(record, source_url=fields['source_url'])
+        imports = LocalImportQueue(self.queue, self.ffmpeg, worker=imported)
+        self.imports.append(imports)
+        job = imports.submit({'request_id':'synthetic-personal-source',
+            'source_url':'https://www.youtube.com/watch?v=abcdefghijk',
+            'title':'Synthetic track', 'artist':'Test artist', 'album':'Test album'})
+        imports.pool.submit(lambda:None).result(timeout=5)
+        job = imports.get(job['id']); self.assertEqual(job['state'], 'ready', job)
+        request = {'request_id':'synthetic-personal-speed', 'source_id':job['row']['id'],
+                   'source_local_id':job['id'], 'kind':'speed', 'speed':1.25}
+        return imports, job, request
+
     def settled(self, variants, request=None):
         job = variants.submit(request or self.request())
         deadline = time.monotonic() + 15
@@ -116,6 +134,132 @@ class VariantTests(unittest.TestCase):
             with self.subTest(change=change), self.assertRaises(ValueError): request_fields(self.request(**change))
         fields = request_fields(self.request(path='../../user.mp3'))
         self.assertNotIn('path', fields)
+
+    def test_personal_request_has_exactly_one_source_identity(self):
+        personal = self.request(); personal.pop('spotify'); personal['source_local_id'] = 'a' * 32
+        self.assertNotIn('spotify', request_fields(personal))
+        for value in ('', 'A' * 32, 'a' * 31, '../user', None, True):
+            with self.subTest(value=value), self.assertRaises(VariantRequestError):
+                request_fields(dict(personal, source_local_id=value))
+        with self.assertRaises(VariantRequestError): request_fields(dict(personal, spotify=TRACK))
+        with self.assertRaises(VariantRequestError): request_fields(dict(personal, spotify=None))
+        missing = dict(personal); missing.pop('source_local_id')
+        with self.assertRaises(VariantRequestError): request_fields(missing)
+
+    def test_personal_import_real_speed_copy_has_provenance_and_no_catalogue_mapping(self):
+        imports, original, request = self.personal_source()
+        variants = VariantQueue(self.queue, self.ffmpeg, local_imports=imports)
+        self.variants.append(variants)
+        source = imports._path(imports.jobs[original['id']]['_audio'])
+        before = source.read_bytes(); mappings = copy.deepcopy(self.queue.reusable)
+        job = self.settled(variants, request)
+        self.assertEqual(job['state'], 'ready', job)
+        self.assertTrue(variants.capabilities()['localSources'])
+        self.assertNotIn('spotify', job); self.assertNotIn('spotify', job['row'])
+        for key in ('source_id', 'source_local_id'):
+            self.assertEqual(job[key], request[key]); self.assertEqual(job['row'][key], request[key])
+        self.assertEqual(job['row']['local_id'], job['id'])
+        self.assertEqual(job['row']['variant_kind'], 'speed'); self.assertEqual(job['row']['variant_speed'], 1.25)
+        self.assertEqual(job['row']['source_url'], original['row']['source_url'])
+        self.assertEqual(job['row']['sourceURL'], original['row']['sourceURL'])
+        self.assertEqual(job['row']['sourceKind'], 'youtube')
+        self.assertLess(abs(job['row']['seconds'] - original['row']['seconds'] / 1.25), .12)
+        self.assertEqual(source.read_bytes(), before); self.assertEqual(self.queue.reusable, mappings)
+        self.assertFalse(self.queue.preferred)
+        self.assertEqual(list(self.queue.jobs), ['a' * 32])
+
+    def test_personal_source_requires_exact_ready_import_not_just_a_registered_hash(self):
+        imports, original, request = self.personal_source()
+        variants = self.variants_queue(local_imports=imports)
+        for changes in ({'source_local_id':'b' * 32}, {'source_id':'c' * 64}):
+            with self.assertRaises(VariantRequestError): variants.submit(dict(request, **changes))
+        with self.assertRaises(VariantRequestError): self.variants_queue().submit(request)
+        self.assertFalse(self.variants_queue().capabilities()['localSources'])
+        saved = imports.jobs[original['id']]
+        saved['state'] = 'error'
+        with self.assertRaises(VariantRequestError): variants.submit(request)
+        saved['state'] = 'ready'
+        path = imports._path(saved['_audio']); before = path.stat()
+        data = bytearray(path.read_bytes()); data[-50] ^= 1; path.write_bytes(data)
+        os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+        with self.assertRaises(VariantRequestError): variants.submit(request)
+        self.assertFalse(self.calls); self.assertFalse(variants.jobs)
+
+    def test_personal_copy_reuse_restart_and_corruption_preserve_identity(self):
+        imports, original, request = self.personal_source()
+        variants = self.variants_queue(local_imports=imports)
+        first = self.settled(variants, request)
+        self.assertEqual(first['state'], 'ready', first)
+        second_request = dict(request, request_id='personal-reuse-request')
+        second = self.settled(variants, second_request)
+        self.assertEqual(first['row']['id'], second['row']['id'])
+        self.assertNotEqual(first['id'], second['id'])
+        self.assertEqual(second['row']['local_id'], second['id']); self.assertEqual(len(self.calls), 1)
+        variants.shutdown()
+        restored = self.variants_queue(local_imports=imports)
+        self.assertEqual(restored.submit(second_request)['id'], second['id'])
+        self.assertEqual(restored.get(first['id'])['row'], first['row'])
+        self.assertEqual(len(self.calls), 1)
+        restored.shutdown()
+        output = self.queue.files[first['row']['id']][0]
+        data = bytearray(output.read_bytes()); data[-70] ^= 1; output.write_bytes(data)
+        damaged = self.variants_queue(local_imports=imports)
+        self.assertEqual(damaged.get(first['id'])['state'], 'error')
+        self.assertEqual(damaged.get(second['id'])['state'], 'error')
+        retry = self.settled(damaged, dict(request, request_id='personal-damage-retry'))
+        self.assertEqual(retry['state'], 'ready', retry); self.assertEqual(len(self.calls), 2)
+
+    def test_personal_instrumental_and_source_changed_during_processing(self):
+        imports, original, request = self.personal_source()
+        request.pop('speed'); request['kind'] = 'instrumental'
+        variants = self.variants_queue(local_imports=imports, instrumental_worker=self.worker)
+        job = self.settled(variants, request)
+        self.assertEqual(job['state'], 'ready', job)
+        self.assertEqual(job['row']['variant_kind'], 'instrumental'); self.assertNotIn('variant_speed', job['row'])
+        self.assertNotIn('spotify', job['row'])
+        # A derived row cannot impersonate an original personal-import job.
+        forged = dict(request, request_id='personal-derived-source', source_id=job['row']['id'], source_local_id=job['id'])
+        with self.assertRaises(VariantRequestError): variants.submit(forged)
+        def changed(root, source, fields, ffmpeg):
+            result = self.worker(root, source, fields, ffmpeg)
+            before = source.stat(); data = bytearray(source.read_bytes()); data[-50] ^= 1; source.write_bytes(data)
+            os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns))
+            return result
+        changing = self.variants_queue(local_imports=imports, instrumental_worker=changed)
+        failed = self.settled(changing, dict(request, request_id='personal-changed-during'))
+        self.assertEqual(failed['state'], 'error'); self.assertNotIn('row', failed)
+
+    def test_personal_saved_cross_identity_is_not_restored(self):
+        imports, _, request = self.personal_source()
+        variants = self.variants_queue(local_imports=imports)
+        job = self.settled(variants, request); variants.shutdown()
+        path = variants.job_directory / (job['id'] + '.json')
+        original = json.loads(path.read_text(encoding='utf-8'))
+        for changed in ({'spotify':TRACK}, {'source_local_id':'c' * 32}, {'source_id':'d' * 64},
+                        {'local_id':'e' * 32}, {'variant_kind':'instrumental'}, {'variant_speed':1.5},
+                        {'source_url':'https://127.0.0.1/private'}):
+            with self.subTest(changed=changed):
+                saved = copy.deepcopy(original); saved['row'].update(changed); atomic_document(path, saved)
+                restored = self.variants_queue(local_imports=imports)
+                self.assertEqual(restored.get(job['id'])['state'], 'error'); restored.shutdown()
+
+    def test_personal_http_creation_and_range_use_exact_import(self):
+        imports, original, request = self.personal_source()
+        variants = self.variants_queue(local_imports=imports)
+        with self.http_service(variants) as base:
+            with urlopen(base + '/audio-variants') as response:
+                self.assertTrue(json.load(response)['capabilities']['localSources'])
+            body = Request(base + '/audio-variants', data=json.dumps(request).encode(),
+                           headers={'Content-Type':'application/json'})
+            with urlopen(body) as response:
+                self.assertEqual(response.status, 202); submitted = json.load(response)
+            job = self.settled(variants, request)
+            with urlopen(base + '/audio-variants/' + submitted['id']) as response:
+                self.assertEqual(json.load(response)['row'], job['row'])
+            with urlopen(Request(base + '/file/' + job['row']['id'], headers={'Range':'bytes=32-127'})) as response:
+                self.assertEqual(response.status, 206)
+                self.assertEqual(response.read(), self.queue.files[job['row']['id']][0].read_bytes()[32:128])
+            self.assertEqual(imports.get(original['id'])['row'], original['row'])
 
     def test_ready_copy_is_verified_and_original_cache_is_unchanged(self):
         variants = self.variants_queue()

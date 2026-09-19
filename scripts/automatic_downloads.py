@@ -1089,8 +1089,8 @@ def main():
     try:
         from download_variants import VariantQueue
         from local_imports import LocalImportQueue
-        variants = VariantQueue(queue, args.ffmpeg)
         local_imports = LocalImportQueue(queue, args.ffmpeg)
+        variants = VariantQueue(queue, args.ffmpeg, local_imports=local_imports)
         server = ThreadingHTTPServer((args.bind, args.port), handler_for(queue, args.bind, args.port, token, variants, local_imports))
         url = f'http://{args.bind}:{args.port}/{token}/'
         args.session.parent.mkdir(parents=True, exist_ok=True)
