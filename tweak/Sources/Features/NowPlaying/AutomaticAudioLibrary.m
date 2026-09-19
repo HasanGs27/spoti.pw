@@ -169,9 +169,101 @@ static NSArray *identity(NSDictionary *info) {
     return @[strictLabel(info[@"title"]) ?: @"", strictLabel(info[@"artist"]) ?: @"", strictLabel(info[@"album"]) ?: @"",
              @((long long)floor([info[@"seconds"] doubleValue]))];
 }
+static NSString *packetFailure(const char *stage, OSStatus status) {
+#ifdef SG_AUTOMATIC_LIBRARY_TEST
+    fprintf(stderr, "Packet rejection: stage=%s status=%d\n", stage, (int)status);
+#endif
+    return nil;
+}
+static NSString *mp3PacketHash(NSMutableDictionary *info, BOOL (^cancelled)(void)) {
+    // AudioFile reads the original MPEG packets, including their boundaries, without
+    // decoding. AVAssetReader's compressed MP3 samples do not always provide timing.
+    // https://developer.apple.com/documentation/audiotoolbox/audiofilereadpacketdata(_:_:_:_:_:_:_:)
+    AudioFileID file = NULL;
+    OSStatus status = AudioFileOpenURL((__bridge CFURLRef)info[@"url"], kAudioFileReadPermission, 0, &file);
+    if (status || !file) return packetFailure("mp3-open", status);
+    @try {
+        AudioStreamBasicDescription format = {0}; UInt32 size = sizeof(format);
+        status = AudioFileGetProperty(file, kAudioFilePropertyDataFormat, &size, &format);
+        if (status || format.mFormatID != kAudioFormatMPEGLayer3 || !isfinite(format.mSampleRate) || format.mSampleRate <= 0 ||
+            !format.mChannelsPerFrame || !format.mFramesPerPacket) return packetFailure("mp3-format", status);
+        UInt64 count = 0; size = sizeof(count);
+        status = AudioFileGetProperty(file, kAudioFilePropertyAudioDataPacketCount, &size, &count);
+        if (status || !count || count > 4000000) return packetFailure("mp3-count", status);
+        UInt32 maximum = 0; size = sizeof(maximum);
+        status = AudioFileGetProperty(file, kAudioFilePropertyPacketSizeUpperBound, &size, &maximum);
+        if (status || !maximum || maximum > 1024 * 1024) return packetFailure("mp3-packet-size", status);
+        CC_SHA256_CTX state; CC_SHA256_Init(&state);
+        NSString *signature = [NSString stringWithFormat:@"MPEG-packets-v1/%u/%u/%.17g/%u/%u/%u/%u/%u/%llu",
+            (unsigned)format.mFormatID, (unsigned)format.mFormatFlags, format.mSampleRate, (unsigned)format.mChannelsPerFrame,
+            (unsigned)format.mFramesPerPacket, (unsigned)format.mBytesPerFrame, (unsigned)format.mBytesPerPacket,
+            (unsigned)format.mBitsPerChannel, (unsigned long long)count];
+        NSData *signatureData = [signature dataUsingEncoding:NSUTF8StringEncoding];
+        CC_SHA256_Update(&state, signatureData.bytes, (CC_LONG)signatureData.length);
+        // Preserve all decoder configuration and trim information when provided.
+        AudioFilePropertyID properties[] = {kAudioFilePropertyMagicCookieData, kAudioFilePropertyChannelLayout, kAudioFilePropertyPacketTableInfo};
+        for (NSUInteger i = 0; i < sizeof(properties) / sizeof(properties[0]); i++) {
+            UInt32 length = 0; status = AudioFileGetPropertyInfo(file, properties[i], &length, NULL);
+            if (status && status != kAudioFileUnsupportedPropertyError) return packetFailure("mp3-config-size", status);
+            if (status) length = 0;
+            if (length > 65536) return packetFailure("mp3-config-bound", 0);
+            uint32_t header[2] = {CFSwapInt32HostToBig(properties[i]), CFSwapInt32HostToBig(length)};
+            CC_SHA256_Update(&state, header, sizeof(header));
+            if (length) {
+                NSMutableData *configuration = [NSMutableData dataWithLength:length]; UInt32 actual = length;
+                status = AudioFileGetProperty(file, properties[i], &actual, configuration.mutableBytes);
+                if (status || actual != length) return packetFailure("mp3-config", status);
+                CC_SHA256_Update(&state, configuration.bytes, length);
+            }
+        }
+        UInt32 capacityPackets = MIN(128U, (1024U * 1024U) / maximum), capacityBytes = capacityPackets * maximum;
+        NSMutableData *buffer = [NSMutableData dataWithLength:capacityBytes]; AudioStreamPacketDescription descriptions[128];
+        UInt64 position = 0, frames = 0, total = 0;
+        double deadline = NSProcessInfo.processInfo.systemUptime + 45;
+        while (position < count) {
+            if (cancelledNow(cancelled) || NSProcessInfo.processInfo.systemUptime >= deadline) return packetFailure("mp3-interrupted", 0);
+            UInt32 packets = (UInt32)MIN((UInt64)capacityPackets, count - position), bytes = capacityBytes;
+            memset(descriptions, 0, sizeof(descriptions));
+            status = AudioFileReadPacketData(file, false, &bytes, descriptions, (SInt64)position, &packets, buffer.mutableBytes);
+            if ((status && status != kAudioFileEndOfFileError) || !packets || packets > capacityPackets || packets > count - position ||
+                !bytes || bytes > capacityBytes || total + bytes > libraryLimit) return packetFailure("mp3-read", status);
+            UInt64 used = 0;
+            for (UInt32 i = 0; i < packets; i++) {
+                AudioStreamPacketDescription packet = descriptions[i];
+                UInt32 packetFrames = packet.mVariableFramesInPacket ?: format.mFramesPerPacket;
+                if (packet.mStartOffset < 0 || (UInt64)packet.mStartOffset != used || !packet.mDataByteSize ||
+                    packet.mDataByteSize > bytes - used || !packetFrames) return packetFailure("mp3-packet-bounds", 0);
+                uint32_t header[2] = {CFSwapInt32HostToBig(packet.mDataByteSize), CFSwapInt32HostToBig(packetFrames)};
+                CC_SHA256_Update(&state, header, sizeof(header));
+                CC_SHA256_Update(&state, (const uint8_t *)buffer.bytes + packet.mStartOffset, packet.mDataByteSize);
+                used += packet.mDataByteSize; frames += packetFrames;
+            }
+            if (used != bytes) return packetFailure("mp3-unread-bytes", 0);
+            total += bytes; position += packets;
+        }
+        // Confirm the declared packet range is complete, not a partial parser result.
+        UInt32 extra = 1, bytes = capacityBytes;
+        status = AudioFileReadPacketData(file, false, &bytes, descriptions, (SInt64)position, &extra, buffer.mutableBytes);
+        double encodedSeconds = (double)frames / format.mSampleRate, expected = [info[@"seconds"] doubleValue];
+        if ((status && status != kAudioFileEndOfFileError) || extra || bytes || !total ||
+            !isfinite(encodedSeconds) || encodedSeconds < expected - .1 || encodedSeconds > expected + .15 ||
+            cancelledNow(cancelled) || NSProcessInfo.processInfo.systemUptime >= deadline || ![fileStamp(info[@"url"]) isEqual:info[@"stamp"]]) {
+#ifdef SG_AUTOMATIC_LIBRARY_TEST
+            fprintf(stderr, "MP3 completion: packets=%llu declared=%llu bytes=%llu extra=%u trailing=%u duration=%.6f expected=%.6f\n",
+                (unsigned long long)position, (unsigned long long)count, (unsigned long long)total, extra, bytes, encodedSeconds, expected);
+#endif
+            return packetFailure("mp3-incomplete", status);
+        }
+        unsigned char digest[CC_SHA256_DIGEST_LENGTH]; CC_SHA256_Final(digest, &state);
+        NSMutableString *hash = [NSMutableString string];
+        for (NSUInteger i = 0; i < sizeof(digest); i++) [hash appendFormat:@"%02x", digest[i]];
+        info[@"packets"] = hash; return hash;
+    } @finally { AudioFileClose(file); }
+}
 static NSString *packetHash(NSMutableDictionary *info, BOOL (^cancelled)(void)) {
-    if (![fileStamp(info[@"url"]) isEqual:info[@"stamp"]]) return nil;
+    if (cancelledNow(cancelled) || ![fileStamp(info[@"url"]) isEqual:info[@"stamp"]]) return nil;
     if (info[@"packets"]) return [info[@"packets"] isKindOfClass:NSString.class] ? info[@"packets"] : nil;
+    if ([info[@"extension"] isEqual:@"mp3"]) return mp3PacketHash(info, cancelled);
     // Cache only success: cancellation/timeouts must remain retryable.
     AVURLAsset *asset = [AVURLAsset URLAssetWithURL:info[@"url"] options:nil];
     AVAssetTrack *track = [asset tracksWithMediaType:AVMediaTypeAudio].firstObject;
@@ -627,6 +719,10 @@ int main(void) { @autoreleasepool {
     NSString *oldPackets = packetHash(audioInfo(old, @"mp3"), nil), *keeperPackets = packetHash(audioInfo(keeper, @"mp3"), nil);
     if (![oldPackets isEqual:keeperPackets]) fprintf(stderr, "Packet identity diagnostics: old=%d keeper=%d same=%d\n", oldPackets != nil, keeperPackets != nil, [oldPackets isEqual:keeperPackets]);
     assert([oldPackets isEqual:keeperPackets]);
+    NSMutableDictionary *retryPackets = audioInfo(old, @"mp3"); [retryPackets removeObjectForKey:@"packets"];
+    __block NSUInteger cancellationChecks = 0;
+    assert(!packetHash(retryPackets, ^BOOL{ return ++cancellationChecks >= 3; }));
+    assert(!retryPackets[@"packets"] && [packetHash(retryPackets, nil) isEqual:oldPackets]);
     reused = SGAutomaticLibraryReuse(staging, oldRow, nil);
     assert([reused[@"id"] isEqual:keeperRow[@"id"]] && [reused[@"bytes"] isEqual:keeperRow[@"bytes"]]);
     assert([SGAutomaticLibraryFile(reused).path isEqual:keeper.path]);
