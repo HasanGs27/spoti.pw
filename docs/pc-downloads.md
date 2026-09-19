@@ -36,9 +36,19 @@ Ces limites décrivent notre système. Elles ne garantissent pas qu'une source e
 - Les doublons et les copies déjà vérifiées sont réutilisés après contrôle de leur empreinte, y compris après un redémarrage du compagnon.
 - Les métadonnées des morceaux sont mises en cache pendant six heures, dans une limite de 512 entrées. Les playlists sont relues pour conserver leur contenu à jour.
 - La recherche contrôle le titre, les artistes, les crédits invités connus, la durée et la version. Un résultat accepté n'est plus soumis à un second rapprochement contradictoire.
-- Les pochettes sont vérifiées puis intégrées au MP3. La réparation d'une pochette peut réutiliser l'audio déjà préparé et vérifié, sans nouvelle conversion.
+- Si une source ne peut pas être téléchargée, jusqu'à trois candidats distincts issus de YouTube Music peuvent être essayés, avec les mêmes contrôles d'identité. Il s'agit d'autres correspondances sur le même service, pas de trois fournisseurs indépendants. Aucune version approchante n'est acceptée pour remplir la liste.
+- Le moteur choisit le meilleur flux audio disponible selon les informations de la source. Un flux AAC-LC compatible est conservé en M4A sans reconversion audio ; les autres flux sont convertis en MP3. La priorité reste le meilleur flux proposé, sans forcer une source AAC de qualité inférieure.
+- Les pochettes sont vérifiées, mises en cache et intégrées au fichier audio. La réparation d'une pochette peut réutiliser l'audio déjà préparé et vérifié, sans nouvelle conversion.
 
-Le MP3 utilise un débit adapté à la source disponible. Augmenter artificiellement ce débit ne restituerait pas les détails absents de la source. La disponibilité de tous les titres et la qualité du master original ne sont pas garanties. Une sélection issue d'une page Spotify publique peut être incomplète ; la liste fournie par l'application est utilisée lorsqu'elle est disponible.
+Le MP3 utilise un débit adapté à la source disponible. Augmenter artificiellement ce débit ne restituerait pas les détails absents de la source. Un M4A conservé évite une perte supplémentaire liée à la reconversion ; cela ne transforme pas la source en master sans perte. La disponibilité de tous les titres et la qualité du master original ne sont pas garanties. Une sélection issue d'une page Spotify publique peut être incomplète ; la liste fournie par l'application est utilisée lorsqu'elle est disponible.
+
+## Reprendre un transfert
+
+Avec la nouvelle version de l'application et du compagnon, une coupure du réseau ou une pause conserve la partie déjà reçue sur l'iPhone. Lors de la prochaine tentative, le transfert PC → iPhone reprend à cet endroit si le même fichier est toujours disponible. Le fichier complet est vérifié avant son import et avant l'affichage de la flèche verte.
+
+Les transferts partiels sont temporaires : le cache est limité à 512 Mo, 32 fichiers et sept jours. iOS peut aussi le purger pour libérer de la place. Si le cache manque ou si l'ancien compagnon ne permet pas la reprise, le fichier est retransféré intégralement. Un transfert terminé quitte ce cache ; aucune deuxième copie complète n'y est conservée.
+
+Cette reprise concerne le transfert du PC vers l'iPhone. Elle ne garantit pas la reprise au même octet d'un téléchargement depuis une source externe. Garder Spotify ouvert jusqu'à la flèche verte reste recommandé.
 
 ## Configuration du compagnon
 
@@ -46,4 +56,4 @@ Installer les versions de `scripts/download-requirements.txt` dans un environnem
 
 `scripts/automatic_downloads.py --bind <IPv4-LAN> --data <dossier-jobs> --session <session.json> --ffmpeg <chemin-ffmpeg>` conserve l'association existante. Le lien de session est privé : ne pas le publier. Le compagnon est limité au réseau local et s'arrête après six heures au maximum ; il se relance avec le même lanceur. Il ne démarre pas automatiquement avec Windows.
 
-Le protocole reste en version 2 : les optimisations du compagnon n'exigent pas de reconstruire l'IPA compatible existante. La gestion des fichiers locaux sur l’iPhone nécessite la nouvelle version de l’application.
+Le protocole reste en version 2. Le compagnon accepte les anciens fichiers MP3, conserve les associations et ajoute la prise en charge M4A ainsi que les réponses HTTP partielles. La reprise des transferts sur l'iPhone nécessite la nouvelle IPA ; les versions précédentes continuent à transférer les fichiers entiers. Le compagnon configure un cache partagé de pochettes ; un worker lancé séparément peut utiliser `SG_ARTWORK_CACHE_DIR` pour choisir ce dossier.
