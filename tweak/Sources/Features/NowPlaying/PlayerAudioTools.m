@@ -225,123 +225,13 @@ void SGPresentPlayerAudioVersions(UIViewController *owner, NSString *capturedURI
     [owner presentViewController:navigation animated:YES completion:nil];
 }
 
-@interface SGPlayerAudioButtons : UIView
-@property(nonatomic, strong) UIButton *speed;
-@property(nonatomic, strong) UIButton *vocals;
-@property(nonatomic, weak) UIStackView *row;
-@property(nonatomic, strong) NSLayoutConstraint *widthConstraint;
-@end
-@implementation SGPlayerAudioButtons
-- (UIButton *)button:(NSString *)title symbol:(NSString *)symbol action:(SEL)action {
-    UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
-    UIButtonConfiguration *config = UIButtonConfiguration.plainButtonConfiguration;
-    config.title = title; config.image = [UIImage systemImageNamed:symbol]; config.imagePlacement = NSDirectionalRectEdgeTop;
-    config.imagePadding = 2; config.baseForegroundColor = [UIColor colorWithWhite:.70 alpha:1];
-    config.contentInsets = NSDirectionalEdgeInsetsMake(2,2,2,2);
-    config.titleTextAttributesTransformer = ^NSDictionary<NSAttributedStringKey,id> *(NSDictionary<NSAttributedStringKey,id> *attributes) {
-        NSMutableDictionary *result = [attributes mutableCopy]; result[NSFontAttributeName] = [UIFont systemFontOfSize:10 weight:UIFontWeightMedium]; return result;
-    };
-    button.configuration = config; button.accessibilityLabel = title; [button addTarget:self action:action forControlEvents:UIControlEventTouchUpInside]; [self addSubview:button]; return button;
-}
-- (instancetype)initWithFrame:(CGRect)frame {
-    if ((self = [super initWithFrame:frame])) {
-        self.speed = [self button:@"Vitesse" symbol:@"speedometer" action:@selector(openSpeed)];
-        self.vocals = [self button:@"Sans voix" symbol:@"mic.slash" action:@selector(openVocals)];
-        self.speed.accessibilityIdentifier = @"spoti.player.speed"; self.vocals.accessibilityIdentifier = @"spoti.player.vocals";
-        self.speed.accessibilityHint = @"Régler la vitesse de lecture du morceau.";
-        self.vocals.accessibilityHint = @"Réduction en direct indisponible.";
-        UIButtonConfiguration *vocalsStyle = self.vocals.configuration;
-        vocalsStyle.baseForegroundColor = [UIColor colorWithWhite:.48 alpha:1];
-        self.vocals.configuration = vocalsStyle;
-        self.translatesAutoresizingMaskIntoConstraints = NO;
-        [self setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
-        [self setContentCompressionResistancePriority:UILayoutPriorityRequired - 1 forAxis:UILayoutConstraintAxisHorizontal];
-        // A hidden arranged view receives a required zero-width constraint from
-        // UIKit. Keep our own width one point below required so it can collapse.
-        self.widthConstraint = [self.widthAnchor constraintEqualToConstant:104];
-        self.widthConstraint.priority = UILayoutPriorityRequired - 1;
-        self.widthConstraint.active = YES;
-    } return self;
-}
-- (CGSize)intrinsicContentSize { return CGSizeMake(104,44); }
-- (void)layoutSubviews {
-    [super layoutSubviews]; CGFloat width = self.bounds.size.width / 2.;
-    CGFloat height = MIN((CGFloat)44,self.bounds.size.height), y = (self.bounds.size.height-height)/2.;
-    self.speed.frame = CGRectMake(0,y,width,height); self.vocals.frame = CGRectMake(width,y,width,height);
-}
-- (void)openSpeed { SGPresentPlayerNativeSpeed(SGTopController()); }
-- (void)openVocals {
-    UIViewController *owner = SGTopController(); if (!owner || owner.presentedViewController) return;
+// The native track menu owns the entry point; this action is informational
+// until this player exposes a verified realtime vocal-reduction control.
+void SGPresentPlayerVocalReduction(UIViewController *owner) {
+    if (!owner || owner.presentedViewController) return;
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Réduction de voix indisponible"
-        message:@"La réduction de voix en direct n’est pas disponible dans ce lecteur. Le morceau continue avec sa voix d’origine."
+        message:@"La réduction de voix en direct n'est pas disponible dans ce lecteur. Le morceau continue avec sa voix d'origine."
         preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"Compris" style:UIAlertActionStyleCancel handler:nil]];
     [owner presentViewController:alert animated:YES completion:nil];
-}
-@end
-
-static char buttonsKey;
-static BOOL SGPlayerAudioFixedWidth(UIView *view, UIView *host) {
-    for (UIView *owner = view; owner; owner = owner.superview) {
-        for (NSLayoutConstraint *constraint in owner.constraints) {
-            if (!constraint.active || constraint.relation != NSLayoutRelationEqual ||
-                constraint.priority < UILayoutPriorityRequired - 1) continue;
-            if ((constraint.firstItem == view && constraint.firstAttribute == NSLayoutAttributeWidth) ||
-                (constraint.secondItem == view && constraint.secondAttribute == NSLayoutAttributeWidth)) return YES;
-        }
-        if (owner == host) break;
-    }
-    return NO;
-}
-static UIStackView *SGPlayerAudioInformationRow(UIView *host) {
-    __block UIStackView *found = nil;
-    SGForEachView(host, ^(UIView *view) {
-        if (found || ![view isKindOfClass:UIStackView.class]) return;
-        UIStackView *row = (UIStackView *)view;
-        if (row.axis != UILayoutConstraintAxisHorizontal || row.distribution != UIStackViewDistributionFill ||
-            row.arrangedSubviews.count < 2 || row.arrangedSubviews.count > 5) return;
-        BOOL text = NO, addTo = NO;
-        for (UIView *item in row.arrangedSubviews) {
-            text |= SGHasClass(item,@"TrackInfoContainerView");
-            addTo |= SGHasClass(item,@"AddToButton");
-        }
-        if (text && addTo) found = row;
-    });
-    return found;
-}
-void SGPlayerAudioToolsLayout(UIViewController *information) {
-    UIView *host = information.viewIfLoaded; if (!host) return;
-    SGPlayerAudioButtons *buttons = objc_getAssociatedObject(host,&buttonsKey);
-    UIStackView *row = buttons.row;
-    if (!row || ![row isDescendantOfView:host]) row = SGPlayerAudioInformationRow(host);
-    if (!row || !host.window || row.bounds.size.height < 44 || row.bounds.size.width < 240) { buttons.hidden = YES; return; }
-    UIView *text = nil, *addTo = nil;
-    CGFloat occupied = 0; NSUInteger count = 0;
-    for (UIView *item in row.arrangedSubviews) {
-        if (item == buttons) continue;
-        if (SGHasClass(item,@"TrackInfoContainerView")) { if (text) { buttons.hidden = YES; return; } text = item; }
-        else {
-            if (SGHasClass(item,@"AddToButton")) addTo = item;
-            if (!item.hidden) occupied += item.bounds.size.width;
-        }
-        if (!item.hidden) count++;
-    }
-    // The row, not an overlay, reserves space before the native AddTo button.
-    // Long titles retain Spotify's existing marquee/truncation behaviour.
-    CGFloat margins = row.layoutMarginsRelativeArrangement ? row.layoutMargins.left + row.layoutMargins.right : 0;
-    CGFloat available = row.bounds.size.width - margins - occupied - MAX((CGFloat)0,row.spacing) * count - 104;
-    if (!text || !addTo || text.hidden || SGPlayerAudioFixedWidth(text,host) || available < 92 ||
-        ([text contentCompressionResistancePriorityForAxis:UILayoutConstraintAxisHorizontal] >= UILayoutPriorityRequired &&
-            text.intrinsicContentSize.width > available)) { buttons.hidden = YES; return; }
-    if (!buttons) {
-        buttons = [[SGPlayerAudioButtons alloc] initWithFrame:CGRectZero];
-        objc_setAssociatedObject(host,&buttonsKey,buttons,OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    }
-    NSUInteger position = [row.arrangedSubviews indexOfObjectIdenticalTo:addTo];
-    NSUInteger current = [row.arrangedSubviews indexOfObjectIdenticalTo:buttons];
-    if (buttons.superview != row || current == NSNotFound || current + 1 != position) {
-        [buttons.row removeArrangedSubview:buttons]; [buttons removeFromSuperview];
-        [row insertArrangedSubview:buttons atIndex:[row.arrangedSubviews indexOfObjectIdenticalTo:addTo]]; buttons.row = row;
-    }
-    buttons.hidden = NO;
 }

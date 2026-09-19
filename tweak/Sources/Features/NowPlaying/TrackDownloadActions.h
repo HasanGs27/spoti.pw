@@ -1,5 +1,5 @@
 #import <Foundation/Foundation.h>
 
-// Preserve the exact menu target: a playlist, episode or local-file URI never
-// falls back to the playing track. Unknown input leaves native actions intact.
+// Preserve the exact menu target. Catalogue tracks receive download and audio
+// actions; local tracks receive audio actions only. Native actions stay intact.
 id SGTrackDownloadMenuActions(id actions, id entity);

@@ -247,11 +247,14 @@ static UILabel *speedLabel(UIFont *font, UIColor *color) {
 @end
 
 void SGPresentPlayerNativeSpeed(UIViewController *owner) {
-    if (!NSThread.isMainThread) { dispatch_async(dispatch_get_main_queue(), ^{ SGPresentPlayerNativeSpeed(owner); }); return; }
+    SGPresentPlayerNativeSpeedForTrack(owner, nil);
+}
+void SGPresentPlayerNativeSpeedForTrack(UIViewController *owner, NSString *expectedURI) {
+    if (!NSThread.isMainThread) { dispatch_async(dispatch_get_main_queue(), ^{ SGPresentPlayerNativeSpeedForTrack(owner, expectedURI); }); return; }
     if (!owner || owner.presentedViewController) return;
     id<SGNativeSpeedPlayer> player = observedPlayer;
     NSDictionary *snapshot = SGPlayerNativeSpeedSnapshot(readState(player));
-    if (!snapshot) {
+    if (!snapshot || (expectedURI && ![expectedURI isEqual:snapshot[@"trackURI"]])) {
         UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Vitesse"
             message:@"Lance un morceau, puis rouvre son lecteur pour régler sa vitesse." preferredStyle:UIAlertControllerStyleAlert];
         [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleCancel handler:nil]];
