@@ -92,9 +92,26 @@ jobs:
         run: |
           clang -fobjc-arc -fblocks -Wall -Werror -framework Foundation -DSG_AUDIO_VARIANT_TEST=1 \
             tweak/Sources/Features/NowPlaying/AudioVariantModel.m \
+            tweak/Sources/Features/NowPlaying/LocalImportModel.m \
+            tweak/Sources/Features/NowPlaying/YouTubeSourceModel.m \
             tweak/Sources/Features/NowPlaying/AutomaticDownloadModel.m \
             tweak/Sources/Features/NowPlaying/LocalDownloadManifest.m -o "$RUNNER_TEMP/audio-variant-test"
           "$RUNNER_TEMP/audio-variant-test"
+
+      - name: Test full player speed and audio source identity
+        run: |
+          clang -fobjc-arc -fblocks -Wall -Werror -framework Foundation -DSG_PLAYER_NATIVE_SPEED_TEST=1 \
+            tweak/Sources/Features/NowPlaying/PlayerNativeSpeedModel.m -o "$RUNNER_TEMP/player-native-speed-test"
+          "$RUNNER_TEMP/player-native-speed-test"
+          clang -fobjc-arc -fblocks -Wall -Werror -framework Foundation -DSG_PLAYER_AUDIO_TOOLS_TEST=1 \
+            tweak/Sources/Features/NowPlaying/PlayerAudioToolsModel.m \
+            tweak/Sources/Features/NowPlaying/AudioVariantModel.m \
+            tweak/Sources/Features/NowPlaying/LocalImportModel.m \
+            tweak/Sources/Features/NowPlaying/YouTubeSourceModel.m \
+            tweak/Sources/Features/NowPlaying/AutomaticDownloadState.m \
+            tweak/Sources/Features/NowPlaying/AutomaticDownloadModel.m \
+            tweak/Sources/Features/NowPlaying/LocalDownloadManifest.m -o "$RUNNER_TEMP/player-audio-tools-test"
+          "$RUNNER_TEMP/player-audio-tools-test"
 
       - name: Test YouTube selection and personal import model
         run: |
