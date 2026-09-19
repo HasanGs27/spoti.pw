@@ -12,7 +12,7 @@ SG_VERSION := $(shell sed -n 's/^Version: //p' control)
 # is generated from the IPA by scripts/extract-flags.py.
 spotifyglass_FILES := $(shell find Sources -name '*.m' -o -name '*.x' -o -name '*.swift' | sort)
 spotifyglass_CFLAGS := -fobjc-arc -ISources -DSG_VERSION=\"$(SG_VERSION)\"
-spotifyglass_FRAMEWORKS := UIKit QuartzCore UniformTypeIdentifiers MediaPlayer CoreImage ImageIO CoreGraphics AVFoundation CoreMedia AudioToolbox JavaScriptCore VideoToolbox Network
+spotifyglass_FRAMEWORKS := UIKit QuartzCore UniformTypeIdentifiers MediaPlayer CoreImage ImageIO CoreGraphics AVFoundation CoreMedia AudioToolbox JavaScriptCore VideoToolbox Network WebKit
 spotifyglass_SWIFTFLAGS := -swift-version 5
 # Runtime swizzling instead of Substrate so the dylib has no extra dependency inside the IPA.
 spotifyglass_LOGOS_DEFAULT_GENERATOR := internal
