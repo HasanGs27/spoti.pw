@@ -83,11 +83,20 @@ jobs:
       - name: Test native audio resolver
         run: bash scripts/test-native-audio.sh
 
+      - name: Test local audio deduplication and restore
+        run: |
+          clang -fobjc-arc -fblocks -framework Foundation -framework AVFoundation -framework CoreMedia -framework AudioToolbox -framework ImageIO -DSG_AUTOMATIC_LIBRARY_TEST=1 \
+            tweak/Sources/Features/NowPlaying/AutomaticAudioLibrary.m \
+            tweak/Sources/Features/NowPlaying/AutomaticDownloadModel.m \
+            tweak/Sources/Features/NowPlaying/LocalDownloadManifest.m -o "$RUNNER_TEMP/automatic-library-test"
+          "$RUNNER_TEMP/automatic-library-test"
+
       - name: Test manual audio import
         # The native import test uses synthetic audio, not a third-party recording.
         run: |
-          clang -fobjc-arc -fblocks -framework Foundation -framework AVFoundation -framework CoreMedia -DSG_AUTOMATIC_AUDIO_TEST=1 \
+          clang -fobjc-arc -fblocks -framework Foundation -framework AVFoundation -framework CoreMedia -framework AudioToolbox -framework ImageIO -DSG_AUTOMATIC_AUDIO_TEST=1 \
             tweak/Sources/Features/NowPlaying/AutomaticAudioFile.m \
+            tweak/Sources/Features/NowPlaying/AutomaticAudioLibrary.m \
             tweak/Sources/Features/NowPlaying/AutomaticDownloadModel.m \
             tweak/Sources/Features/NowPlaying/LocalDownloadManifest.m -o "$RUNNER_TEMP/manual-audio-test"
           "$RUNNER_TEMP/manual-audio-test"
