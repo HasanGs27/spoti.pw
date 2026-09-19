@@ -15,7 +15,6 @@
 static const NSUInteger libraryLimit = 100 * 1024 * 1024;
 static NSString *const pathKey = @"spotifyglass.automaticDownloads.libraryPaths";
 static NSDictionary *pathSnapshot;
-static BOOL lastScanLimited;
 static NSCache *audioCache(void) {
     static NSCache *cache; static dispatch_once_t once;
     dispatch_once(&once, ^{ cache = [NSCache new]; cache.countLimit = 10000; }); return cache;
@@ -358,13 +357,14 @@ static NSString *packetHash(NSMutableDictionary *info, BOOL (^cancelled)(void)) 
     info[@"packets"] = hash; return hash;
 }
 static NSArray *scan(BOOL (^cancelled)(void)) {
-    lastScanLimited = NO;
     NSFileManager *fm = NSFileManager.defaultManager;
+#ifdef SG_AUTOMATIC_LIBRARY_TEST
     __block NSUInteger errors = 0;
+#endif
     NSDirectoryEnumerator *walker = [fm enumeratorAtURL:documents() includingPropertiesForKeys:@[NSURLIsDirectoryKey, NSURLIsSymbolicLinkKey]
         options:NSDirectoryEnumerationSkipsHiddenFiles | NSDirectoryEnumerationSkipsPackageDescendants errorHandler:^BOOL(NSURL *url, NSError *error) {
-            errors++; lastScanLimited = YES;
 #ifdef SG_AUTOMATIC_LIBRARY_TEST
+            errors++;
             fprintf(stderr, "Scan error: name=%s domain=%s code=%ld\n", url.lastPathComponent.UTF8String, error.domain.UTF8String, (long)error.code);
 #endif
             return !cancelledNow(cancelled);
@@ -377,7 +377,7 @@ static NSArray *scan(BOOL (^cancelled)(void)) {
     NSURL *file;
     while ((file = walker.nextObject)) {
         if (cancelledNow(cancelled)) break;
-        if (++visited > 20000 || files.count >= 10000) { lastScanLimited = YES; break; }
+        if (++visited > 20000 || files.count >= 10000) break;
         NSNumber *directory = nil, *link = nil;
         [file getResourceValue:&directory forKey:NSURLIsDirectoryKey error:nil];
         [file getResourceValue:&link forKey:NSURLIsSymbolicLinkKey error:nil];
