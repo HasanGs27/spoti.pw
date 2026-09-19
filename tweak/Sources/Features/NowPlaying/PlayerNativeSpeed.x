@@ -16,7 +16,7 @@ static NSUInteger requestGeneration;
 
 static id readState(id<SGNativeSpeedPlayer> player) {
     @try {
-        NSMethodSignature *signature = [player methodSignatureForSelector:@selector(state)];
+        NSMethodSignature *signature = [(NSObject *)player methodSignatureForSelector:@selector(state)];
         if (![player isKindOfClass:NSClassFromString(@"SPTEsperantoPlayer")] || signature.numberOfArguments != 2 ||
             strcmp(signature.methodReturnType, @encode(id)) != 0) return nil;
         return player.state;
