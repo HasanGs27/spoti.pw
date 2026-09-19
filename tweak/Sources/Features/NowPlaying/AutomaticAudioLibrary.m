@@ -234,24 +234,68 @@ static NSString *packetHash(NSMutableDictionary *info, BOOL (^cancelled)(void)) 
 static NSArray *scan(BOOL (^cancelled)(void)) {
     lastScanLimited = NO;
     NSFileManager *fm = NSFileManager.defaultManager;
+    __block NSUInteger errors = 0;
     NSDirectoryEnumerator *walker = [fm enumeratorAtURL:documents() includingPropertiesForKeys:@[NSURLIsDirectoryKey, NSURLIsSymbolicLinkKey]
-        options:NSDirectoryEnumerationSkipsHiddenFiles | NSDirectoryEnumerationSkipsPackageDescendants errorHandler:nil];
+        options:NSDirectoryEnumerationSkipsHiddenFiles | NSDirectoryEnumerationSkipsPackageDescendants errorHandler:^BOOL(NSURL *url, NSError *error) {
+            errors++; lastScanLimited = YES;
+#ifdef SG_AUTOMATIC_LIBRARY_TEST
+            fprintf(stderr, "Scan error: name=%s domain=%s code=%ld\n", url.lastPathComponent.UTF8String, error.domain.UTF8String, (long)error.code);
+#endif
+            return !cancelledNow(cancelled);
+        }];
     NSMutableArray *files = [NSMutableArray array]; NSUInteger visited = 0;
-    for (NSURL *file in walker) {
+#ifdef SG_AUTOMATIC_LIBRARY_TEST
+    NSUInteger directories = 0, links = 0, excluded = 0, extensions = 0, unsafe = 0;
+#endif
+    // Advance explicitly so skipDescendants always refers to the current directory.
+    NSURL *file;
+    while ((file = walker.nextObject)) {
         if (cancelledNow(cancelled)) break;
         if (++visited > 20000 || files.count >= 10000) { lastScanLimited = YES; break; }
         NSNumber *directory = nil, *link = nil;
         [file getResourceValue:&directory forKey:NSURLIsDirectoryKey error:nil];
         [file getResourceValue:&link forKey:NSURLIsSymbolicLinkKey error:nil];
-        if (link.boolValue) { [walker skipDescendants]; continue; }
+#ifdef SG_AUTOMATIC_LIBRARY_TEST
+        if (visited <= 20) fprintf(stderr, "Scan entry: name=%s level=%lu dir=%d link=%d relative=%d regular=%d canonical=%d\n",
+            file.lastPathComponent.UTF8String, (unsigned long)walker.level, directory.boolValue, link.boolValue,
+            relativePath(file) != nil, regularFile(file, nil), [file.path isEqual:file.URLByResolvingSymlinksInPath.path]);
+        if (link.boolValue) links++;
+#endif
+        // Foundation never descends into symbolic links. skipDescendants applies to
+        // the last directory, so calling it on a file link can skip unrelated files.
+        if (link.boolValue) continue;
         if (directory.boolValue) {
-            if ([@[@"cache", @"caches", @"tmp", @"temp"] containsObject:file.lastPathComponent.lowercaseString]) [walker skipDescendants];
+#ifdef SG_AUTOMATIC_LIBRARY_TEST
+            directories++;
+#endif
+            if ([@[@"cache", @"caches", @"tmp", @"temp"] containsObject:file.lastPathComponent.lowercaseString]) {
+                [walker skipDescendants];
+#ifdef SG_AUTOMATIC_LIBRARY_TEST
+                excluded++;
+#endif
+            }
             continue;
         }
         NSString *ext = file.pathExtension.lowercaseString;
-        if (![@[@"mp3", @"m4a"] containsObject:ext] || !relativePath(file)) continue;
+        if (![@[@"mp3", @"m4a"] containsObject:ext]) {
+#ifdef SG_AUTOMATIC_LIBRARY_TEST
+            extensions++;
+#endif
+            continue;
+        }
+        if (!relativePath(file)) {
+#ifdef SG_AUTOMATIC_LIBRARY_TEST
+            unsafe++;
+#endif
+            continue;
+        }
         [files addObject:file];
     }
+#ifdef SG_AUTOMATIC_LIBRARY_TEST
+    fprintf(stderr, "Scan summary: enumerator=%d visited=%lu dirs=%lu links=%lu excludedDirs=%lu otherExtensions=%lu unsafe=%lu accepted=%lu errors=%lu\n",
+        walker != nil, (unsigned long)visited, (unsigned long)directories, (unsigned long)links, (unsigned long)excluded,
+        (unsigned long)extensions, (unsigned long)unsafe, (unsigned long)files.count, (unsigned long)errors);
+#endif
     return [files sortedArrayUsingComparator:^NSComparisonResult(NSURL *a, NSURL *b) { return [a.path compare:b.path options:NSLiteralSearch]; }];
 }
 static NSComparisonResult preference(NSDictionary *a, NSDictionary *b) {
@@ -548,11 +592,21 @@ int main(void) { @autoreleasepool {
     NSData *covered = testTagged(@"Same Song", @"Synthetic Artist", @"Album", YES);
     NSURL *old = testWrite(@"Old Imports/old.mp3", bare);
     NSDictionary *oldRow = testRequest(old);
+    NSUInteger beforeLinks = scan(nil).count;
     NSURL *external = [root URLByAppendingPathComponent:@"outside.mp3"]; assert([bare writeToURL:external atomically:YES]);
     NSURL *link = [testDocuments URLByAppendingPathComponent:@"linked.mp3"];
     assert([fm createSymbolicLinkAtPath:link.path withDestinationPath:external.path error:nil]);
+    NSUInteger afterLinks = scan(nil).count;
     NSURL *cache = testWrite(@"Caches/cached.mp3", bare);
     NSURL *hidden = testWrite(@".hidden/hidden.mp3", bare);
+    NSError *childrenError = nil;
+    NSArray *children = [fm contentsOfDirectoryAtURL:testDocuments includingPropertiesForKeys:@[NSURLIsDirectoryKey, NSURLIsSymbolicLinkKey, NSURLIsHiddenKey, NSURLIsPackageKey] options:0 error:&childrenError];
+    fprintf(stderr, "Fixture root: beforeLinks=%lu afterLinks=%lu children=%lu error=%ld\n", (unsigned long)beforeLinks, (unsigned long)afterLinks, (unsigned long)children.count, (long)childrenError.code);
+    for (NSURL *child in children) {
+        NSDictionary *flags = [child resourceValuesForKeys:@[NSURLIsDirectoryKey, NSURLIsSymbolicLinkKey, NSURLIsHiddenKey, NSURLIsPackageKey] error:nil];
+        fprintf(stderr, "Fixture child: name=%s dir=%d link=%d hidden=%d package=%d\n", child.lastPathComponent.UTF8String,
+            [flags[NSURLIsDirectoryKey] boolValue], [flags[NSURLIsSymbolicLinkKey] boolValue], [flags[NSURLIsHiddenKey] boolValue], [flags[NSURLIsPackageKey] boolValue]);
+    }
     // Existing manual file is adopted by true hash, without moving or duplicating it.
     NSDictionary *reused = SGAutomaticLibraryReuse(nil, oldRow, nil);
     if (![reused[@"id"] isEqual:oldRow[@"id"]]) {
