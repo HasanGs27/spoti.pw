@@ -8,7 +8,8 @@ static BOOL pattern(NSString *text, NSString *expression) {
     dispatch_once(&once, ^{ expressions = [NSCache new]; expressions.countLimit = 12; });
     NSRegularExpression *regex = [expressions objectForKey:expression];
     if (!regex) { regex = [NSRegularExpression regularExpressionWithPattern:expression options:0 error:nil]; [expressions setObject:regex forKey:expression]; }
-    return [regex numberOfMatchesInString:text options:0 range:NSMakeRange(0, text.length)] == 1;
+    NSTextCheckingResult *match = [regex firstMatchInString:text options:0 range:NSMakeRange(0, text.length)];
+    return match && match.range.location == 0 && match.range.length == text.length;
 }
 static BOOL finiteNumber(id value, double minimum, double maximum) {
     return [value isKindOfClass:NSNumber.class] && CFGetTypeID((__bridge CFTypeRef)value) != CFBooleanGetTypeID() &&
@@ -86,6 +87,10 @@ static NSDictionary *validatedRow(id row) {
         if (!url) return nil;
         item[key] = url.absoluteString;
     }
+    if (row[@"source"] && row[@"source"] != NSNull.null && ![row[@"source"] isEqual:@""]) {
+        if (!pattern(row[@"source"], @"^https://music\\.youtube\\.com/watch\\?v=[A-Za-z0-9_-]{11}$")) return nil;
+        item[@"source"] = row[@"source"];
+    }
     return item;
 }
 NSDictionary *SGAutomaticJob(NSData *data) {
@@ -111,6 +116,8 @@ NSDictionary *SGAutomaticJob(NSData *data) {
     NSMutableDictionary *result = [@{@"version":@2, @"id":job[@"id"], @"url":SGAutomaticSpotifyURL(job[@"url"]), @"state":job[@"state"],
         @"name":job[@"name"], @"message":job[@"message"], @"scope":job[@"scope"], @"items":items, @"engine":job[@"engine"] ?: @"pc"} mutableCopy];
     if (job[@"completeMetadata"]) result[@"completeMetadata"] = job[@"completeMetadata"];
+    if (job[@"kind"] && ![@[@"download", @"alternative"] containsObject:job[@"kind"]]) return nil;
+    if (job[@"kind"]) result[@"kind"] = job[@"kind"];
     return result;
 }
 NSString *SGAutomaticLocalURI(NSDictionary *row) {

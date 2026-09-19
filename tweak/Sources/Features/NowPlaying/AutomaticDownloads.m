@@ -2,6 +2,8 @@
 #import "AutomaticDownloads.h"
 #import "AutomaticDownloadModel.h"
 #import "AutomaticDownloadTransfer.h"
+#import "AutomaticDownloadState.h"
+#import "AutomaticPCDiscovery.h"
 #import "AutomaticAudioFile.h"
 #import "AutomaticAudioLibrary.h"
 #import "AutomaticLocalFilesPage.h"
@@ -20,6 +22,7 @@ static NSString *const changed = @"SGAutomaticDownloadsDidChange";
 static NSString *const pairKey = @"spotifyglass.automaticDownloads.pair";
 static NSString *const modeKey = @"spotifyglass.automaticDownloads.mode";
 static NSString *const queueKey = @"spotifyglass.automaticDownloads.queue";
+static NSString *const intentKey = @"spotifyglass.automaticDownloads.intent.v1";
 static __weak id observedPlayer;
 
 static NSCache *verifiedFiles(void) {
@@ -96,7 +99,7 @@ static void tell(NSString *message) {
     [owner presentViewController:alert animated:YES completion:nil];
 }
 
-@interface SGAutomaticDownloads : NSObject <NSURLSessionTaskDelegate, NSURLSessionDownloadDelegate>
+@interface SGAutomaticDownloads : NSObject <NSURLSessionTaskDelegate, NSURLSessionDownloadDelegate, UIDocumentInteractionControllerDelegate>
 @property (atomic) BOOL busy;
 @property (atomic) BOOL clearing;
 @property (atomic) NSUInteger generation;
@@ -116,6 +119,19 @@ static void tell(NSString *message) {
 @property (atomic) double transferProgress;
 @property (atomic) BOOL userPaused;
 @property (atomic) BOOL preparingAudio;
+@property (atomic) BOOL waitingForPC;
+@property (atomic) BOOL pcIdentityVerified;
+@property (atomic) BOOL transportUnavailable;
+@property (atomic) BOOL interrupted;
+@property (atomic, copy) NSString *resumeURL;
+@property (nonatomic) NSUInteger reconnectAttempt;
+@property (nonatomic) NSUInteger reconnectTicket;
+@property (nonatomic) NSUInteger reconnectPendingTicket;
+@property (atomic, copy) NSDictionary *alternativeJob;
+@property (atomic) BOOL alternativeAcceptRequested;
+@property (atomic, copy) NSDictionary *candidateRow;
+@property (atomic, strong) NSURL *candidateFile;
+@property (nonatomic, strong) UIDocumentInteractionController *candidatePreview;
 @property (atomic, strong) id resolverToken;
 @property (nonatomic) CFTimeInterval lastProgressNotification;
 @property (nonatomic) BOOL notificationPending;
@@ -152,6 +168,18 @@ static void tell(NSString *message) {
 - (void)advanceQueue;
 - (void)selectJob:(NSDictionary *)job;
 - (void)repairRow:(NSDictionary *)row selection:(NSDictionary *)selection source:(NSURL *)source;
+- (void)persistIntent;
+- (void)waitForPC:(NSUInteger)generation;
+- (void)scheduleReconnect;
+- (void)attemptReconnect;
+- (void)refreshSelection:(NSString *)url;
+- (void)startAlternative:(NSDictionary *)row;
+- (void)followAlternative:(NSDictionary *)job root:(NSURL *)root generation:(NSUInteger)generation;
+- (void)showAlternative;
+- (void)acceptAlternative;
+- (void)cancelAlternative;
+- (void)showPCStorage;
+- (void)cleanupPCStorage;
 @end
 
 @implementation SGAutomaticDownloads
@@ -170,7 +198,14 @@ static void tell(NSString *message) {
             if (url && ![queued containsObject:url] && queued.count < 10) [queued addObject:url];
         }
         engine.queuedURLs = queued;
-        engine.registeredTracks = @{};
+        NSDictionary *storedIntent = [NSUserDefaults.standardUserDefaults dictionaryForKey:intentKey];
+        NSDictionary *intent = SGAutomaticDownloadIntent(storedIntent);
+        if (storedIntent) engine.queuedURLs = intent[@"queue"];
+        engine.pending = intent[@"pending"];
+        engine.alternativeAcceptRequested = [intent[@"acceptRequested"] boolValue];
+        engine.userPaused = [intent[@"paused"] boolValue];
+        engine.resumeURL = intent[@"activeURL"] ?: engine.pending[@"url"];
+        engine.registeredTracks = intent[@"tracks"] ?: @{};
         engine.collectionErrors = @{};
         engine.devicePendingURL = SGAutomaticSpotifyURL([NSUserDefaults.standardUserDefaults stringForKey:@"spotifyglass.automaticDownloads.pendingDevice"]);
         engine.root = SGDownloadRoot([NSUserDefaults.standardUserDefaults stringForKey:pairKey]);
@@ -195,7 +230,7 @@ static void tell(NSString *message) {
         }
         engine.localRows = local;
         NSString *last = [NSUserDefaults.standardUserDefaults stringForKey:@"spotifyglass.automaticDownloads.last"];
-        engine.job = last ? [engine merged:valid[last]] : nil;
+        engine.job = [engine merged:valid[engine.resumeURL ?: last ?: @""]];
         NSURLSessionConfiguration *config = NSURLSessionConfiguration.ephemeralSessionConfiguration;
         config.timeoutIntervalForRequest = 25; config.timeoutIntervalForResource = 150;
         config.allowsCellularAccess = NO; config.URLCache = nil; config.HTTPCookieStorage = nil;
@@ -211,16 +246,79 @@ static void tell(NSString *message) {
                     if ([row[@"state"] isEqual:@"ready"] && !candidates[row[@"spotify"]]) candidates[row[@"spotify"]] = row;
             for (NSDictionary *row in candidates.allValues) if (verifyRow(row)) [engine remember:row];
             [engine update:engine.message];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (!engine.userPaused && UIApplication.sharedApplication.applicationState == UIApplicationStateActive &&
+                    (engine.pending || engine.resumeURL || engine.devicePendingURL || engine.queuedURLs.count)) [engine resume];
+            });
         });
         [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) {
+            if (!engine.busy) engine.pcIdentityVerified = NO;
             if (!engine.busy) dispatch_async(engine.worker, ^{
                 for (NSDictionary *row in engine.localRows.allValues) verifyRow(row);
                 engine.verificationRevision += 1;
                 [engine update:engine.message];
             });
+            if (!engine.busy && !engine.userPaused && (!engine.candidateFile || engine.alternativeAcceptRequested)) {
+                if (engine.waitingForPC) [engine scheduleReconnect];
+                else if (engine.pending || engine.resumeURL || engine.devicePendingURL || engine.queuedURLs.count) [engine resume];
+            }
         }];
     });
     return engine;
+}
+- (void)persistIntent {
+    void (^save)(void) = ^{
+        NSMutableDictionary *intent = [@{@"version":@1, @"queue":self.queuedURLs ?: @[], @"paused":@(self.userPaused), @"tracks":self.registeredTracks ?: @{}} mutableCopy];
+        if (self.pending) intent[@"pending"] = self.pending;
+        if (self.alternativeAcceptRequested) intent[@"acceptRequested"] = @YES;
+        if (self.resumeURL) intent[@"activeURL"] = self.resumeURL;
+        [NSUserDefaults.standardUserDefaults setObject:SGAutomaticDownloadIntent(intent) forKey:intentKey];
+    };
+    if (NSThread.isMainThread) save(); else dispatch_sync(dispatch_get_main_queue(), save);
+}
+- (void)waitForPC:(NSUInteger)generation {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (self.generation != generation) return;
+        self.waitingForPC = YES; self.busy = NO; self.activeSpotify = nil; self.preparingAudio = NO; self.transferProgress = 0;
+        self.pcIdentityVerified = NO;
+        if (self.backgroundTask != UIBackgroundTaskInvalid) {
+            [UIApplication.sharedApplication endBackgroundTask:self.backgroundTask]; self.backgroundTask = UIBackgroundTaskInvalid;
+        }
+        [self persistIntent]; [self update:@"En attente du PC. La demande est conservée ; la connexion reprendra automatiquement quand Spotify est ouvert."];
+        [self scheduleReconnect];
+    });
+}
+- (void)scheduleReconnect {
+    if (self.busy || self.userPaused || !self.waitingForPC || !self.root ||
+        ![[NSUserDefaults.standardUserDefaults stringForKey:modeKey] isEqual:@"pc"] ||
+        UIApplication.sharedApplication.applicationState != UIApplicationStateActive) return;
+    if (self.reconnectPendingTicket && self.reconnectPendingTicket == self.reconnectTicket) return;
+    NSUInteger ticket = ++self.reconnectTicket;
+    self.reconnectPendingTicket = ticket;
+    NSTimeInterval delay = SGAutomaticDownloadRetryDelay(self.reconnectAttempt);
+    self.reconnectAttempt = MIN((NSUInteger)5, self.reconnectAttempt + 1);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (self.reconnectPendingTicket == ticket) self.reconnectPendingTicket = 0;
+        if (ticket != self.reconnectTicket || self.busy || self.userPaused || !self.waitingForPC ||
+            UIApplication.sharedApplication.applicationState != UIApplicationStateActive) return;
+        [self attemptReconnect];
+    });
+}
+- (void)attemptReconnect {
+    if (self.busy || self.userPaused || !self.root) return;
+    self.busy = YES; self.waitingForPC = YES; NSUInteger generation = ++self.generation;
+    // Discovery challenges the saved address too. Never send the private URL to
+    // a reused DHCP address until the companion has proved its identity.
+    SGAutomaticDiscoverPC(self.root, ^(NSURL *found) {
+        if (generation != self.generation) return;
+        self.busy = NO;
+        if (!found) { [self update:@"En attente du PC. La demande reste enregistrée."]; [self scheduleReconnect]; return; }
+        self.root = found; self.pcIdentityVerified = YES;
+        [NSUserDefaults.standardUserDefaults setObject:found.absoluteString forKey:pairKey];
+        self.waitingForPC = NO; self.reconnectAttempt = 0;
+        if (!self.userPaused && UIApplication.sharedApplication.applicationState == UIApplicationStateActive) [self resume];
+        else if (!self.userPaused) self.waitingForPC = YES;
+    });
 }
 - (void)update:(NSString *)message {
     if (message) self.message = message;
@@ -234,11 +332,12 @@ static void tell(NSString *message) {
     });
 }
 - (void)selectJob:(NSDictionary *)job {
-    if (self.busy || !job) return;
-    self.pending = nil; self.devicePendingURL = nil;
+    if (self.busy || !job || self.pending || self.waitingForPC) return;
+    self.devicePendingURL = nil;
     [NSUserDefaults.standardUserDefaults removeObjectForKey:@"spotifyglass.automaticDownloads.pendingDevice"];
     self.job = [self merged:job];
     [NSUserDefaults.standardUserDefaults setObject:job[@"url"] forKey:@"spotifyglass.automaticDownloads.last"];
+    if (self.userPaused) { self.resumeURL = job[@"url"]; [self persistIntent]; }
 }
 - (void)saveJob:(NSDictionary *)job {
     job = [self merged:job];
@@ -291,6 +390,7 @@ static void tell(NSString *message) {
 - (void)URLSession:(NSURLSession *)session downloadTask:(NSURLSessionDownloadTask *)task didFinishDownloadingToURL:(NSURL *)url {}
 - (NSURL *)fetch:(NSURLRequest *)request limit:(NSUInteger)limit generation:(NSUInteger)generation {
     if (generation != self.generation) return nil;
+    self.transportUnavailable = NO;
     NSURL *cache = [NSFileManager.defaultManager URLsForDirectory:NSCachesDirectory inDomains:NSUserDomainMask].firstObject;
     NSURL *staging = [cache URLByAppendingPathComponent:[NSString stringWithFormat:@"sg-auto-%@.mp3", NSUUID.UUID.UUIDString]];
     dispatch_semaphore_t done = dispatch_semaphore_create(0);
@@ -299,6 +399,8 @@ static void tell(NSString *message) {
     NSURLSessionDownloadTask *task = [session downloadTaskWithRequest:request completionHandler:^(NSURL *file, NSURLResponse *response, NSError *error) {
         NSNumber *size = nil; [file getResourceValue:&size forKey:NSURLFileSizeKey error:nil];
         NSInteger code = [response isKindOfClass:NSHTTPURLResponse.class] ? ((NSHTTPURLResponse *)response).statusCode : 0;
+        self.transportUnavailable = (error && [error.domain isEqual:NSURLErrorDomain] && error.code != NSURLErrorCancelled) ||
+            code == 502 || code == 503 || code == 504;
         if (!error && generation == self.generation && (code == 200 || code == 202) && size.unsignedIntegerValue > 0 && size.unsignedIntegerValue <= limit)
             copied = [NSFileManager.defaultManager moveItemAtURL:file toURL:staging error:nil];
         dispatch_semaphore_signal(done);
@@ -326,8 +428,10 @@ static void tell(NSString *message) {
         if (self.backgroundTask != UIBackgroundTaskInvalid) {
             [UIApplication.sharedApplication endBackgroundTask:self.backgroundTask]; self.backgroundTask = UIBackgroundTaskInvalid;
         }
-        [self update:message];
-        if (!self.userPaused) [self advanceQueue];
+        if (!self.interrupted && !self.waitingForPC && !self.pending) self.resumeURL = nil;
+        [self persistIntent]; [self update:message];
+        if (self.waitingForPC && !self.userPaused) [self scheduleReconnect];
+        else if (!self.userPaused && !self.interrupted && !self.pending) [self advanceQueue];
     });
 }
 - (void)beginBackgroundAllowance {
@@ -337,14 +441,19 @@ static void tell(NSString *message) {
         UIBackgroundTaskIdentifier task = weak.backgroundTask;
         weak.backgroundTask = UIBackgroundTaskInvalid;
         if (task != UIBackgroundTaskInvalid) [UIApplication.sharedApplication endBackgroundTask:task];
+        BOOL explicitlyPaused = weak.userPaused;
         [weak pause];
-        [weak update:@"Mis en pause par iOS. Reviens dans Spotify et touche Reprendre."];
+        weak.userPaused = explicitlyPaused; [weak persistIntent];
+        [weak update:@"Interrompu par iOS. La préparation reprendra au retour dans Spotify."];
     }];
 }
 - (void)advanceQueue {
-    if (self.busy || self.userPaused || !self.queuedURLs.count) return;
+    if (self.busy || self.userPaused || self.pending || self.waitingForPC || !self.queuedURLs.count ||
+        UIApplication.sharedApplication.applicationState != UIApplicationStateActive) return;
     NSMutableArray *queue = [self.queuedURLs mutableCopy]; NSString *next = queue.firstObject; [queue removeObjectAtIndex:0];
-    self.queuedURLs = queue; [NSUserDefaults.standardUserDefaults setObject:queue forKey:queueKey];
+    self.queuedURLs = queue;
+    // start: saves the popped head as the first durable request together with the
+    // remaining queue. A crash before that save leaves the old head in the queue.
     [self start:next];
 }
 - (void)removeQueued:(NSString *)url {
@@ -352,6 +461,7 @@ static void tell(NSString *message) {
     NSMutableArray *queue = [self.queuedURLs mutableCopy]; [queue removeObject:url];
     self.queuedURLs = queue;
     [NSUserDefaults.standardUserDefaults setObject:queue forKey:queueKey];
+    [self persistIntent];
     [self update:@"Sélection retirée de la file. Tes fichiers sont conservés."];
 }
 - (void)saveError:(NSString *)reason row:(NSDictionary *)row {
@@ -390,6 +500,7 @@ static void tell(NSString *message) {
 }
 - (void)startDevice:(NSString *)url {
     self.busy = YES; self.activeCollection = url; self.pending = nil;
+    self.resumeURL = url; self.waitingForPC = NO; self.interrupted = NO; [self persistIntent];
     self.devicePendingURL = url;
     [NSUserDefaults.standardUserDefaults setObject:url forKey:@"spotifyglass.automaticDownloads.pendingDevice"];
     NSUInteger generation = ++self.generation; [self beginBackgroundAllowance];
@@ -435,6 +546,7 @@ static void tell(NSString *message) {
     });
 }
 - (void)repairRow:(NSDictionary *)row selection:(NSDictionary *)selection source:(NSURL *)source {
+    if ([self.pending[@"kind"] isEqual:@"alternative"]) { tell(@"Choisis ou annule d’abord la version proposée. La copie actuelle est conservée."); return; }
     if (self.busy || !row || !selection) return;
     self.busy = YES; self.userPaused = NO; self.activeCollection = selection[@"url"];
     NSUInteger generation = ++self.generation; [self beginBackgroundAllowance];
@@ -542,13 +654,20 @@ static void tell(NSString *message) {
         dispatch_async(dispatch_get_main_queue(), ^{
             if (self.generation != generation) return;
             self.busy = NO;
-            if (!valid) { [self update:@"PC inaccessible. Vérifie le même Wi-Fi et l’autorisation Réseau local de Spotify."]; return; }
+            if (!valid) {
+                if ([root.absoluteString isEqual:self.root.absoluteString] && (self.pending || self.resumeURL)) [self waitForPC:generation];
+                else { [self update:@"PC inaccessible. Vérifie le même Wi-Fi et l’autorisation Réseau local de Spotify."]; [self scheduleReconnect]; }
+                return;
+            }
             self.root = root;
+            self.pcIdentityVerified = YES;
             [NSUserDefaults.standardUserDefaults setObject:root.absoluteString forKey:pairKey];
             [NSUserDefaults.standardUserDefaults setObject:@"pc" forKey:modeKey];
             [NSUserDefaults.standardUserDefaults setBool:YES forKey:@"SGAutomaticDownloadsEnabled"];
             [self update:@"PC connecté. La flèche d’une playlist peut lancer sa préparation."];
-            if (self.pending) [self submitPending];
+            self.waitingForPC = NO; self.reconnectAttempt = 0;
+            if (!self.userPaused && UIApplication.sharedApplication.applicationState == UIApplicationStateActive &&
+                (self.pending || self.resumeURL || self.queuedURLs.count)) [self resume];
         });
     });
 }
@@ -556,29 +675,35 @@ static void tell(NSString *message) {
     if (self.clearing) { [self update:@"Nettoyage en cours. Les fichiers téléchargés sont conservés."]; return; }
     NSString *canonical = SGAutomaticSpotifyURL(url);
     if (!canonical) return;
-    if (self.busy) {
+    if (self.busy || self.pending || self.waitingForPC) {
+        if ([canonical isEqual:self.pending[@"url"]] || [canonical isEqual:self.resumeURL]) {
+            if (!self.busy) [self resume]; else [self update:@"Cette sélection est déjà en cours."];
+            return;
+        }
         if ([canonical isEqual:self.activeCollection]) { [self update:@"Cette sélection est déjà en cours."]; return; }
         if ([self.queuedURLs containsObject:canonical]) { [self update:@"Cette sélection est déjà dans la file d'attente."]; return; }
         if (![canonical isEqual:self.activeCollection] && ![self.queuedURLs containsObject:canonical]) {
             if (self.queuedURLs.count >= 10) { [self update:@"Dix sélections sont déjà en attente."]; return; }
             self.queuedURLs = [self.queuedURLs arrayByAddingObject:canonical];
             [NSUserDefaults.standardUserDefaults setObject:self.queuedURLs forKey:queueKey];
+            [self persistIntent];
         }
         [self update:@"Sélection ajoutée à la file. Le téléchargement en cours continue."]; return;
     }
-    self.userPaused = NO;
+    self.userPaused = NO; self.interrupted = NO; self.reconnectTicket++;
     if (![[NSUserDefaults.standardUserDefaults stringForKey:modeKey] isEqual:@"pc"]) { self.pending = nil; [self startDevice:canonical]; return; }
     self.devicePendingURL = nil;
     [NSUserDefaults.standardUserDefaults removeObjectForKey:@"spotifyglass.automaticDownloads.pendingDevice"];
-    NSMutableDictionary *request = [@{@"url":canonical, @"request_id":NSUUID.UUID.UUIDString} mutableCopy];
-    NSArray *tracks = self.registeredTracks[canonical];
-    if (tracks.count) request[@"track_urls"] = tracks;
-    self.pending = request;
+    self.pending = SGAutomaticDownloadRequest(canonical, self.registeredTracks[canonical], NO);
+    self.resumeURL = canonical;
+    [self persistIntent]; // before the first POST, including its idempotency key
     if (!self.root) { [self update:@"Associe le PC dans Options et nettoyage : la sélection sera ensuite envoyée automatiquement."]; return; }
     [self submitPending];
 }
 - (void)submitPending {
-    if (self.busy || !self.pending || !self.root) return;
+    if (self.busy || self.userPaused || !self.pending || !self.root) return;
+    if (!self.pcIdentityVerified) { self.waitingForPC = YES; [self attemptReconnect]; return; }
+    self.interrupted = NO; self.waitingForPC = NO;
     self.busy = YES; NSUInteger generation = ++self.generation;
     self.activeCollection = self.pending[@"url"]; [self beginBackgroundAllowance];
     NSURL *root = self.root;
@@ -590,11 +715,270 @@ static void tell(NSString *message) {
         request.HTTPBody = [NSJSONSerialization dataWithJSONObject:pending options:0 error:nil];
         NSDictionary *job = SGAutomaticJob([self json:request generation:generation]);
         if (!job || ![job[@"url"] isEqual:pending[@"url"]]) {
+            if (self.transportUnavailable) { [self waitForPC:generation]; return; }
             [self finish:@"Le PC n’a pas confirmé la demande. Reprendre réessaiera sans créer de doublon." generation:generation]; return;
         }
-        self.pending = nil;
+        if (generation != self.generation) return;
+        if ([pending[@"kind"] isEqual:@"alternative"]) {
+            if (![job[@"kind"] isEqual:@"alternative"]) { [self finish:@"Le PC n’a pas confirmé la recherche d’une autre version." generation:generation]; return; }
+            [self followAlternative:job root:root generation:generation]; return;
+        }
         [self saveJob:job];
+        dispatch_sync(dispatch_get_main_queue(), ^{ if (generation == self.generation) { self.pending = nil; [self persistIntent]; } });
+        if (generation != self.generation) return;
         [self follow:job root:root generation:generation];
+    });
+}
+- (void)refreshSelection:(NSString *)url {
+    if (self.busy || self.pending || self.waitingForPC) { tell(@"Termine ou mets la demande actuelle en pause avant d’actualiser cette sélection."); return; }
+    NSString *canonical = SGAutomaticSpotifyURL(url); if (!canonical) return;
+    if (![[NSUserDefaults.standardUserDefaults stringForKey:modeKey] isEqual:@"pc"]) {
+        tell(@"L’actualisation complète utilise le PC associé. Choisis le mode PC dans les options."); return;
+    }
+    self.userPaused = NO; self.interrupted = NO; self.resumeURL = canonical;
+    NSMutableDictionary *registered = [self.registeredTracks mutableCopy]; [registered removeObjectForKey:canonical]; self.registeredTracks = registered;
+    self.pending = SGAutomaticDownloadRequest(canonical, nil, YES);
+    [self persistIntent];
+    [self update:@"Nouvelle lecture de la sélection. Les fichiers déjà vérifiés seront réutilisés."];
+    if (self.root) [self submitPending]; else [self update:@"Associe le PC pour mettre à jour la sélection. Les fichiers actuels sont conservés."];
+}
+- (void)startAlternative:(NSDictionary *)row {
+    if (self.busy || self.pending || self.waitingForPC) { tell(@"Termine la demande actuelle ou annule-la avant de chercher une autre version."); return; }
+    if (!self.root || ![[NSUserDefaults.standardUserDefaults stringForKey:modeKey] isEqual:@"pc"]) { tell(@"Le choix d’une autre version utilise le PC associé. Choisis le PC dans les options."); return; }
+    NSString *url = SGAutomaticSpotifyURL(row[@"spotify"]); if (![url containsString:@"/track/"]) return;
+    NSMutableDictionary *request = [SGAutomaticDownloadRequest(url, nil, NO) mutableCopy];
+    request[@"kind"] = @"alternative";
+    NSString *source = row[@"source"];
+    if (!source && [row[@"sourceID"] isKindOfClass:NSString.class] && [row[@"sourceID"] length] == 11 &&
+        [row[@"sourceID"] rangeOfCharacterFromSet:[[NSCharacterSet characterSetWithCharactersInString:@"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"] invertedSet]].location == NSNotFound)
+        source = [@"https://music.youtube.com/watch?v=" stringByAppendingString:row[@"sourceID"]];
+    NSDictionary *validated = SGAutomaticDownloadIntent(@{@"version":@1, @"pending":@{@"url":url,
+        @"request_id":request[@"request_id"], @"kind":@"alternative", @"avoid_sources":source ? @[source] : @[]}});
+    request = [validated[@"pending"] mutableCopy];
+    if (!request) { tell(@"La source actuelle n’a pas pu être identifiée correctement."); return; }
+    self.pending = request; self.resumeURL = url; self.userPaused = NO; self.interrupted = NO; self.alternativeAcceptRequested = NO;
+    [self persistIntent]; [self update:@"Recherche d’une autre version. La copie actuelle reste disponible."];
+    [self submitPending];
+}
+- (void)followAlternative:(NSDictionary *)initial root:(NSURL *)root generation:(NSUInteger)generation {
+    NSDictionary *job = initial;
+    while (generation == self.generation) {
+        self.alternativeJob = job;
+        NSDictionary *row = [job[@"items"] firstObject];
+        if ([job[@"state"] isEqual:@"complete"] && [job[@"items"] count] == 1 &&
+            [row[@"state"] isEqual:@"ready"] && [row[@"spotify"] isEqual:self.pending[@"url"]]) {
+            self.activeSpotify = row[@"spotify"]; self.preparingAudio = YES;
+            NSString *reason = nil;
+            NSURL *file = SGAutomaticTransferFile(root, row, ^BOOL { return generation != self.generation; },
+                ^(NSURLSessionTask *task) { self.active = task; }, ^(NSUInteger received, NSUInteger total) {
+                    if (generation == self.generation && total) { self.transferProgress = MIN(0.98, (double)received / total); [self update:nil]; }
+                }, &reason);
+            self.active = nil; self.preparingAudio = NO;
+            if (generation != self.generation) { if (file) [NSFileManager.defaultManager removeItemAtURL:file error:nil]; return; }
+            if (!file) {
+                NSURLRequest *probe = [NSURLRequest requestWithURL:[root URLByAppendingPathComponent:@"hello"] cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:5];
+                [self json:probe generation:generation];
+                if (self.transportUnavailable) { [self waitForPC:generation]; return; }
+                [self finish:reason ?: @"La nouvelle version n’a pas été reçue. La copie actuelle est conservée." generation:generation]; return;
+            }
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+            AVURLAsset *asset = [AVURLAsset URLAssetWithURL:file options:nil];
+            double seconds = CMTimeGetSeconds(asset.duration);
+            BOOL valid = asset.playable && [asset tracksWithMediaType:AVMediaTypeAudio].count && isfinite(seconds) && fabs(seconds - [row[@"seconds"] doubleValue]) < 2;
+#pragma clang diagnostic pop
+            if (!valid || generation != self.generation) {
+                [NSFileManager.defaultManager removeItemAtURL:file error:nil];
+                if (generation == self.generation) [self finish:@"Cette version n’est pas lisible. La copie actuelle est conservée." generation:generation];
+                return;
+            }
+            self.candidateRow = row; self.candidateFile = file;
+            [self finish:@"Une nouvelle version est prête à écouter. La version actuelle n’a pas été remplacée." generation:generation];
+            dispatch_async(dispatch_get_main_queue(), ^{ if (generation == self.generation) {
+                if (self.alternativeAcceptRequested) [self acceptAlternative]; else [self showAlternative];
+            } });
+            return;
+        }
+        if ([@[@"complete", @"partial", @"error", @"interrupted"] containsObject:job[@"state"]]) {
+            NSString *reason = row[@"errorMessage"] ?: job[@"message"];
+            dispatch_sync(dispatch_get_main_queue(), ^{ if (generation == self.generation) { self.pending = nil; self.resumeURL = nil; self.alternativeJob = nil; [self persistIntent]; } });
+            [self finish:[NSString stringWithFormat:@"Aucune autre version prête. %@ La copie actuelle est conservée.", reason ?: @""] generation:generation]; return;
+        }
+        [self update:@"Recherche d’une autre version sur le PC. Tu pourras l’écouter avant de choisir."];
+        [NSThread sleepForTimeInterval:2];
+        if (generation != self.generation) return;
+        NSURL *url = [[root URLByAppendingPathComponent:@"jobs"] URLByAppendingPathComponent:job[@"id"]];
+        NSDictionary *next = SGAutomaticJob([self json:[NSURLRequest requestWithURL:url] generation:generation]);
+        if (!next || ![next[@"id"] isEqual:job[@"id"]] || ![next[@"kind"] isEqual:@"alternative"] || ![next[@"url"] isEqual:job[@"url"]]) {
+            if (self.transportUnavailable) [self waitForPC:generation];
+            else [self finish:@"Le suivi de la version est interrompu. La copie actuelle est conservée." generation:generation];
+            return;
+        }
+        job = next;
+    }
+}
+- (UIViewController *)documentInteractionControllerViewControllerForPreview:(UIDocumentInteractionController *)controller { return SGTopController(); }
+- (void)documentInteractionControllerDidEndPreview:(UIDocumentInteractionController *)controller {
+    self.candidatePreview = nil;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 300 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{ [self showAlternative]; });
+}
+- (void)showAlternative {
+    UIViewController *owner = SGTopController();
+    if (!self.candidateFile || !self.candidateRow || self.busy || !owner || owner.presentedViewController) return;
+    if (self.alternativeAcceptRequested) {
+        UIAlertController *confirmation = [UIAlertController alertControllerWithTitle:@"Confirmation en attente"
+            message:@"Ton choix a été enregistré. La connexion au PC permettra de terminer la confirmation et d'associer cette version à tes sélections locales."
+            preferredStyle:UIAlertControllerStyleAlert];
+        [confirmation addAction:[UIAlertAction actionWithTitle:@"Terminer la confirmation" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) { [self resume]; }]];
+        [confirmation addAction:[UIAlertAction actionWithTitle:@"Mettre en pause" style:UIAlertActionStyleCancel handler:^(UIAlertAction *action) { [self pause]; }]];
+        [owner presentViewController:confirmation animated:YES completion:nil]; return;
+    }
+    NSString *message = [NSString stringWithFormat:@"Écoute cette version avant de choisir. La copie actuelle reste disponible.\n\nAlbum : %@\nLe repère « Version » distingue cette copie de l’ancienne.", self.candidateRow[@"album"] ?: @""];
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:self.candidateRow[@"title"] message:message
+        preferredStyle:UIAlertControllerStyleActionSheet];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Écouter cette version" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        self.candidatePreview = [UIDocumentInteractionController interactionControllerWithURL:self.candidateFile];
+        self.candidatePreview.delegate = self;
+        if (![self.candidatePreview presentPreviewAnimated:YES]) { self.candidatePreview = nil; tell(@"L’aperçu audio n’a pas pu s’ouvrir. La version actuelle est conservée."); }
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Utiliser cette version" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        UIAlertController *confirm = [UIAlertController alertControllerWithTitle:@"Utiliser cette version ?"
+            message:@"Les sélections locales utiliseront cette version du morceau. L’ancien fichier sera conservé ; tu pourras le supprimer séparément dans Gérer les fichiers locaux."
+            preferredStyle:UIAlertControllerStyleAlert];
+        [confirm addAction:[UIAlertAction actionWithTitle:@"Annuler" style:UIAlertActionStyleCancel handler:^(UIAlertAction *a) { [self showAlternative]; }]];
+        [confirm addAction:[UIAlertAction actionWithTitle:@"Confirmer" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) { [self acceptAlternative]; }]];
+        [owner presentViewController:confirm animated:YES completion:nil];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Garder la version actuelle" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) { [self cancelAlternative]; }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Choisir plus tard" style:UIAlertActionStyleCancel handler:nil]];
+    sheet.popoverPresentationController.sourceView = owner.view; sheet.popoverPresentationController.sourceRect = owner.view.bounds;
+    [owner presentViewController:sheet animated:YES completion:nil];
+}
+- (void)cancelAlternative {
+    if (self.busy || self.alternativeAcceptRequested || ![self.pending[@"kind"] isEqual:@"alternative"]) return;
+    NSURL *file = self.candidateFile; self.candidateFile = nil; self.candidateRow = nil; self.alternativeJob = nil;
+    self.pending = nil; self.resumeURL = nil; self.waitingForPC = NO; self.reconnectTicket++; self.alternativeAcceptRequested = NO;
+    [self persistIntent];
+    if (file) dispatch_async(self.worker, ^{ [NSFileManager.defaultManager removeItemAtURL:file error:nil]; });
+    [self update:@"Version actuelle conservée."]; if (!self.userPaused) [self advanceQueue];
+}
+- (void)acceptAlternative {
+    if (self.busy || !self.candidateFile || !self.candidateRow || !self.alternativeJob || !self.root) return;
+    self.alternativeAcceptRequested = YES; self.userPaused = NO; [self persistIntent];
+    if (!self.pcIdentityVerified || self.waitingForPC) {
+        self.userPaused = NO; self.waitingForPC = YES; [self persistIntent]; [self attemptReconnect]; return;
+    }
+    self.busy = YES; self.interrupted = NO; self.userPaused = NO;
+    NSDictionary *candidate = self.candidateRow, *job = self.alternativeJob;
+    NSURL *file = self.candidateFile, *root = self.root;
+    NSUInteger generation = ++self.generation; [self beginBackgroundAllowance];
+    [self update:@"Vérification et confirmation de la nouvelle version."];
+    dispatch_async(self.worker, ^{
+        if (![fileHash(file) isEqual:candidate[@"id"]]) { [self finish:@"Le fichier de préécoute a changé. La version actuelle est conservée." generation:generation]; return; }
+        NSURL *directory = downloadsDirectory(); NSFileManager *fm = NSFileManager.defaultManager;
+        [fm createDirectoryAtURL:directory withIntermediateDirectories:NO attributes:nil error:nil];
+        NSNumber *link = nil, *dir = nil;
+        [directory getResourceValue:&link forKey:NSURLIsSymbolicLinkKey error:nil]; [directory getResourceValue:&dir forKey:NSURLIsDirectoryKey error:nil];
+        if (!dir.boolValue || link.boolValue || ![[directory URLByResolvingSymlinksInPath].URLByDeletingLastPathComponent.path isEqual:[directory.URLByDeletingLastPathComponent URLByResolvingSymlinksInPath].path]) {
+            [self finish:@"Le dossier local n’est pas disponible. La version actuelle est conservée." generation:generation]; return;
+        }
+        NSURL *target = [directory URLByAppendingPathComponent:[candidate[@"id"] stringByAppendingPathExtension:candidate[@"extension"] ?: @"mp3"]];
+        NSDictionary *attrs = [fm attributesOfItemAtPath:target.path error:nil];
+        BOOL installed = [attrs[NSFileType] isEqual:NSFileTypeRegular] && [attrs[NSFileSize] isEqual:candidate[@"bytes"]] && [fileHash(target) isEqual:candidate[@"id"]];
+        if (!installed && generation == self.generation) installed = [fm copyItemAtURL:file toURL:target error:nil];
+        if (!installed || generation != self.generation) { if (generation == self.generation) [self finish:@"La nouvelle version n’a pas pu être enregistrée. La copie actuelle reste active." generation:generation]; return; }
+        [fm setAttributes:@{NSFileProtectionKey:NSFileProtectionCompleteUntilFirstUserAuthentication} ofItemAtPath:target.path error:nil];
+        NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:[root URLByAppendingPathComponent:@"accept-version"]];
+        request.HTTPMethod = @"POST"; [request setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+        request.HTTPBody = [NSJSONSerialization dataWithJSONObject:@{@"job_id":job[@"id"], @"sha256":candidate[@"id"]} options:0 error:nil];
+        NSData *response = [self json:request generation:generation];
+        id accepted = response ? [NSJSONSerialization JSONObjectWithData:response options:0 error:nil] : nil;
+        if (generation != self.generation) return;
+        if (![accepted isKindOfClass:NSDictionary.class] || ![accepted[@"accepted"] isEqual:@YES] ||
+            ![accepted[@"sha256"] isEqual:candidate[@"id"]] || ![SGAutomaticSpotifyURL(accepted[@"spotify"]) isEqual:candidate[@"spotify"]]) {
+            if (self.transportUnavailable) { [self waitForPC:generation]; return; }
+            [self finish:@"Le PC n’a pas confirmé le choix. La copie actuelle reste active ; tu peux confirmer à nouveau sans créer de doublon." generation:generation]; return;
+        }
+        SGAutomaticLibraryRegister(candidate, target); markVerified(candidate);
+        NSDictionary *replacement = onPhone(candidate) ? SGAutomaticDownloadReplaceVersion(self.history, self.localRows, candidate) : nil;
+        if (!replacement) { [self finish:@"La nouvelle version n’a pas pu être associée. La copie actuelle reste disponible." generation:generation]; return; }
+        __block BOOL committed = NO;
+        dispatch_sync(dispatch_get_main_queue(), ^{
+            if (generation != self.generation) return;
+            self.localRows = replacement[@"locals"]; self.history = replacement[@"history"];
+            if (self.job[@"url"]) self.job = self.history[self.job[@"url"]] ?: self.job;
+            NSUserDefaults *prefs = NSUserDefaults.standardUserDefaults;
+            // The local association is authoritative on restart. Save it before
+            // history, which may still contain the previous hash after a crash.
+            [prefs setObject:self.localRows forKey:@"spotifyglass.automaticDownloads.localRows"];
+            [prefs setObject:self.history forKey:@"spotifyglass.automaticDownloads.history"];
+            [self remember:candidate]; [self.covers removeObjectForKey:candidate[@"spotify"]];
+            self.candidateFile = nil; self.candidateRow = nil; self.alternativeJob = nil; self.pending = nil; self.resumeURL = nil;
+            self.alternativeAcceptRequested = NO; committed = YES;
+            [self persistIntent];
+        });
+        if (!committed) return;
+        [fm removeItemAtURL:file error:nil];
+        [self finish:@"Nouvelle version choisie pour tes sélections locales. L’ancien fichier est conservé." generation:generation];
+    });
+}
+- (void)showPCStorage {
+    if (self.busy || !self.root) { tell(self.root ? @"Mets le transfert en pause pour consulter le stockage du PC." : @"Associe d’abord le PC dans les options."); return; }
+    self.busy = YES; self.reconnectTicket++; NSUInteger generation = ++self.generation;
+    if (!self.pcIdentityVerified) {
+        SGAutomaticDiscoverPC(self.root, ^(NSURL *found) {
+            if (generation != self.generation) return;
+            self.busy = NO;
+            if (!found) { [self update:@"Le PC n’est pas disponible. Le stockage de l’iPhone est inchangé."]; [self scheduleReconnect]; return; }
+            self.root = found; self.pcIdentityVerified = YES;
+            [NSUserDefaults.standardUserDefaults setObject:found.absoluteString forKey:pairKey];
+            if (UIApplication.sharedApplication.applicationState == UIApplicationStateActive) [self showPCStorage];
+        });
+        return;
+    }
+    NSURL *root = self.root;
+    [self update:@"Lecture du stockage du PC."];
+    dispatch_async(self.worker, ^{
+        NSData *data = [self json:[NSURLRequest requestWithURL:[root URLByAppendingPathComponent:@"storage"]] generation:generation];
+        id storage = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+        BOOL valid = [storage isKindOfClass:NSDictionary.class] && [storage[@"version"] isEqual:@1];
+        for (NSString *key in @[@"audio_bytes", @"audio_files", @"reclaimable_bytes", @"reclaimable_files", @"active_jobs"])
+            valid = valid && [storage[key] isKindOfClass:NSNumber.class] && isfinite([storage[key] doubleValue]) && [storage[key] doubleValue] >= 0 && [storage[key] doubleValue] <= 1e16;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (generation != self.generation) return;
+            self.busy = NO; [self update:nil];
+            if (!valid) { tell(@"Le stockage n’a pas pu être lu. Vérifie le PC et la version du compagnon."); [self scheduleReconnect]; return; }
+            UIViewController *owner = SGTopController(); if (!owner || owner.presentedViewController) { [self scheduleReconnect]; return; }
+            NSString *message = [NSString stringWithFormat:@"%@ fichiers audio · %@\n\nEspace récupérable : %@\n\nLe nettoyage conserve les fichiers liés aux sélections terminées. Aucun fichier de l’iPhone n’est supprimé.", storage[@"audio_files"],
+                [NSByteCountFormatter stringFromByteCount:[storage[@"audio_bytes"] longLongValue] countStyle:NSByteCountFormatterCountStyleFile],
+                [NSByteCountFormatter stringFromByteCount:[storage[@"reclaimable_bytes"] longLongValue] countStyle:NSByteCountFormatterCountStyleFile]];
+            UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"Stockage du PC" message:message preferredStyle:UIAlertControllerStyleAlert];
+            if ([storage[@"cleanup_available"] isEqual:@YES] && [storage[@"reclaimable_files"] unsignedIntegerValue])
+                [sheet addAction:[UIAlertAction actionWithTitle:@"Libérer les fichiers inutilisés" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) { [self cleanupPCStorage]; }]];
+            [sheet addAction:[UIAlertAction actionWithTitle:@"Fermer" style:UIAlertActionStyleCancel handler:^(UIAlertAction *action) { [self scheduleReconnect]; }]];
+            [owner presentViewController:sheet animated:YES completion:nil];
+        });
+    });
+}
+- (void)cleanupPCStorage {
+    if (self.busy || !self.root || !self.pcIdentityVerified) return;
+    self.busy = YES; NSUInteger generation = ++self.generation; NSURL *root = self.root;
+    [self update:@"Nettoyage des fichiers inutilisés sur le PC."];
+    dispatch_async(self.worker, ^{
+        NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:[root URLByAppendingPathComponent:@"storage/cleanup"]];
+        request.HTTPMethod = @"POST"; [request setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+        request.HTTPBody = [@"{}" dataUsingEncoding:NSUTF8StringEncoding];
+        NSData *data = [self json:request generation:generation];
+        id result = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+        BOOL valid = [result isKindOfClass:NSDictionary.class] && [result[@"removed_bytes"] isKindOfClass:NSNumber.class] &&
+            isfinite([result[@"removed_bytes"] doubleValue]) && [result[@"removed_bytes"] doubleValue] >= 0 && [result[@"removed_bytes"] doubleValue] <= 1e16;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (generation != self.generation) return;
+            self.busy = NO;
+            NSString *message = valid ? [NSString stringWithFormat:@"%@ libérés sur le PC. Les fichiers de l’iPhone sont conservés.",
+                [NSByteCountFormatter stringFromByteCount:[result[@"removed_bytes"] longLongValue] countStyle:NSByteCountFormatterCountStyleFile]] : @"Le PC n’a pas confirmé le nettoyage. Aucun fichier de l’iPhone n’a été supprimé.";
+            [self update:message]; tell(message); [self scheduleReconnect];
+        });
     });
 }
 - (NSDictionary *)importRow:(NSDictionary *)row root:(NSURL *)root generation:(NSUInteger)generation failure:(NSString **)failure {
@@ -666,6 +1050,11 @@ static void tell(NSString *message) {
             NSDictionary *installed = [self importRow:row root:root generation:generation failure:&transferFailure];
             if (!installed) {
                 if (generation == self.generation) {
+                    NSURLRequest *probe = [NSURLRequest requestWithURL:[root URLByAppendingPathComponent:@"hello"] cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:5];
+                    [self json:probe generation:generation];
+                    if (self.transportUnavailable) { [self waitForPC:generation]; return; }
+                }
+                if (generation == self.generation) {
                     NSMutableDictionary *errors = [self.importErrors mutableCopy] ?: [NSMutableDictionary dictionary];
                     errors[row[@"spotify"]] = transferFailure ?: @"Transfert échoué · toucher pour réessayer ou ajouter un fichier";
                     self.importErrors = errors;
@@ -696,12 +1085,15 @@ static void tell(NSString *message) {
         NSURL *url = [[root URLByAppendingPathComponent:@"jobs"] URLByAppendingPathComponent:job[@"id"]];
         NSDictionary *next = SGAutomaticJob([self json:[NSURLRequest requestWithURL:url] generation:generation]);
         if (!next || ![next[@"id"] isEqual:job[@"id"]] || ![next[@"url"] isEqual:job[@"url"]]) {
+            if (self.transportUnavailable) { [self waitForPC:generation]; return; }
+            self.interrupted = YES;
             [self finish:@"Suivi interrompu. Le PC peut continuer ; touche Reprendre pour récupérer les fichiers." generation:generation]; return;
         }
         job = next;
     }
 }
 - (void)importAudio:(NSURL *)source row:(NSDictionary *)row selection:(NSDictionary *)selection {
+    if ([self.pending[@"kind"] isEqual:@"alternative"]) { tell(@"Choisis ou annule d’abord la version proposée. La copie actuelle est conservée."); return; }
     if (self.busy) { tell(@"Arrête le transfert en cours avant d'ajouter un fichier."); return; }
     if (!source.isFileURL && !SGAutomaticAudioSource(source.absoluteString)) return;
     self.busy = YES; self.activeSpotify = row[@"spotify"];
@@ -750,14 +1142,28 @@ static void tell(NSString *message) {
 }
 - (void)resume {
     if (self.busy) return;
-    self.userPaused = NO;
+    self.userPaused = NO; self.interrupted = NO; self.reconnectTicket++;
+    [self persistIntent];
+    if (self.candidateFile) {
+        if (!self.pcIdentityVerified || self.waitingForPC) { self.waitingForPC = YES; [self attemptReconnect]; }
+        else if (self.alternativeAcceptRequested) [self acceptAlternative]; else [self showAlternative];
+        return;
+    }
     BOOL pc = [[NSUserDefaults.standardUserDefaults stringForKey:modeKey] isEqual:@"pc"];
-    NSString *selection = self.pending[@"url"] ?: self.devicePendingURL ?: self.job[@"url"];
+    NSString *selection = self.pending[@"url"] ?: self.devicePendingURL ?: self.resumeURL ?: self.job[@"url"];
     BOOL switchMode = (self.pending && !pc) || (self.devicePendingURL && pc) ||
         (!self.pending && !self.devicePendingURL && self.job && pc == [self.job[@"engine"] isEqual:@"device"]);
-    if (selection && switchMode) { [self start:selection]; return; }
+    if (selection && switchMode) {
+        if ([self.pending[@"kind"] isEqual:@"alternative"]) { tell(@"Le choix d’une autre version utilise le PC. Annule cette recherche avant de changer de mode."); return; }
+        self.pending = nil; self.waitingForPC = NO; [self persistIntent]; [self start:selection]; return;
+    }
+    if (pc && self.root && (!self.pcIdentityVerified || self.waitingForPC) && (selection || self.resumeURL || self.queuedURLs.count)) {
+        self.waitingForPC = YES; [self attemptReconnect]; return;
+    }
     if (self.pending) { [self submitPending]; return; }
     if (self.devicePendingURL) { [self startDevice:self.devicePendingURL]; return; }
+    if (!self.resumeURL && self.queuedURLs.count) { [self advanceQueue]; return; }
+    if (!self.job && self.resumeURL) { [self start:self.resumeURL]; return; }
     if ([self.job[@"engine"] isEqual:@"device"]) {
         // Cleanup retains only downloaded rows. Reload the playlist on an
         // explicit retry instead of repeatedly processing that ready subset.
@@ -770,20 +1176,23 @@ static void tell(NSString *message) {
     }
     if (!self.job && self.queuedURLs.count) { [self advanceQueue]; return; }
     if (!self.job || !self.root) { [self update:@"Connecte le PC puis utilise une flèche de téléchargement."]; return; }
-    if ([@[@"partial", @"error", @"complete", @"interrupted"] containsObject:self.job[@"state"]]) {
+    BOOL needsPreparation = NO;
+    for (NSDictionary *row in self.job[@"items"]) if (!onPhone(row) && ![row[@"state"] isEqual:@"ready"]) needsPreparation = YES;
+    if (needsPreparation && [@[@"partial", @"error", @"complete", @"interrupted"] containsObject:self.job[@"state"]]) {
         // A completed server job cannot retry itself. A fresh request reuses
         // verified PC files and asks the worker to prepare only missing ones.
         [self start:self.job[@"url"]]; return;
     }
     self.busy = YES; NSUInteger generation = ++self.generation;
-    self.activeCollection = self.job[@"url"]; [self beginBackgroundAllowance];
+    self.activeCollection = self.job[@"url"]; self.resumeURL = self.job[@"url"]; [self persistIntent]; [self beginBackgroundAllowance];
     NSDictionary *job = self.job; NSURL *root = self.root;
     dispatch_async(self.worker, ^{ [self follow:job root:root generation:generation]; });
 }
 - (void)pause {
     if (self.clearing) return;
-    self.userPaused = YES;
-    if (!self.busy) return;
+    self.userPaused = YES; self.interrupted = YES; self.reconnectTicket++;
+    [self persistIntent];
+    if (!self.busy) { [self update:@"En pause. La demande et les fichiers reçus sont conservés."]; return; }
     NSUInteger generation = ++self.generation;
     [self.active cancel];
     [(SGNativeAudioRequest *)self.resolverToken cancel];
@@ -797,16 +1206,24 @@ static void tell(NSString *message) {
 }
 - (void)clearUnfinished {
     if (self.clearing) return;
+    if (self.alternativeAcceptRequested && [self.pending[@"kind"] isEqual:@"alternative"]) {
+        tell(@"Une version a déjà été confirmée. Termine cette confirmation avec Reprendre avant de nettoyer les attentes ; tu peux la laisser en pause."); return;
+    }
     // Keep the engine unavailable until the cancelled worker has drained. This
     // prevents a late resolver/import completion from restoring deleted jobs.
     self.clearing = YES; self.busy = YES; self.userPaused = YES;
     NSUInteger generation = ++self.generation;
     [self.active cancel]; [(SGNativeAudioRequest *)self.resolverToken cancel];
+    NSURL *candidateFile = self.candidateFile;
+    self.candidateFile = nil; self.candidateRow = nil; self.alternativeJob = nil; self.alternativeAcceptRequested = NO;
     self.queuedURLs = @[]; self.pending = nil; self.devicePendingURL = nil;
+    self.resumeURL = nil; self.waitingForPC = NO; self.interrupted = YES; self.reconnectTicket++;
+    [self persistIntent];
     [NSUserDefaults.standardUserDefaults removeObjectForKey:queueKey];
     [NSUserDefaults.standardUserDefaults removeObjectForKey:@"spotifyglass.automaticDownloads.pendingDevice"];
     [self update:@"Nettoyage des attentes et des échecs…"];
     dispatch_async(self.worker, ^{
+        if (candidateFile) [NSFileManager.defaultManager removeItemAtURL:candidateFile error:nil];
         NSMutableDictionary *available = [NSMutableDictionary dictionary];
         for (NSString *key in self.localRows) if (verifyRow(self.localRows[key])) available[key] = self.localRows[key];
         NSDictionary *history = SGAutomaticClearUnfinishedHistory(self.history, available);
@@ -826,6 +1243,7 @@ static void tell(NSString *message) {
 - (void)deleteLocalFile:(NSDictionary *)item completion:(void (^)(BOOL, NSString *))completion {
     if (self.busy || self.clearing) { completion(NO, @"Mets les téléchargements en pause avant de supprimer un fichier."); return; }
     self.busy = YES; self.clearing = YES; self.userPaused = YES;
+    self.reconnectTicket++; [self persistIntent];
     NSUInteger generation = ++self.generation;
     [self update:@"Suppression du fichier sélectionné."];
     dispatch_async(self.worker, ^{
@@ -1047,7 +1465,10 @@ static void tell(NSString *message) {
 }
 - (NSString *)tableView:(UITableView *)table titleForFooterInSection:(NSInteger)section {
     if (section == 2 && self.queuedURLs.count) return @"Glisse une sélection vers la gauche pour la retirer de la file.";
-    return section == 1 && [self.displayJob[@"items"] count] && self.displayJob[@"completeMetadata"] && ![self.displayJob[@"completeMetadata"] boolValue] ? @"La liste accessible peut être incomplète." : nil;
+    if (section != 1 || ![self.displayJob[@"items"] count]) return nil;
+    return self.displayJob[@"completeMetadata"] && ![self.displayJob[@"completeMetadata"] boolValue] ?
+        @"La liste accessible peut être incomplète. Glisse un titre téléchargé vers la gauche pour changer de version." :
+        @"Glisse un titre téléchargé vers la gauche pour chercher une autre version et l’écouter avant de choisir.";
 }
 - (CGFloat)tableView:(UITableView *)table heightForRowAtIndexPath:(NSIndexPath *)path { return path.section == 0 && path.row == 0 ? 142 : 70; }
 - (UITableViewCell *)tableView:(UITableView *)table cellForRowAtIndexPath:(NSIndexPath *)path {
@@ -1067,7 +1488,9 @@ static void tell(NSString *message) {
     if (path.section == 0) {
         if (path.row == 0) {
             BOOL opening = engine.busy && engine.activeCollection && ![self.displayJob[@"url"] isEqual:engine.activeCollection];
-            NSString *title = total && !opening ? [NSString stringWithFormat:@"%lu / %lu sur l'iPhone", (unsigned long)ready, (unsigned long)total] : engine.busy ? @"Préparation en cours" : @"Prêt à télécharger";
+            NSString *title = total && !opening ? [NSString stringWithFormat:@"%lu / %lu sur l’iPhone", (unsigned long)ready, (unsigned long)total] : engine.busy ? @"Préparation en cours" : @"Prêt à télécharger";
+            if (engine.waitingForPC) title = engine.userPaused ? @"En pause" : @"En attente du PC";
+            else if (engine.candidateFile) title = @"Une version à écouter";
             NSString *mode = [[NSUserDefaults.standardUserDefaults stringForKey:modeKey] isEqual:@"pc"] ? @"Préparation sur le PC" : @"Préparation sur cet iPhone";
             NSString *counts = total && !opening ? [NSString stringWithFormat:@"%lu traités · %lu à vérifier", (unsigned long)processed, (unsigned long)failed] : @"Utilise la flèche d'une playlist ou ajoute un lien.";
             SGFillCell(cell, title, [NSString stringWithFormat:@"%@\n%@\n%@", mode, counts, engine.message ?: @""], nil, nil);
@@ -1083,6 +1506,8 @@ static void tell(NSString *message) {
         } else if (path.row == 1) {
             BOOL allReady = total && ready == total;
             NSString *title = engine.clearing ? @"Nettoyage en cours…" : engine.busy ? @"Mettre en pause" : allReady ? @"Écouter hors ligne" : self.displayJob || engine.devicePendingURL || engine.pending || engine.queuedURLs.count ? @"Reprendre la préparation" : @"Télécharger une sélection";
+            if (!engine.busy && engine.candidateFile) title = @"Écouter et choisir la version";
+            else if (!engine.busy && engine.waitingForPC) title = engine.userPaused ? @"Reprendre la connexion" : @"Mettre l’attente en pause";
             SGFillCell(cell, title, engine.busy ? @"Les morceaux terminés seront conservés" : nil, SGGreen(), engine.busy ? @"pause.circle.fill" : allReady ? @"play.circle.fill" : @"arrow.down.circle.fill");
         } else if (path.row == 2) SGFillCell(cell, @"Ajouter un lien Spotify", engine.busy ? @"Ajouter une sélection à la suite" : @"Un morceau ou une playlist", nil, @"plus.circle");
         else SGFillCell(cell, @"Options et nettoyage", @"Mode PC / iPhone · réessayer · nettoyer", nil, @"slider.horizontal.3");
@@ -1114,6 +1539,18 @@ static void tell(NSString *message) {
     }
 }
 - (UISwipeActionsConfiguration *)tableView:(UITableView *)table trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)path {
+    if (path.section == 1 && path.row < self.positions.count) {
+        NSUInteger index = [self.positions[path.row] unsignedIntegerValue];
+        if (index >= [self.displayJob[@"items"] count]) return nil;
+        NSDictionary *row = self.displayJob[@"items"][index];
+        if (!onPhone(row)) return nil;
+        UIContextualAction *version = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleNormal title:@"Changer de version" handler:^(UIContextualAction *action, UIView *view, void (^done)(BOOL)) {
+            done(NO); [SGAutomaticDownloads.shared startAlternative:row];
+        }];
+        version.backgroundColor = UIColor.systemIndigoColor;
+        UISwipeActionsConfiguration *configuration = [UISwipeActionsConfiguration configurationWithActions:@[version]];
+        configuration.performsFirstActionWithFullSwipe = NO; return configuration;
+    }
     if (path.section != 2 || path.row >= self.queuedURLs.count) return nil;
     NSString *url = self.queuedURLs[path.row];
     UIContextualAction *remove = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleDestructive title:@"Retirer" handler:^(UIContextualAction *action, UIView *view, void (^done)(BOOL)) {
@@ -1145,6 +1582,8 @@ static void tell(NSString *message) {
     if (path.row == 0) return;
     if (path.row == 2) { [self addLink]; return; }
     if (path.row == 3) { [self showActions:[table cellForRowAtIndexPath:path]]; return; }
+    if (engine.candidateFile && !engine.busy) { [engine resume]; return; }
+    if (engine.waitingForPC && !engine.userPaused && !engine.busy) { [engine pause]; return; }
     if (engine.busy) [engine pause];
     else if ([self.summary[@"total"] unsignedIntegerValue] && [self.summary[@"ready"] isEqual:self.summary[@"total"]]) [engine play:0];
     else if (engine.job || engine.devicePendingURL || engine.pending || engine.queuedURLs.count) [engine resume];
@@ -1165,9 +1604,20 @@ static void tell(NSString *message) {
     SGAutomaticDownloads *engine = SGAutomaticDownloads.shared;
     UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"Options" message:@"Le PC est conseillé pour préparer les grandes playlists. Les copies restent sur l'iPhone." preferredStyle:UIAlertControllerStyleActionSheet];
     UIAlertAction *mode = [UIAlertAction actionWithTitle:@"Choisir PC ou iPhone" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) { [self chooseMode:cell]; }];
-    mode.enabled = !engine.busy; [sheet addAction:mode];
+    mode.enabled = !engine.busy && ![engine.pending[@"kind"] isEqual:@"alternative"]; [sheet addAction:mode];
     UIAlertAction *retry = [UIAlertAction actionWithTitle:@"Réessayer les titres manquants" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) { [engine resume]; }];
     retry.enabled = !engine.busy && self.displayJob != nil; [sheet addAction:retry];
+    UIAlertAction *refresh = [UIAlertAction actionWithTitle:@"Mettre à jour la sélection" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) { [engine refreshSelection:self.displayJob[@"url"]]; }];
+    refresh.enabled = !engine.busy && !engine.pending && self.displayJob != nil; [sheet addAction:refresh];
+    UIAlertAction *storage = [UIAlertAction actionWithTitle:@"Stockage du PC" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) { [engine showPCStorage]; }];
+    storage.enabled = !engine.busy && engine.root != nil; [sheet addAction:storage];
+    if ([engine.pending[@"kind"] isEqual:@"alternative"]) {
+        if (engine.candidateFile) [sheet addAction:[UIAlertAction actionWithTitle:@"Écouter la version proposée" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) { [engine showAlternative]; }]];
+        if (!engine.alternativeAcceptRequested) {
+            UIAlertAction *cancel = [UIAlertAction actionWithTitle:@"Garder la version actuelle" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) { [engine cancelAlternative]; }];
+            cancel.enabled = !engine.busy; [sheet addAction:cancel];
+        }
+    }
     [sheet addAction:[UIAlertAction actionWithTitle:@"Nettoyer les téléchargements" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) { [engine clearUnfinished]; }]];
     UIAlertAction *files = [UIAlertAction actionWithTitle:@"Gérer les fichiers locaux" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
         SGShowPage(self, [SGAutomaticLocalFilesPage new]);
@@ -1237,9 +1687,10 @@ static void tell(NSString *message) {
         }]];
         [self presentViewController:alert animated:YES completion:nil];
     }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Rechercher à nouveau sur l'iPhone" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Rechercher à nouveau sur l’iPhone" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
         [engine repairRow:row selection:selection source:nil];
     }]];
+    if (engine.root) [sheet addAction:[UIAlertAction actionWithTitle:@"Chercher une autre version sur le PC" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) { [engine startAlternative:row]; }]];
     [sheet addAction:[UIAlertAction actionWithTitle:@"Annuler" style:UIAlertActionStyleCancel handler:nil]];
     sheet.popoverPresentationController.sourceView = cell ?: self.view;
     sheet.popoverPresentationController.sourceRect = cell ? cell.bounds : self.view.bounds;
@@ -1286,8 +1737,10 @@ void SGAutomaticDownloadRegisterTracks(id entity, NSArray *tracks) {
     }
     SGAutomaticDownloads *engine = SGAutomaticDownloads.shared;
     @synchronized (engine) {
+        if ([engine.registeredTracks[url] isEqual:canonical]) return;
         NSMutableDictionary *registered = [engine.registeredTracks mutableCopy]; registered[url] = [canonical copy]; engine.registeredTracks = registered;
     }
+    [engine persistIntent];
 }
 NSDictionary *SGAutomaticDownloadStatus(id entity) {
     NSString *url = SGAutomaticSpotifyURL(entity);
@@ -1310,12 +1763,15 @@ NSDictionary *SGAutomaticDownloadStatus(id entity) {
     }
     BOOL running = engine.busy && ([url isEqual:engine.activeCollection] || [url isEqual:engine.activeSpotify]);
     BOOL queued = [engine.queuedURLs containsObject:url];
+    BOOL waitingPC = engine.waitingForPC && ([url isEqual:engine.pending[@"url"]] || [url isEqual:engine.resumeURL]);
     BOOL complete = job[@"completeMetadata"] ? [job[@"completeMetadata"] boolValue] : ![job[@"engine"] isEqual:@"device"];
-    NSString *state = running ? @"running" : queued ? @"queued" : total && ready == total ? (complete ? @"ready" : @"incomplete") :
+    NSString *state = waitingPC ? (engine.userPaused ? @"paused" : @"queued") : running ? @"running" : queued ? @"queued" : total && ready == total ? (complete ? @"ready" : @"incomplete") :
+        engine.userPaused && [url isEqual:engine.resumeURL] ? @"paused" :
         [job[@"state"] isEqual:@"interrupted"] ? @"paused" : ready ? @"partial" : failed || engine.collectionErrors[url] ? @"error" : @"idle";
     double progress = total ? ((double)ready + (running ? engine.transferProgress : 0)) / total : 0;
     return @{@"state":state, @"completed":@(ready), @"total":@(total), @"progress":@(MIN(1, MAX(0, progress))),
         @"queuePosition":@(queued ? [engine.queuedURLs indexOfObject:url] + 1 : 0),
+        @"waitingForPC":@(waitingPC),
         @"completeMetadata":job[@"completeMetadata"] ?: @NO};
 }
 BOOL SGAutomaticDownloadEntity(id entity, UIView *source) {
@@ -1325,7 +1781,8 @@ BOOL SGAutomaticDownloadEntity(id entity, UIView *source) {
     dispatch_async(dispatch_get_main_queue(), ^{
         NSDictionary *saved = engine.history[url];
         if (engine.clearing) return;
-        BOOL current = engine.busy && [url isEqual:engine.activeCollection];
+        BOOL current = (engine.busy && [url isEqual:engine.activeCollection]) || [url isEqual:engine.pending[@"url"]] ||
+            (engine.waitingForPC && [url isEqual:engine.resumeURL]);
         BOOL queued = [engine.queuedURLs containsObject:url];
         if (!saved && !current && !queued && !engine.collectionErrors[url]) {
             [engine start:url]; [[[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight] impactOccurred]; return;
@@ -1335,6 +1792,7 @@ BOOL SGAutomaticDownloadEntity(id entity, UIView *source) {
         NSDictionary *status = SGAutomaticDownloadStatus(url);
         NSString *message = engine.collectionErrors[url] ?: [NSString stringWithFormat:@"%@/%@ morceaux sur l'iPhone", status[@"completed"], status[@"total"]];
         if (queued) message = [message stringByAppendingFormat:@"\nPosition %@ dans la file", status[@"queuePosition"]];
+        if ([status[@"waitingForPC"] boolValue]) message = [message stringByAppendingString:@"\nEn attente du PC. La demande est enregistrée."];
         if (saved[@"completeMetadata"] && ![saved[@"completeMetadata"] boolValue])
             message = [message stringByAppendingString:@"\nLa page publique peut ne fournir qu'une partie de la playlist."];
         UIAlertController *sheet = [UIAlertController alertControllerWithTitle:saved[@"name"] ?: @"Téléchargement" message:message preferredStyle:UIAlertControllerStyleActionSheet];
@@ -1342,16 +1800,21 @@ BOOL SGAutomaticDownloadEntity(id entity, UIView *source) {
             if (!engine.busy && saved) [engine selectJob:saved];
             if (![owner isKindOfClass:SGAutomaticDownloadsPage.class]) SGShowPage(owner, SGAutomaticDownloadsPageCreate());
         }]];
-        if (current) [sheet addAction:[UIAlertAction actionWithTitle:@"Mettre en pause" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) { [engine pause]; }]];
+        if (current) [sheet addAction:[UIAlertAction actionWithTitle:engine.userPaused ? @"Reprendre" : @"Mettre en pause" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+            if (engine.userPaused) [engine resume]; else [engine pause];
+        }]];
         else if (queued) [sheet addAction:[UIAlertAction actionWithTitle:@"Retirer de la file" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) { [engine removeQueued:url]; }]];
         else if (![status[@"state"] isEqual:@"ready"]) [sheet addAction:[UIAlertAction actionWithTitle:engine.busy ? @"Ajouter à la file" : @"Reprendre les titres manquants" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-            if (engine.busy || !saved) [engine start:url];
+            if (engine.busy || engine.pending || engine.waitingForPC || !saved) [engine start:url];
             else { [engine selectJob:saved]; [engine resume]; }
         }]];
-        if ([status[@"completed"] unsignedIntegerValue] && !engine.busy) [sheet addAction:[UIAlertAction actionWithTitle:@"Écouter les copies hors ligne" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        BOOL canSelect = !engine.pending && !engine.waitingForPC;
+        if ([status[@"completed"] unsignedIntegerValue] && !engine.busy && (canSelect || [engine.job[@"url"] isEqual:url])) [sheet addAction:[UIAlertAction actionWithTitle:@"Écouter les copies hors ligne" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
             [engine selectJob:saved];
+            if (![engine.job[@"url"] isEqual:url]) return;
             NSArray *rows = engine.job[@"items"]; for (NSUInteger i = 0; i < rows.count; i++) if (onPhone(rows[i])) { [engine play:i]; break; }
         }]];
+        if (saved && !engine.busy && !engine.pending && !queued) [sheet addAction:[UIAlertAction actionWithTitle:@"Mettre à jour la sélection" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) { [engine refreshSelection:url]; }]];
         [sheet addAction:[UIAlertAction actionWithTitle:@"Fermer" style:UIAlertActionStyleCancel handler:nil]];
         sheet.popoverPresentationController.sourceView = source ?: owner.view;
         sheet.popoverPresentationController.sourceRect = source ? source.bounds : owner.view.bounds;
@@ -1371,7 +1834,8 @@ void SGAutomaticListLocalFiles(void (^completion)(NSArray<NSDictionary *> *, NSS
             dispatch_async(dispatch_get_main_queue(), ^{
                 engine.busy = NO; engine.clearing = NO;
                 [engine update:engine.message];
-                completion(items, items.count ? @"Touche un fichier ou glisse vers la gauche pour le supprimer de l’iPhone." : @"Aucun fichier audio local trouvé.");
+                completion(items, items.count ? @"Touche un fichier ou glisse vers la gauche pour le supprimer de l'iPhone." : @"Aucun fichier audio local trouvé.");
+                [engine scheduleReconnect];
             });
         });
     });
