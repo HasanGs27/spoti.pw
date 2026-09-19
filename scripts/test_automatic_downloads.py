@@ -8,7 +8,9 @@ import subprocess
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 from collections import Counter
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.request import Request, urlopen
@@ -16,8 +18,9 @@ from urllib.error import HTTPError
 from http.server import ThreadingHTTPServer
 from PIL import Image
 from mutagen.mp3 import MP3
+from mutagen.mp4 import MP4, MP4Cover
 from mutagen.id3 import TIT2, TPE1, TALB, APIC
-from automatic_downloads import Queue, handler_for, lan_address, audio_record
+from automatic_downloads import Queue, handler_for, lan_address, audio_record, byte_range, file_stamp
 from download_metadata import canonical, collection
 from download_worker import acceptable, remember_audio, reusable_audio, finish_audio
 
@@ -54,6 +57,7 @@ class QueueTests(unittest.TestCase):
         cls.fixture = Path(cls.temp.name)/'fixture.mp3'
         ffmpeg = os.environ.get('SG_TEST_FFMPEG') or shutil.which('ffmpeg')
         if not ffmpeg: raise RuntimeError('Set SG_TEST_FFMPEG before these audio integration tests.')
+        cls.ffmpeg = ffmpeg
         subprocess.run([ffmpeg,'-v','error','-f','lavfi','-i','sine=frequency=440:duration=3',
                         '-c:a','libmp3lame',str(cls.fixture)],check=True)
         cover = io.BytesIO(); Image.new('RGB',(32,32),'blue').save(cover,format='JPEG')
@@ -63,6 +67,13 @@ class QueueTests(unittest.TestCase):
         audio.tags.add(TALB(encoding=1,text=['']))
         audio.tags.add(APIC(encoding=1,mime='image/jpeg',type=3,data=cover.getvalue()))
         audio.save(v2_version=3)
+        cls.m4a_fixture = Path(cls.temp.name)/'fixture.m4a'
+        subprocess.run([ffmpeg,'-v','error','-f','lavfi','-i','sine=frequency=550:duration=3',
+                        '-c:a','aac',str(cls.m4a_fixture)], check=True)
+        audio = MP4(cls.m4a_fixture)
+        audio['\xa9nam'], audio['\xa9ART'], audio['\xa9alb'] = ['AAC track'], ['AAC artist'], ['AAC album']
+        audio['covr'] = [MP4Cover(cover.getvalue(), imageformat=MP4Cover.FORMAT_JPEG)]
+        audio.save()
     @classmethod
     def tearDownClass(cls): cls.temp.cleanup()
     def setUp(self):
@@ -92,6 +103,227 @@ class QueueTests(unittest.TestCase):
         job = queue.submit(request)
         queue.pool.submit(lambda: None).result(timeout=10)
         return queue.snapshot(job['id'])
+    def m4a_queue(self, calls):
+        def prepare(url, folder):
+            calls.append(url)
+            target = folder/'audio.m4a'; shutil.copyfile(self.m4a_fixture, target)
+            return target, {'extension':'m4a', 'source':'synthetic AAC', 'quality':'AAC original',
+                            'sourceCodec':'mp4a.40.2', 'sourceBitrate':128}
+        return self.queue(prepare=prepare, resolve=lambda url, tracks:('Selection','test',tracks or [TRACK]))
+    @contextmanager
+    def http_service(self, queue):
+        server = ThreadingHTTPServer(('127.0.0.1', 0), handler_for(queue, '127.0.0.1', 0, 'x'*32))
+        server.RequestHandlerClass = handler_for(queue, '127.0.0.1', server.server_port, 'x'*32)
+        thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+        try: yield f'http://127.0.0.1:{server.server_port}/' + 'x'*32
+        finally:
+            server.shutdown(); server.server_close(); thread.join()
+    def test_m4a_validation_and_reuse_restart_preserve_format_and_encoded_bytes(self):
+        calls = []; queue = self.m4a_queue(calls)
+        first = self.settled(queue, {'url':TRACK, 'request_id':'aac-first-playlist', 'track_urls':[TRACK, TRACK]})
+        self.assertEqual(first['state'], 'complete')
+        self.assertEqual(calls, [TRACK])
+        expected = self.m4a_fixture.read_bytes()
+        for row in first['items']:
+            self.assertEqual((row['extension'], row['title'], row['artist'], row['album']), ('m4a', 'AAC track', 'AAC artist', 'AAC album'))
+            self.assertEqual((row['sourceCodec'], row['sourceBitrate']), ('mp4a.40.2', 128))
+            folder = Path(self.folder.name)/first['id']/str(row['position'])
+            self.assertEqual((folder/'audio.m4a').read_bytes(), expected)
+            self.assertFalse((folder/'audio.mp3').exists())
+        queue.pool.shutdown(wait=True)
+        restored = self.m4a_queue(calls)
+        second = self.settled(restored, {'url':TRACK, 'request_id':'aac-after-restart'})
+        self.assertEqual(calls, [TRACK])
+        row = second['items'][0]
+        self.assertEqual(row['id'], hashlib.sha256(expected).hexdigest())
+        self.assertEqual(row['extension'], 'm4a')
+        with self.http_service(restored) as origin:
+            with urlopen(origin+'/file/'+row['id']) as response:
+                self.assertEqual(response.headers['Content-Type'], 'audio/mp4')
+                self.assertEqual(response.read(), expected)
+    def test_audio_validation_rejects_wrong_extension_tags_cover_and_codec(self):
+        for fixture, extension in ((self.fixture, 'mp3'), (self.m4a_fixture, 'm4a')):
+            self.assertEqual(audio_record(fixture, {'extension':extension})['extension'], extension)
+            target = Path(self.folder.name)/('invalid.'+extension)
+            for corruption in ('title', 'artist', 'cover'):
+                shutil.copyfile(fixture, target)
+                if extension == 'mp3':
+                    audio = MP3(target)
+                    if corruption == 'cover':
+                        audio.tags.delall('APIC'); audio.tags.add(APIC(encoding=1,mime='image/jpeg',type=3,data=b'corrupt'*50))
+                    else: audio.tags.delall('TIT2' if corruption == 'title' else 'TPE1')
+                    audio.save()
+                else:
+                    audio = MP4(target)
+                    if corruption == 'cover': audio['covr'] = [MP4Cover(b'corrupt'*50, imageformat=MP4Cover.FORMAT_JPEG)]
+                    else: del audio['\xa9nam' if corruption == 'title' else '\xa9ART']
+                    audio.save()
+                with self.subTest(extension=extension, corruption=corruption), self.assertRaises(ValueError):
+                    audio_record(target, {'extension':extension})
+        for metadata in ({'extension':'../m4a'}, {'extension':'wav'}, {'extension':None}):
+            with self.assertRaises(ValueError): audio_record(self.fixture, metadata)
+        # An M4A declaration does not make MP3 bytes AAC, and vice versa.
+        from mutagen import MutagenError
+        for fixture, extension in ((self.fixture, 'm4a'), (self.m4a_fixture, 'mp3')):
+            with self.assertRaises((MutagenError, ValueError)):
+                audio_record(fixture, {'extension':extension})
+        incompatible = Path(self.folder.name)/'alac.m4a'
+        subprocess.run([self.ffmpeg, '-v', 'error', '-i', str(self.m4a_fixture), '-map', '0:a:0',
+                        '-c:a', 'alac', str(incompatible)], check=True)
+        # A valid M4A container alone does not qualify an unrequested codec.
+        with self.assertRaisesRegex(ValueError, 'Codec M4A'):
+            audio_record(incompatible, {'extension':'m4a'})
+    def test_worker_declared_filename_and_shared_cache_contract(self):
+        queue = self.cached_queue([])
+        folder = Path(self.folder.name).resolve()/'worker-contract'; folder.mkdir()
+        for extension in ('mp3', 'm4a'):
+            metadata = {'spotify':TRACK, 'extension':extension}
+            (folder/'audio-ready.json').write_text(json.dumps(metadata))
+            with patch('automatic_downloads.subprocess.run') as run:
+                target, returned = queue.worker(TRACK, folder)
+            self.assertEqual(target, folder/('audio.'+extension))
+            self.assertEqual(returned, metadata)
+            self.assertEqual(run.call_args.kwargs['timeout'], 240)
+            self.assertTrue(run.call_args.kwargs['check'])
+            self.assertEqual(run.call_args.kwargs['env']['SG_ARTWORK_CACHE_DIR'], str(queue.root/'.artwork-cache'))
+            self.assertEqual(run.call_args.kwargs['env']['SG_METADATA_CACHE_DIR'], str(queue.root/'.metadata-cache'))
+        for metadata in ({'spotify':OTHER, 'extension':'m4a'}, {'spotify':TRACK, 'extension':'../bad'}, {'spotify':TRACK, 'extension':'wav'}):
+            (folder/'audio-ready.json').write_text(json.dumps(metadata))
+            with patch('automatic_downloads.subprocess.run'), self.assertRaises(ValueError): queue.worker(TRACK, folder)
+    def test_legacy_mp3_without_extension_restores_and_serves_protocol_two(self):
+        queue = self.cached_queue([])
+        first = self.settled(queue, {'url':TRACK, 'request_id':'legacy-extension-first'})
+        first['items'][0].pop('extension')
+        queue.save(first); queue.pool.shutdown(wait=True)
+        restored = self.cached_queue([])
+        row = restored.snapshot(first['id'])['items'][0]
+        self.assertEqual((row['state'], row['extension']), ('ready', 'mp3'))
+        with self.http_service(restored) as origin:
+            with urlopen(origin+'/hello') as response: self.assertEqual(json.load(response)['version'], 2)
+            with urlopen(origin+'/file/'+row['id']) as response:
+                self.assertEqual(response.headers['Content-Type'], 'audio/mpeg')
+                self.assertEqual(response.read(), self.fixture.read_bytes())
+    def test_prepared_v2_m4a_repair_is_private_and_preserves_format(self):
+        queue = self.cached_queue([])
+        folder = Path(self.folder.name).resolve()/'repair-source'; folder.mkdir()
+        source = folder/'audio.m4a'; shutil.copyfile(self.m4a_fixture, source)
+        audio = MP4(source); del audio['covr']; audio.save()
+        marker = {'version':2, 'extension':'m4a', 'spotify':TRACK,
+                  'source':'https://music.youtube.com/watch?v=abcdefghijk', 'sha256':hashlib.sha256(source.read_bytes()).hexdigest(),
+                  'sourceCodec':'mp4a.40.2', 'sourceBitrate':128}
+        (folder/'prepared-audio.json').write_text(json.dumps(marker))
+        queue.remember_repair(TRACK, folder)
+        self.assertIn(TRACK, queue.repairable)
+        self.assertFalse(queue.files); self.assertFalse(queue.reusable)
+        target = folder.parent/'repair-target'; target.mkdir()
+        self.assertTrue(queue.seed_repair(TRACK, target))
+        self.assertEqual((target/'audio.m4a').read_bytes(), source.read_bytes())
+        self.assertFalse((target/'audio.mp3').exists())
+        self.assertEqual(json.loads((target/'prepared-audio.json').read_text()), marker)
+        self.assertFalse(MP4(target/'audio.m4a').get('covr'))
+        for change in ({'extension':'mp3'}, {'extension':'../m4a'}, {'extension':None}, {'version':1}, {'version':True}):
+            (folder/'prepared-audio.json').write_text(json.dumps(marker|change))
+            self.assertIsNone(queue.repair_record(TRACK, folder), change)
+        marker.pop('extension')
+        (folder/'prepared-audio.json').write_text(json.dumps(marker))
+        self.assertIsNone(queue.repair_record(TRACK, folder))
+    def test_prepared_legacy_v1_mp3_remains_repairable(self):
+        queue = self.cached_queue([])
+        folder = Path(self.folder.name).resolve()/'legacy-repair'; folder.mkdir()
+        shutil.copyfile(self.fixture, folder/'audio.mp3')
+        marker = {'version':1, 'spotify':TRACK, 'source':'https://music.youtube.com/watch?v=abcdefghijk',
+                  'sha256':hashlib.sha256(self.fixture.read_bytes()).hexdigest()}
+        (folder/'prepared-audio.json').write_text(json.dumps(marker))
+        queue.remember_repair(TRACK, folder)
+        target = folder.parent/'legacy-target'; target.mkdir()
+        self.assertTrue(queue.seed_repair(TRACK, target))
+        self.assertEqual((target/'audio.mp3').read_bytes(), self.fixture.read_bytes())
+        self.assertEqual(json.loads((target/'prepared-audio.json').read_text()), marker)
+    def test_bad_m4a_restore_is_isolated_from_other_ready_tracks(self):
+        queue = self.m4a_queue([])
+        first = self.settled(queue, {'url':TRACK, 'request_id':'aac-invalid-restore', 'track_urls':[TRACK, OTHER]})
+        queue.pool.shutdown(wait=True)
+        bad = Path(self.folder.name)/first['id']/'1'/'audio.m4a'
+        audio = MP4(bad); del audio['covr']; audio.save()
+        restored = self.m4a_queue([])
+        self.assertEqual([row['state'] for row in restored.snapshot(first['id'])['items']], ['error', 'ready'])
+        self.assertNotIn(TRACK, restored.reusable)
+        self.assertIn(OTHER, restored.reusable)
+    def test_byte_range_parser_bounds_suffixes_and_unsupported_units(self):
+        for header, expected in ((None, None), ('items=0-1', None), ('bytes=0-0', (0,0)),
+                                 ('bytes=3-', (3,9)), ('bytes=3-99', (3,9)), ('bytes=-2', (8,9)), ('bytes=-99', (0,9))):
+            self.assertEqual(byte_range(header, 10), expected)
+        for header in ('bytes=', 'bytes=-', 'bytes=-0', 'bytes=10-', 'bytes=5-2', 'bytes=0-1,3-4',
+                       'bytes=+1-2', 'bytes= 0-1', 'bytes='+'9'*600+'-'):
+            with self.subTest(header=header), self.assertRaises(ValueError): byte_range(header, 10)
+    def test_http_ranges_reconstruct_audio_with_etag_and_if_range_fallback(self):
+        queue = self.m4a_queue([])
+        done = self.settled(queue, {'url':TRACK, 'request_id':'ranged-m4a-request'})
+        row = done['items'][0]; data = self.m4a_fixture.read_bytes(); size = len(data)
+        etag = '"'+row['id']+'"'
+        with self.http_service(queue) as origin:
+            url = origin+'/file/'+row['id']
+            def fetch(headers):
+                with urlopen(Request(url, headers=headers)) as response:
+                    return response.status, response.headers, response.read()
+            status, headers, prefix = fetch({'Range':'bytes=0-1023'})
+            self.assertEqual((status, len(prefix), headers['Content-Range']), (206, 1024, f'bytes 0-1023/{size}'))
+            self.assertEqual((headers['ETag'], headers['Accept-Ranges']), (etag, 'bytes'))
+            status, headers, suffix = fetch({'Range':'bytes=1024-', 'If-Range':etag})
+            self.assertEqual(status, 206)
+            self.assertEqual(headers['Content-Length'], str(size-1024))
+            self.assertEqual(hashlib.sha256(prefix+suffix).hexdigest(), row['id'])
+            # A client that lost an ordinary 200 response can retain its prefix too.
+            with urlopen(url) as response:
+                interrupted_prefix = response.read(777)
+                interrupted_etag = response.headers['ETag']
+            status, _, resumed = fetch({'Range':'bytes=777-', 'If-Range':interrupted_etag})
+            self.assertEqual((status, interrupted_prefix+resumed), (206, data))
+            for range_value, expected in (('bytes=-31', data[-31:]), ('bytes=0-999999999', data),
+                                           (f'bytes={size-1}-', data[-1:])):
+                status, headers, actual = fetch({'Range':range_value})
+                self.assertEqual(status, 206); self.assertEqual(actual, expected)
+            for condition in ('"stale"', 'W/'+etag, 'Wed, 21 Oct 2015 07:28:00 GMT'):
+                status, headers, full = fetch({'Range':'bytes=1024-', 'If-Range':condition})
+                self.assertEqual((status, full), (200, data))
+                self.assertNotIn('Content-Range', headers)
+            for range_value in (f'bytes={size}-', 'bytes=0-1,4-7', 'bytes=-0', 'bytes=8-2'):
+                with self.assertRaises(HTTPError) as error: fetch({'Range':range_value})
+                self.assertEqual(error.exception.code, 416)
+                self.assertEqual(error.exception.headers['Content-Range'], f'bytes */{size}')
+                self.assertEqual(error.exception.headers['ETag'], etag)
+                self.assertEqual(error.exception.read(), b'')
+            for bad in (Request(url, headers={'Range':'bytes=0-1', 'Origin':'https://evil.example'}),
+                        Request(url, headers={'Range':'bytes=0-1', 'Host':'evil.example'}),
+                        Request(url.replace('x'*32, 'wrong'), headers={'Range':'bytes=0-1'})):
+                with self.assertRaises(HTTPError) as error: urlopen(bad)
+                self.assertEqual(error.exception.code, 404)
+            path = queue.files[row['id']][0]; original_stat = path.stat()
+            path.write_bytes(data[:-1]+bytes([data[-1]^1]))
+            os.utime(path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+            with self.assertRaises(HTTPError) as error: fetch({'Range':'bytes=1024-', 'If-Range':etag})
+            self.assertEqual(error.exception.code, 409)
+    def test_http_cannot_serve_outside_root_or_missing_registered_files(self):
+        queue = self.m4a_queue([])
+        done = self.settled(queue, {'url':TRACK, 'request_id':'ranged-path-boundary'})
+        row = done['items'][0]; ident = row['id']; original = queue.files[ident]
+        with self.assertRaises(ValueError): queue.register(ident, self.m4a_fixture.resolve(), 'm4a')
+        with self.http_service(queue) as origin:
+            request = Request(origin+'/file/'+ident, headers={'Range':'bytes=0-127'})
+            # Even an invalid in-memory cache entry may not expose an outside file.
+            queue.files[ident] = (self.m4a_fixture.resolve(), file_stamp(self.m4a_fixture.stat()), 'm4a')
+            with self.assertRaises(HTTPError) as error: urlopen(request)
+            self.assertEqual(error.exception.code, 409)
+            queue.files[ident] = original
+            original[0].unlink()
+            with self.assertRaises(HTTPError) as error: urlopen(request)
+            self.assertEqual(error.exception.code, 409)
+            try: original[0].symlink_to(self.m4a_fixture.resolve())
+            except OSError: pass # Windows may lack the optional symlink privilege.
+            else:
+                with self.assertRaises(HTTPError) as error: urlopen(request)
+                self.assertEqual(error.exception.code, 409)
+                original[0].unlink()
     def repair_worker(self, calls, downloads):
         cover = MP3(self.fixture).tags.getall('APIC')[0].data
         def prepare(url, folder):

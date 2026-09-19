@@ -9,6 +9,9 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
+import time
+import hashlib
 import tempfile
 import unittest
 from pathlib import Path
@@ -17,6 +20,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from PIL import Image
 from mutagen.mp3 import MP3
+from mutagen.mp4 import MP4, Atoms
 import download_worker as worker
 
 SOURCE = "https://music.youtube.com/watch?v=abcdef12345"
@@ -25,13 +29,16 @@ COVER = "https://i.scdn.co/image/test-fixture"
 
 
 def setUpModule():
-    global _test_profile, _home_patch
+    global _test_profile, _home_patch, _network_patch
     _test_profile = tempfile.TemporaryDirectory()
     _home_patch = patch.object(Path, "home", classmethod(lambda cls: Path(_test_profile.name)))
     _home_patch.start()
+    _network_patch = patch("requests.sessions.Session.send", side_effect=AssertionError("Offline tests must not request a network source"))
+    _network_patch.start()
 
 
 def tearDownModule():
+    _network_patch.stop()
     _home_patch.stop()
     _test_profile.cleanup()
 
@@ -53,6 +60,26 @@ def image_bytes(format="JPEG"):
 
 
 class MatchingTests(unittest.TestCase):
+    def test_candidate_fallbacks_are_distinct_bounded_and_keep_strict_rules(self):
+        second, third, fourth = [SOURCE[:-1]+x for x in ("6", "7", "8")]
+        good = result()
+        provider = SimpleNamespace(get_results=Mock(return_value=[
+            result(name="Bandolero Remix", url=fourth), good, good,
+            result(url=second, duration=186.5), result(url=third, duration=187),
+            result(url=fourth, duration=188)]))
+        values = list(worker.choose_sources(provider, song(), [], worker.Budget()))
+        self.assertEqual(values, [SOURCE, second, third])
+        self.assertEqual(provider.get_results.call_count, 1)
+        # A second query remains lazy and cannot retry a previously yielded URL.
+        expected = song(artists=["Moha La Squale", "Guest"])
+        first = result(name="Bandolero (feat. Guest)")
+        other = result(name="Bandolero (feat. Guest)", url=second)
+        provider.get_results = Mock(side_effect=[[first], [first, other]])
+        sources = worker.choose_sources(provider, expected, [])
+        self.assertEqual(next(sources), SOURCE)
+        self.assertEqual(provider.get_results.call_count, 1)
+        self.assertEqual(list(sources), [second])
+
     def test_explicit_spinall_alias_does_not_relax_other_identity_checks(self):
         expected = song(name="Dis Love", artists=["SPINALL", "Wizkid", "Tiwa Savage"], duration=155, explicit=False)
         base = dict(name="Dis Love (feat. Wizkid & Tiwa Savage)", artists=["DJ Spinall"], duration=155, explicit=False)
@@ -154,6 +181,55 @@ class FakeResponse:
 
 
 class CoverAndProgressTests(unittest.TestCase):
+    def setUp(self):
+        self.environment = patch.dict(os.environ, {"SG_ARTWORK_CACHE_DIR":"", "SG_METADATA_CACHE_DIR":""})
+        self.environment.start()
+        self.addCleanup(self.environment.stop)
+
+    def test_shared_cover_cache_revalidates_bytes_identity_and_age(self):
+        with tempfile.TemporaryDirectory() as name, patch.dict(os.environ, {"SG_ARTWORK_CACHE_DIR":str(Path(name).resolve())}):
+            image = image_bytes()
+            session = Mock(get=Mock(return_value=FakeResponse(image)))
+            self.assertEqual(worker.fetch_cover(COVER, session), (image, "image/jpeg"))
+            session.get.reset_mock()
+            self.assertEqual(worker.fetch_cover(COVER, session), (image, "image/jpeg"))
+            session.get.assert_not_called()
+            file = worker.cover_cache_file(COVER)
+            valid = json.loads(file.read_text(encoding="utf-8"))
+            for change in ({"sha256":"0"*64}, {"url":COVER+"wrong"}, {"savedAt":0}, {"data":"not base64"}):
+                file.write_text(json.dumps(valid | change), encoding="utf-8")
+                session.get.reset_mock()
+                self.assertEqual(worker.fetch_cover(COVER, session), (image, "image/jpeg"))
+                self.assertEqual(session.get.call_count, 1)
+            # A poisoned response cannot replace the previously valid cache entry.
+            file.write_text(json.dumps(valid | {"savedAt":0}), encoding="utf-8")
+            before = file.read_bytes()
+            with self.assertRaises(Exception): worker.fetch_cover(COVER, Mock(get=Mock(return_value=FakeResponse(b"<html>"))))
+            self.assertEqual(file.read_bytes(), before)
+            self.assertFalse(list(Path(name).glob("*.tmp")))
+
+    def test_cover_cache_concurrent_writes_are_atomic(self):
+        from concurrent.futures import ThreadPoolExecutor
+        with tempfile.TemporaryDirectory() as name, patch.dict(os.environ, {"SG_ARTWORK_CACHE_DIR":str(Path(name).resolve())}):
+            image = image_bytes()
+            target = worker.cover_cache_file(COVER)
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                list(pool.map(lambda _:worker.save_cached_cover(target, COVER, image), range(12)))
+            self.assertEqual(worker.cached_cover(target, COVER), (image, "image/jpeg"))
+            self.assertFalse(list(Path(name).glob("*.tmp")))
+
+    @unittest.skipUnless(os.name == "nt", "Windows Job Object regression")
+    def test_windows_bounded_children_keep_exit_codes_and_kill_descendants(self):
+        self.assertEqual(worker.run_bounded([sys.executable, "-c", "raise SystemExit(7)"], 5), 7)
+        with tempfile.TemporaryDirectory() as name:
+            target = Path(name)/"orphan.txt"
+            child = "import time,pathlib; time.sleep(1); pathlib.Path(" + repr(str(target)) + ").write_text('orphan')"
+            parent = "import subprocess,sys,time; subprocess.Popen([sys.executable,'-c'," + repr(child) + "],creationflags=0x08000000); time.sleep(10)"
+            with self.assertRaises(subprocess.TimeoutExpired):
+                worker.run_bounded([sys.executable, "-c", parent], .4)
+            time.sleep(1.1)
+            self.assertFalse(target.exists())
+
     def test_windows_ffmpeg_spawns_are_hidden_and_module_local(self):
         sync = Mock(return_value="sync child")
         asynchronous = AsyncMock(return_value="async child")
@@ -242,6 +318,12 @@ class AudioIntegrationTests(unittest.TestCase):
         if not cls.ffmpeg: raise RuntimeError("Set SG_TEST_FFMPEG for the synthetic MP3 integration tests.")
         subprocess.run([cls.ffmpeg, "-v", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=3",
                         "-c:a", "libmp3lame", str(cls.fixture)], check=True)
+        cls.aac = Path(cls.temp.name)/"fixture.m4a"
+        subprocess.run([cls.ffmpeg, "-v", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=3",
+                        "-c:a", "aac", "-b:a", "128k", str(cls.aac)], check=True)
+        cls.opus = Path(cls.temp.name)/"fixture.webm"
+        subprocess.run([cls.ffmpeg, "-v", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=3",
+                        "-c:a", "libopus", "-b:a", "128k", str(cls.opus)], check=True)
     @classmethod
     def tearDownClass(cls): cls.temp.cleanup()
     def setUp(self):
@@ -255,6 +337,109 @@ class AudioIntegrationTests(unittest.TestCase):
         data = self.file.read_bytes()
         offset = int(MP3(self.file).tags.size) if data.startswith(b"ID3") else 0
         return data[offset:]
+
+    def mdat(self, file):
+        with file.open("rb") as handle:
+            valid, data = Atoms(handle)[b"mdat"].read(handle)
+            self.assertTrue(valid)
+            return data
+
+    def test_original_aac_and_tags_keep_encoded_audio_and_cover_retry(self):
+        saved = worker.install_source(self.aac, {"sourceCodec":"mp4a.40.2"}, self.folder,
+                                      self.song, self.ffmpeg, worker.Budget())
+        self.assertEqual(saved.suffix, ".m4a")
+        self.assertEqual(saved.read_bytes(), self.aac.read_bytes())
+        worker.remember_audio(self.folder, self.song, SOURCE, "m4a", {"sourceCodec":"mp4a.40.2", "sourceBitrate":128})
+        before = saved.read_bytes()
+        with self.assertRaises(TimeoutError):
+            worker.finish_audio(saved, self.song, SOURCE, Mock(side_effect=TimeoutError("offline")))
+        self.assertEqual(saved.read_bytes(), before)
+        self.assertEqual(worker.reusable_audio(self.folder, self.song), SOURCE)
+        worker.finish_audio(saved, self.song, SOURCE, lambda _: (image_bytes(), "image/jpeg"))
+        self.assertEqual(self.mdat(saved), self.mdat(self.aac))
+        audio = worker.verify_audio(saved, 3)
+        self.assertEqual(worker.audio_labels(audio, "m4a"), {"title":self.song.name,"artist":"Moha La Squale","album":""})
+        self.assertEqual(worker.validate_cover(audio.tags["covr"][0]), "image/jpeg")
+        loader = Mock(side_effect=AssertionError("Valid cover should be reused"))
+        worker.finish_audio(saved, self.song, SOURCE, loader)
+        loader.assert_not_called()
+        self.assertEqual(self.mdat(saved), self.mdat(self.aac))
+        worker.remember_audio(self.folder, self.song, SOURCE, "m4a")
+        self.assertEqual(worker.reusable_audio(self.folder, self.song), SOURCE)
+        saved.write_bytes(saved.read_bytes()+b"changed")
+        self.assertIsNone(worker.reusable_audio(self.folder, self.song))
+
+    def test_best_opus_converts_once_and_original_mp3_is_not_reencoded(self):
+        file = worker.install_source(self.opus, {"sourceCodec":"opus"}, self.folder,
+                                     self.song, self.ffmpeg, worker.Budget())
+        self.assertEqual(file.suffix, ".mp3")
+        self.assertAlmostEqual(MP3(file).info.length, 3, delta=.1)
+        original = worker.install_source(self.fixture, {}, self.folder, self.song, self.ffmpeg, worker.Budget())
+        self.assertEqual(original.read_bytes(), self.fixture.read_bytes())
+        # A bad replacement can never clobber the last complete audio file.
+        before = original.read_bytes()
+        with self.assertRaises(worker.WorkerFailure):
+            worker.install_source(self.aac, {}, self.folder, song(duration=100), self.ffmpeg, worker.Budget())
+        self.assertEqual(original.read_bytes(), before)
+        self.assertFalse(list(self.folder.glob("prepared-*")))
+
+    def test_marker_v1_compatibility_and_invalid_extension_version_refusal(self):
+        marker = {"version":1,"spotify":TRACK,"source":SOURCE,"sha256":worker.file_digest(self.file)}
+        path = self.folder/"prepared-audio.json"
+        path.write_text(json.dumps(marker), encoding="utf-8")
+        self.assertEqual(worker.reusable_audio(self.folder, self.song), SOURCE)
+        for changes in ({"version":True}, {"version":3}, {"version":2,"extension":"../mp3"}, {"version":2}):
+            path.write_text(json.dumps(marker | changes), encoding="utf-8")
+            self.assertIsNone(worker.reusable_audio(self.folder, self.song))
+
+    def test_fallback_success_never_repeats_bad_source_and_rate_limit_stops(self):
+        second = SOURCE[:-1]+"6"
+        provider = SimpleNamespace(get_results=Mock(return_value=[result(duration=3), result(duration=3,url=second), result(duration=3)]))
+        calls = []
+        def download(url, folder, budget):
+            calls.append(url)
+            if url == SOURCE: raise RuntimeError("404 removed signed-token-secret")
+            raw = folder/("source-"+"b"*16)/"source.m4a"; raw.parent.mkdir()
+            shutil.copyfile(self.aac, raw)
+            return raw, {"source":url,"sourceCodec":"mp4a.40.2"}
+        with patch.object(worker, "download_source", side_effect=download):
+            selected, file, _ = worker.prepare_sources(provider, self.song, self.folder, self.ffmpeg, worker.Budget(), [], worker.Progress(self.folder))
+        self.assertEqual(selected, second)
+        self.assertEqual(calls, [SOURCE, second])
+        self.assertEqual(file.suffix, ".m4a")
+        self.assertFalse(list(self.folder.glob("source-*")))
+        failures = json.loads((self.folder/"attempts.json").read_text())
+        self.assertEqual(failures, [{"source":SOURCE,"code":"unavailable","transient":False}])
+        self.assertNotIn("secret", str(failures))
+        with patch.object(worker, "download_source", side_effect=RuntimeError("429 too many requests")) as fetch:
+            with self.assertRaises(worker.WorkerFailure) as failure:
+                worker.prepare_sources(provider, self.song, self.folder, self.ffmpeg, worker.Budget(), [], worker.Progress(self.folder))
+            self.assertTrue(failure.exception.stop)
+            self.assertEqual(fetch.call_count, 1)
+        with patch.object(worker, "download_source") as fetch:
+            with self.assertRaises(worker.WorkerFailure):
+                worker.prepare_sources(provider, self.song, self.folder, self.ffmpeg, worker.Budget(seconds=-1), [], worker.Progress(self.folder))
+            fetch.assert_not_called()
+
+    def test_download_helper_uses_best_source_without_m4a_preference(self):
+        import download_source
+        folder = self.folder/"helper"; folder.mkdir()
+        raw = folder/"source.m4a"; shutil.copyfile(self.aac, raw)
+        options = []
+        class Client:
+            def __init__(self, opts): options.append(opts)
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def extract_info(self, url, download):
+                return {"id":SOURCE.rsplit("=",1)[1],"ext":"m4a","acodec":"mp4a.40.2","abr":128,"duration":3}
+            def prepare_filename(self, info): return str(raw)
+        from spotdl.utils.formatter import args_to_ytdlp_options
+        parsed = args_to_ytdlp_options(["--ignore-config", "--retries", "1"], {})
+        with patch("yt_dlp.YoutubeDL", Client), patch("spotdl.utils.formatter.args_to_ytdlp_options", return_value=parsed):
+            download_source.fetch(SOURCE, folder.resolve(), 20)
+        self.assertEqual(options[0]["format"], "bestaudio/best")
+        self.assertIsNone(options[0]["cookiesfrombrowser"])
+        self.assertEqual(json.loads((folder/"source-info.json").read_text())["sourceCodec"], "mp4a.40.2")
 
     def test_missing_cover_repair_keeps_encoded_audio_and_metadata(self):
         before = self.encoded_audio()
@@ -311,33 +496,30 @@ class AudioIntegrationTests(unittest.TestCase):
                         id=TRACK.rsplit("/", 1)[1], isExplicit=True,
                         visualIdentity={"image": [{"maxWidth": 640, "url": COVER}]})
         provider = SimpleNamespace(get_results=Mock(return_value=[result(duration=3)]))
-        settings, downloads = [], []
-        def factory(options):
-            settings.append(options)
-            def download(request):
-                self.assertEqual(request.download_url, SOURCE)
-                downloads.append(request.url)
-                shutil.copyfile(self.fixture, self.file)
-                return request, self.file
-            return SimpleNamespace(audio_providers=[provider], download_song=download,
-                                   progress_handler=SimpleNamespace(close=lambda: None), errors=[])
+        downloads = []
+        def download(url, folder, budget):
+            self.assertEqual(url, SOURCE)
+            downloads.append(url)
+            raw = folder/("source-"+"a"*16)/"source.mp3"
+            raw.parent.mkdir(exist_ok=True)
+            shutil.copyfile(self.fixture, raw)
+            return raw, {"source":url, "sourceCodec":"mp3", "sourceBitrate":128}
         original_home = Path.__dict__["home"]
         args = SimpleNamespace(url=TRACK, ffmpeg=self.ffmpeg)
         try:
-            with patch("download_metadata.entity", return_value=metadata), patch("spotdl.download.downloader.Downloader", side_effect=factory), patch.object(worker, "downloader_arguments", return_value=""), patch.object(worker, "fetch_cover", side_effect=TimeoutError("offline")):
+            with patch("download_metadata.entity", return_value=metadata), patch.object(worker, "create_provider", return_value=(provider, Mock())), patch.object(worker, "download_source", side_effect=download), patch.object(worker, "fetch_cover", side_effect=TimeoutError("offline")):
                 with self.assertRaises(TimeoutError): worker.prepare(args, self.folder, worker.Progress(self.folder))
-            self.assertEqual(downloads, [TRACK])
+            self.assertEqual(downloads, [SOURCE])
             self.assertFalse((self.folder/"audio-ready.json").exists())
             self.assertTrue((self.folder/"prepared-audio.json").exists())
-            self.assertEqual(settings[0]["bitrate"], "auto")
-            self.assertTrue(settings[0]["skip_album_art"])
-            with patch("download_metadata.entity", return_value=metadata), patch("spotdl.download.downloader.Downloader", side_effect=AssertionError("Must reuse audio")), patch.object(worker, "fetch_cover", return_value=(image_bytes(), "image/jpeg")):
+            with patch("download_metadata.entity", return_value=metadata), patch.object(worker, "create_provider", side_effect=AssertionError("Must reuse audio")), patch.object(worker, "fetch_cover", return_value=(image_bytes(), "image/jpeg")):
                 worker.prepare(args, self.folder, worker.Progress(self.folder))
             record = json.loads((self.folder/"audio-ready.json").read_text(encoding="utf-8"))
             self.assertEqual(record["source"], SOURCE)
             self.assertEqual(record["spotify"], TRACK)
             self.assertAlmostEqual(record["seconds"], 3, delta=.1)
-            self.assertEqual(downloads, [TRACK])
+            self.assertEqual(downloads, [SOURCE])
+            self.assertEqual(record["extension"], "mp3")
         finally:
             Path.home = original_home
 

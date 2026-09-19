@@ -2,11 +2,14 @@
 import argparse
 import copy
 import hashlib
+import io
 import ipaddress
 import json
+import math
 import os
 import re
 import secrets
+import stat
 import subprocess
 import sys
 import threading
@@ -17,6 +20,8 @@ from pathlib import Path
 from urllib.parse import urlsplit
 from mutagen import MutagenError
 from mutagen.mp3 import MP3
+from mutagen.mp4 import MP4
+from PIL import Image
 from download_metadata import canonical, collection
 from download_worker import source_url
 
@@ -24,6 +29,68 @@ LIMIT = 100 * 1024 * 1024
 ACTIVE = {"queued", "resolving", "running"}
 PHASES = {'metadata', 'search', 'download', 'cover', 'verify'}
 FAILURES = {'network', 'unavailable', 'no_match', 'invalid_audio', 'cover', 'error'}
+
+
+def audio_extension(metadata):
+    # Protocol 2 originally had only MP3 and omitted this field.
+    value = metadata.get('extension', 'mp3')
+    if value not in ('mp3', 'm4a'): raise ValueError('Format audio invalide.')
+    return value
+
+
+def source_details(metadata):
+    result = {}
+    if isinstance(metadata.get('sourceCodec'), str): result['sourceCodec'] = metadata['sourceCodec'][:64]
+    value = metadata.get('sourceBitrate')
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and 0 < value <= 8000000:
+        result['sourceBitrate'] = value
+    return result
+
+
+def file_stamp(info):
+    # Python 3.12 on Windows can report creation time for stat().st_ctime
+    # but change time for fstat().st_ctime on the SAME file. Compare its stable
+    # identity/size/mtime there; the complete SHA still detects timestamp tampering.
+    return (info.st_size, info.st_mtime_ns, info.st_ctime_ns if os.name != 'nt' else 0, info.st_dev, info.st_ino)
+
+
+def bounded_digest(stream, size):
+    digest, remaining = hashlib.sha256(), size
+    while remaining:
+        chunk = stream.read(min(131072, remaining))
+        if not chunk: raise ValueError('Fichier audio incomplet.')
+        digest.update(chunk); remaining -= len(chunk)
+    if stream.read(1): raise ValueError('Le fichier audio a changé.')
+    return digest.hexdigest()
+
+
+def valid_cover(data):
+    if not isinstance(data, bytes) or not 24 <= len(data) <= 20 * 1024 * 1024: return False
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            if image.format not in ('JPEG', 'PNG') or not all(1 <= n <= 10000 for n in image.size) or image.width * image.height > 40000000:
+                return False
+            image.verify()
+        return True
+    except (ValueError, OSError, Image.DecompressionBombError): return False
+
+
+def byte_range(header, size):
+    """One bounded inclusive range; unknown units may be ignored per HTTP semantics."""
+    if header is None: return None
+    if len(header) > 512: raise ValueError('Plage invalide.')
+    if not header.startswith('bytes='): return None
+    match = re.fullmatch(r'bytes=([0-9]{0,20})-([0-9]{0,20})', header)
+    if not match or not any(match.groups()): raise ValueError('Plage invalide.')
+    first, last = match.groups()
+    if not first:
+        count = int(last)
+        if not count: raise ValueError('Plage vide.')
+        return max(0, size-count), size-1
+    start = int(first)
+    end = min(int(last), size-1) if last else size-1
+    if start >= size or start > end: raise ValueError('Plage hors fichier.')
+    return start, end
 
 
 def worker_document(path):
@@ -51,17 +118,38 @@ def lan_address(value):
 
 
 def audio_record(path, metadata):
-    if path.is_symlink() or not 1024 <= path.stat().st_size <= LIMIT:
+    extension = audio_extension(metadata)
+    before = path.stat()
+    if path.is_symlink() or not stat.S_ISREG(before.st_mode) or not 1024 <= before.st_size <= LIMIT:
         raise ValueError("Fichier audio invalide.")
-    audio = MP3(path)
-    if audio.info.length < 1 or not audio.tags or not audio.tags.getall("APIC"):
-        raise ValueError("Audio ou pochette manquant.")
     with path.open('rb') as stream:
-        digest = hashlib.file_digest(stream, 'sha256').hexdigest()
-    return {"id": digest, "bytes": path.stat().st_size, "seconds": round(audio.info.length, 3),
-        "title": str(audio.tags['TIT2']), "artist": str(audio.tags['TPE1']),
-        "album": str(audio.tags.get('TALB', '')), "cover": True,
+        if file_stamp(os.fstat(stream.fileno())) != file_stamp(before): raise ValueError('Le fichier audio a changé.')
+        audio = MP4(stream) if extension == 'm4a' else MP3(stream)
+        info = audio.info
+        if (not math.isfinite(info.length) or not 1 <= info.length <= 86400 or
+            not 8000 <= info.sample_rate <= 192000 or not 1 <= info.channels <= 8 or
+            not 0 < info.bitrate <= 8000000 or not audio.tags):
+            raise ValueError('Audio invalide ou métadonnées absentes.')
+        if extension == 'm4a':
+            if not info.codec.startswith('mp4a.'): raise ValueError('Codec M4A non pris en charge.')
+            title, artist, album = ((audio.tags.get(key) or [''])[0] for key in ('\xa9nam', '\xa9ART', '\xa9alb'))
+            covers = audio.tags.get('covr', [])
+        else:
+            if info.layer != 3: raise ValueError('Codec MP3 invalide.')
+            title, artist, album = (str(audio.tags.get(key, '')) for key in ('TIT2', 'TPE1', 'TALB'))
+            covers = [cover.data for cover in audio.tags.getall('APIC')]
+        if (not all(isinstance(value, str) and len(value) <= 4096 for value in (title, artist, album)) or
+            not title.strip() or not artist.strip() or not any(valid_cover(data) for data in covers)):
+            raise ValueError('Titre, artiste ou pochette manquant.')
+        stream.seek(0)
+        digest = bounded_digest(stream, before.st_size)
+        if file_stamp(os.fstat(stream.fileno())) != file_stamp(before) or file_stamp(path.stat()) != file_stamp(before):
+            raise ValueError('Le fichier audio a changé.')
+    record = {"id": digest, "bytes": before.st_size, "seconds": round(info.length, 3),
+        "title": title, "artist": artist, "album": album, "cover": True, "extension": extension,
         "source": metadata.get('source', ''), "quality": metadata.get('quality', '')}
+    record.update(source_details(metadata))
+    return record
 
 
 class Queue:
@@ -73,8 +161,9 @@ class Queue:
         self.reusable, self.repairable = {}, {}
         self.pool = ThreadPoolExecutor(max_workers=1)
         for path in self.root.glob('*/job.json'):
-            if not re.fullmatch('[a-f0-9]{32}', path.parent.name) or path.is_symlink(): continue
             try:
+                if (not re.fullmatch('[a-f0-9]{32}', path.parent.name) or path.is_symlink() or
+                    path.resolve() != path or path.stat().st_size > 8 * 1024 * 1024): continue
                 job = json.loads(path.read_text(encoding='utf-8'))
                 if job['id'] != path.parent.name: continue
                 if 'completeMetadata' not in job:
@@ -85,26 +174,37 @@ class Queue:
                 if job['state'] in ACTIVE:
                     job.update(state='interrupted', message='PC redémarré : relance ce téléchargement.')
                 for item in job.get('items', []):
+                    position = item.get('position')
+                    if isinstance(position, bool) or not isinstance(position, int) or not 1 <= position <= 500:
+                        raise ValueError('Position audio invalide.')
+                    folder = path.parent / str(position)
                     if item['state'] == 'ready':
-                        audio = path.parent / str(item['position']) / 'audio.mp3'
-                        record = audio_record(audio, item) if audio.is_file() else None
+                        record = None
+                        try:
+                            audio = folder / ('audio.' + audio_extension(item))
+                            if audio.is_file() and audio.resolve(strict=True) == audio:
+                                record = audio_record(audio, item)
+                        except (OSError, ValueError, KeyError, MutagenError): pass
                         if record and record['id'] == item['id']:
-                            self.register(item['id'], audio)
+                            self.register(item['id'], audio, record['extension'])
                             self.remember_audio(item['spotify'], audio, record)
+                            item.update(record)
                         else:
                             item.update(state='error', message='Fichier absent ou modifié sur le PC.')
                             job.update(state='partial', message='Certains fichiers ne sont plus disponibles sur le PC.')
                     if item['state'] != 'ready':
-                        self.remember_repair(item['spotify'], path.parent / str(item['position']))
+                        self.remember_repair(item['spotify'], folder)
                 self.jobs[job['id']] = job
                 self.save(job)
-            except (ValueError, KeyError, OSError, MutagenError): continue
+            except (ValueError, KeyError, TypeError, OSError, MutagenError): continue
 
-    def register(self, ident, path):
-        path = path.resolve(strict=True)
-        if not path.is_relative_to(self.root): raise ValueError('Chemin audio invalide.')
-        stat = path.stat()
-        self.files[ident] = (path, stat.st_size, stat.st_mtime_ns)
+    def register(self, ident, path, extension='mp3'):
+        if (path.is_symlink() or path.resolve(strict=True) != path or not path.is_relative_to(self.root) or
+            not re.fullmatch('[a-f0-9]{64}', ident) or extension not in ('mp3', 'm4a')):
+            raise ValueError('Chemin audio invalide.')
+        info = path.stat()
+        if not stat.S_ISREG(info.st_mode) or not 1024 <= info.st_size <= LIMIT: raise ValueError('Fichier audio invalide.')
+        self.files[ident] = (path, file_stamp(info), extension)
 
     def remember_audio(self, url, path, record):
         url = canonical(url)
@@ -137,7 +237,8 @@ class Queue:
             record = audio_record(temporary, metadata)
             if record['id'] != metadata['id']:
                 raise ValueError('Le fichier audio a changé.')
-            target = folder / 'audio.mp3'
+            target = folder / ('audio.' + record['extension'])
+            if target.is_symlink(): raise ValueError('Chemin audio invalide.')
             temporary.replace(target)
             return target, record
         except (OSError, ValueError, KeyError, MutagenError):
@@ -148,18 +249,26 @@ class Queue:
             if temporary is not None: temporary.unlink(missing_ok=True)
 
     def repair_record(self, url, folder):
-        """A matched but unfinished MP3 is never an entry in self.files/self.reusable."""
+        """Matched unfinished audio is never an entry in self.files/self.reusable."""
         try:
             url = canonical(url)
             if '/track/' not in url or folder.is_symlink() or folder.resolve(strict=True) != folder or not folder.is_relative_to(self.root):
                 return None
             marker = worker_document(folder / 'prepared-audio.json')
-            if (marker.get('version') != 1 or isinstance(marker.get('version'), bool) or
+            version = marker.get('version')
+            if (type(version) is not int or version not in (1, 2) or
                 canonical(marker.get('spotify')) != url or
                 not isinstance(marker.get('source'), str) or not source_url(marker['source']) or
                 not isinstance(marker.get('sha256'), str) or not re.fullmatch('[a-f0-9]{64}', marker['sha256'])):
                 return None
-            path = folder / 'audio.mp3'
+            # Version 1 never represented M4A. Version 2 must declare its format.
+            if version == 1:
+                if marker.get('extension', 'mp3') != 'mp3': return None
+                extension = 'mp3'
+            else:
+                if 'extension' not in marker: return None
+                extension = audio_extension(marker)
+            path = folder / ('audio.' + extension)
             if path.is_symlink() or path.resolve(strict=True) != path or not 1024 <= path.stat().st_size <= LIMIT:
                 return None
             digest, size = hashlib.sha256(), 0
@@ -169,7 +278,10 @@ class Queue:
                     if size > LIMIT: return None
                     digest.update(chunk)
             if size < 1024 or digest.hexdigest() != marker['sha256']: return None
-            return path, {'version':1, 'spotify':url, 'source':source_url(marker['source']), 'sha256':marker['sha256']}, size
+            normalized = {'version':version, 'spotify':url, 'source':source_url(marker['source']), 'sha256':marker['sha256']}
+            if version == 2: normalized['extension'] = extension
+            normalized.update(source_details(marker))
+            return path, normalized, size
         except (OSError, ValueError, TypeError):
             return None
 
@@ -190,7 +302,7 @@ class Queue:
                 raise ValueError('Audio conservé modifié ou absent.')
             if folder.is_symlink() or folder.resolve(strict=True) != folder or not folder.is_relative_to(self.root):
                 raise ValueError('Dossier de réparation invalide.')
-            target, marker_path = folder / 'audio.mp3', folder / 'prepared-audio.json'
+            target, marker_path = folder / ('audio.' + audio_extension(marker)), folder / 'prepared-audio.json'
             if target.exists() or target.is_symlink() or marker_path.exists() or marker_path.is_symlink(): return False
             temporary = folder / ('repair-' + secrets.token_hex(8) + '.tmp')
             digest, size = hashlib.sha256(), 0
@@ -266,11 +378,12 @@ class Queue:
         with (folder / 'engine.log').open('w', encoding='utf-8') as log:
             subprocess.run([sys.executable, '-X', 'utf8', str(Path(__file__).with_name('download_worker.py')),
                 url, str(folder), '--ffmpeg', self.ffmpeg], stdout=log, stderr=subprocess.STDOUT,
-                timeout=240, check=True, env={**os.environ, 'SG_METADATA_CACHE_DIR':str(self.root / '.metadata-cache')},
+                timeout=240, check=True, env={**os.environ, 'SG_METADATA_CACHE_DIR':str(self.root / '.metadata-cache'),
+                    'SG_ARTWORK_CACHE_DIR':str(self.root / '.artwork-cache')},
                 creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
-        metadata = json.loads((folder / 'audio-ready.json').read_text(encoding='utf-8'))
-        if metadata['spotify'] != url: raise ValueError('Mauvaise identité audio.')
-        return folder / 'audio.mp3', metadata
+        metadata = worker_document(folder / 'audio-ready.json')
+        if metadata.get('spotify') != url: raise ValueError('Mauvaise identité audio.')
+        return folder / ('audio.' + audio_extension(metadata)), metadata
 
     def save_progress(self, job):
         # Caller holds self.lock: publish complete row changes and their counts together.
@@ -327,7 +440,7 @@ class Queue:
                     # was removed or changed between positions.
                     raise ValueError('Copie locale indisponible ou modifiée.')
                 with self.lock:
-                    self.register(record['id'], path)
+                    self.register(record['id'], path, record['extension'])
                     self.remember_audio(item['spotify'], path, record)
                     item.update(record, state='ready')
                     item.pop('message', None)
@@ -561,18 +674,59 @@ p{margin:8px 0;color:#b6c2ba}.connection{display:inline-flex;gap:8px;align-items
             ident = path.removeprefix(base + '/file/')
             with queue.lock: record = queue.files.get(ident)
             if not record or not re.fullmatch('[a-f0-9]{64}', ident): return self.reply(404, {})
-            source, size, stamp = record
+            source, stamp, extension = record
+            size, etag = stamp[0], '"' + ident + '"'
+            headers_sent = False
             try:
-                stat = source.stat()
-                if source.is_symlink() or source.resolve() != source or (stat.st_size,stat.st_mtime_ns) != (size,stamp):
-                    return self.reply(409,{})
+                if (source.is_symlink() or source.resolve(strict=True) != source or not source.is_relative_to(queue.root) or
+                    file_stamp(source.stat()) != stamp): return self.reply(409, {})
                 with source.open('rb') as stream:
-                    self.send_response(200)
-                    self.send_header('Content-Type','audio/mpeg')
-                    self.send_header('Content-Length',str(size))
+                    # Check the opened file as well as its path. Hashing is bounded to
+                    # the registered size and also catches same-size/mtime tampering.
+                    # The client verifies this same digest after joining a resumed file.
+                    if (file_stamp(os.fstat(stream.fileno())) != stamp or bounded_digest(stream, size) != ident or
+                        file_stamp(os.fstat(stream.fileno())) != stamp or file_stamp(source.stat()) != stamp):
+                        return self.reply(409, {})
+                    requested = self.headers.get_all('Range', [])
+                    try:
+                        if len(requested) > 1: raise ValueError('Plusieurs plages.')
+                        interval = byte_range(requested[0] if requested else None, size) if self.headers.get('If-Range') in (None, etag) else None
+                    except ValueError:
+                        self.send_response(416)
+                        self.send_header('Content-Range', f'bytes */{size}')
+                        self.send_header('Accept-Ranges', 'bytes')
+                        self.send_header('ETag', etag)
+                        self.send_header('Content-Length', '0')
+                        self.send_header('Cache-Control', 'no-store')
+                        self.end_headers()
+                        return
+                    start, end = interval if interval is not None else (0, size-1)
+                    remaining = end-start+1
+                    stream.seek(start)
+                    self.connection.settimeout(20)
+                    self.send_response(206 if interval is not None else 200)
+                    self.send_header('Content-Type', 'audio/mp4' if extension == 'm4a' else 'audio/mpeg')
+                    self.send_header('Content-Length', str(remaining))
+                    self.send_header('Accept-Ranges', 'bytes')
+                    self.send_header('ETag', etag)
+                    self.send_header('Cache-Control', 'no-store')
+                    self.send_header('X-Content-Type-Options', 'nosniff')
+                    self.send_header('Referrer-Policy', 'no-referrer')
+                    if interval is not None: self.send_header('Content-Range', f'bytes {start}-{end}/{size}')
+                    headers_sent = True
                     self.end_headers()
-                    while chunk := stream.read(131072): self.wfile.write(chunk)
-            except OSError: self.close_connection = True
+                    while remaining:
+                        chunk = stream.read(min(131072, remaining))
+                        if (not chunk or file_stamp(os.fstat(stream.fileno())) != stamp or
+                            source.is_symlink() or source.resolve(strict=True) != source or file_stamp(source.stat()) != stamp):
+                            raise ValueError('Fichier audio modifié pendant le transfert.')
+                        self.wfile.write(chunk)
+                        remaining -= len(chunk)
+            except (OSError, ValueError):
+                if not headers_sent:
+                    try: self.reply(409, {})
+                    except OSError: pass
+                self.close_connection = True
     return Handler
 
 
