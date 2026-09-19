@@ -560,6 +560,26 @@ static BOOL sameStat(const struct stat *a, const struct stat *b) {
         a->st_mtimespec.tv_sec == b->st_mtimespec.tv_sec && a->st_mtimespec.tv_nsec == b->st_mtimespec.tv_nsec &&
         a->st_ctimespec.tv_sec == b->st_ctimespec.tv_sec && a->st_ctimespec.tv_nsec == b->st_ctimespec.tv_nsec;
 }
+NSDictionary *SGAutomaticLibraryDeletionItem(NSDictionary *readyRow) {
+    if (!rowKey(readyRow) || ![readyRow[@"state"] isEqual:@"ready"]) return nil;
+    NSNumber *bytes = readyRow[@"bytes"];
+    if (![bytes isKindOfClass:NSNumber.class] || CFGetTypeID((__bridge CFTypeRef)bytes) == CFBooleanGetTypeID()) return nil;
+    double count = bytes.doubleValue;
+    if (!isfinite(count) || count < 1024 || count > libraryLimit || floor(count) != count) return nil;
+    NSURL *file = SGAutomaticLibraryFile(readyRow);
+    NSString *path = relativePath(file), *extension = readyRow[@"extension"] ?: @"mp3";
+    NSArray *stamp = fileStamp(file);
+    if (!path || !validStamp(stamp) || ![file.pathExtension.lowercaseString isEqual:extension] || ![stamp[0] isEqual:bytes]) return nil;
+    // Hash only this resolved file, then recheck its physical identity and mapping.
+    // Delete independently reopens every path component with O_NOFOLLOW and refuses
+    // a later replacement, so this snapshot never authorizes a newly resolved copy.
+    if (![fileHash(file, nil) isEqual:readyRow[@"id"]] || ![fileStamp(file) isEqual:stamp] ||
+        ![documentPath(path, YES).path isEqual:file.path] || ![SGAutomaticLibraryFile(readyRow).path isEqual:file.path]) return nil;
+    NSString *title = strictLabel(readyRow[@"title"]);
+    return @{@"path":[path copy], @"stamp":[stamp copy], @"bytes":stamp[0], @"extension":[extension copy],
+        @"title":title.length ? title : file.lastPathComponent.stringByDeletingPathExtension,
+        @"artist":strictLabel(readyRow[@"artist"]) ?: @"", @"album":strictLabel(readyRow[@"album"]) ?: @""};
+}
 BOOL SGAutomaticLibraryDelete(NSDictionary *item, NSError **error) {
     if (error) *error = nil;
     if (![item isKindOfClass:NSDictionary.class]) return deletionError(error, EINVAL, @"Ce fichier local n'est pas valide.");
@@ -800,8 +820,57 @@ int main(void) { @autoreleasepool {
     @synchronized(pathLock()) { pathSnapshot = nil; }
     assert(![SGAutomaticLibraryFile(keeperRow).path isEqual:external.path]);
     assert(!SGAutomaticLibraryFile(@{@"id":@"../escape", @"extension":@"mp3"}));
+    // Targeted selection deletion resolves one ready row without a library scan.
+    // A second identical physical copy is never selected by digest alone.
+    NSData *targetData = testTagged(@"Targeted Delete", @"Synthetic Artist", @"Album", YES);
+    NSURL *targetFile = testWrite(@"Targeted/selected.mp3", targetData);
+    NSURL *targetNeighbor = testWrite(@"Targeted/neighbor.mp3", targetData);
+    NSDictionary *targetRow = testRequest(targetFile);
+    SGAutomaticLibraryRegister(targetRow, targetFile);
+    NSDictionary *targetItem = SGAutomaticLibraryDeletionItem(targetRow);
+    assert([targetItem[@"path"] isEqual:@"Targeted/selected.mp3"] && validStamp(targetItem[@"stamp"]));
+    assert([targetItem[@"title"] isEqual:@"Targeted Delete"] && [targetItem[@"bytes"] isEqual:targetRow[@"bytes"]]);
+    assert(!SGAutomaticLibraryDeletionItem(nil) && !SGAutomaticLibraryDeletionItem(@{}));
+    NSMutableDictionary *badRow = [targetRow mutableCopy]; badRow[@"state"] = @"waiting";
+    assert(!SGAutomaticLibraryDeletionItem(badRow));
+    badRow[@"state"] = @"ready"; badRow[@"bytes"] = @([targetRow[@"bytes"] unsignedLongLongValue] + 1);
+    assert(!SGAutomaticLibraryDeletionItem(badRow));
+    badRow[@"bytes"] = @YES; assert(!SGAutomaticLibraryDeletionItem(badRow));
+    badRow[@"bytes"] = targetRow[@"bytes"];
+    badRow[@"id"] = [@"" stringByPaddingToLength:64 withString:@"f" startingAtIndex:0];
+    SGAutomaticLibraryRegister(badRow, targetFile); // deliberately stale/incorrect mapping
+    assert(!SGAutomaticLibraryDeletionItem(badRow));
+    assert([[NSData dataWithContentsOfURL:targetFile] isEqual:targetData]);
+    NSMutableData *targetChanged = [targetData mutableCopy]; ((uint8_t *)targetChanged.mutableBytes)[targetChanged.length - 40] ^= 1;
+    assert([targetChanged writeToURL:targetFile atomically:YES]);
+    assert([fm setAttributes:@{NSFileModificationDate:targetItem[@"stamp"][1]} ofItemAtPath:targetFile.path error:nil]);
+    assert(!SGAutomaticLibraryDeletionItem(targetRow)); // same length/mtime, different content
+    assert(!SGAutomaticLibraryDelete(targetItem, &deletion)); // the earlier snapshot is stale
+    assert([targetData writeToURL:targetFile atomically:YES]);
+    targetItem = SGAutomaticLibraryDeletionItem(targetRow); assert(targetItem);
+    beforeBytes = testDiskBytes();
+    assert(SGAutomaticLibraryDelete(targetItem, &deletion));
+    assert(![fm fileExistsAtPath:targetFile.path] && [[NSData dataWithContentsOfURL:targetNeighbor] isEqual:targetData]);
+    assert(beforeBytes - testDiskBytes() == [targetRow[@"bytes"] unsignedLongLongValue]);
+    assert(!SGAutomaticLibraryDeletionItem(targetRow)); // no fallback to the identical neighbor
+    // Unsafe stored mappings and a replaced leaf must not produce deletion authority.
+    NSString *targetKey = rowKey(targetRow);
+    @synchronized(pathLock()) {
+        NSMutableDictionary *paths = [pathSnapshot mutableCopy]; paths[targetKey] = @"Targeted/selected.mp3"; pathSnapshot = [paths copy];
+    }
+    assert([fm createSymbolicLinkAtPath:targetFile.path withDestinationPath:targetNeighbor.path error:nil]);
+    assert(!SGAutomaticLibraryDeletionItem(targetRow));
+    assert([[NSData dataWithContentsOfURL:targetNeighbor] isEqual:targetData]);
+    assert([fm removeItemAtURL:targetFile error:nil]);
+    assert([fm createDirectoryAtURL:targetFile withIntermediateDirectories:NO attributes:nil error:nil]);
+    assert(!SGAutomaticLibraryDeletionItem(targetRow));
+    @synchronized(pathLock()) {
+        NSMutableDictionary *paths = [pathSnapshot mutableCopy]; paths[targetKey] = @"../outside.mp3"; pathSnapshot = [paths copy];
+    }
+    assert(!SGAutomaticLibraryDeletionItem(targetRow));
+    assert([[NSData dataWithContentsOfURL:external] isEqual:bare]);
     [testDefaults removePersistentDomainForName:suite];
     assert([fm removeItemAtURL:root error:nil]);
-    puts("Audio library: PASS (true hashes, packet identity, covers, strict versions/albums, listing, cancellation, exact file deletion, stale and symlink protection)");
+    puts("Audio library: PASS (true hashes, packet identity, covers, strict versions/albums, listing, cancellation, targeted row snapshots, exact file deletion, stale and symlink protection)");
 } return 0; }
 #endif

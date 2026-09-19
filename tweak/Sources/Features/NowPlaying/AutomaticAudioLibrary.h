@@ -20,6 +20,11 @@ FOUNDATION_EXPORT NSDictionary *SGAutomaticLibraryReuse(NSURL *prepared, NSDicti
 // Listing reads metadata only: no full-file or packet hashing. Cancellation returns [].
 FOUNDATION_EXPORT NSArray<NSDictionary *> *SGAutomaticLibraryItems(BOOL (^cancelled)(void));
 
+// Builds one deletion snapshot without scanning the library. Run on the serial worker:
+// the ready row's complete digest and byte count must still match its exact resolved
+// regular file. Returns nil for missing/changed files or unsafe paths. Does not delete.
+FOUNDATION_EXPORT NSDictionary *SGAutomaticLibraryDeletionItem(NSDictionary *readyRow);
+
 // Permanently deletes only the selected physical file after checking its saved stamp.
 // The caller obtains user confirmation. Stale entries, links and directories fail;
 // an identical copy at another path remains untouched. Run on the serial worker.

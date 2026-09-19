@@ -32,6 +32,7 @@ static NSString *const pairKey = @"spotifyglass.automaticDownloads.pair";
 static NSString *const modeKey = @"spotifyglass.automaticDownloads.mode";
 static NSString *const queueKey = @"spotifyglass.automaticDownloads.queue";
 static NSString *const intentKey = @"spotifyglass.automaticDownloads.intent.v1";
+static NSString *const selectionEditsKey = @"spotifyglass.automaticDownloads.selectionEdits.v1";
 static __weak id observedPlayer;
 
 static NSCache *verifiedFiles(void) {
@@ -123,6 +124,7 @@ static void afterSourceSheet(UIAlertController *sheet, void (^completion)(void))
 @property (atomic, copy) NSString *message;
 @property (atomic, copy) NSDictionary *job;
 @property (atomic, copy) NSDictionary *history;
+@property (atomic, copy) NSDictionary *selectionEdits;
 @property (atomic, copy) NSDictionary *pending;
 @property (atomic, copy) NSDictionary *localRows;
 @property (atomic, copy) NSDictionary *importErrors;
@@ -163,10 +165,12 @@ static void afterSourceSheet(UIAlertController *sheet, void (^completion)(void))
 - (void)update:(NSString *)message;
 - (void)connect:(NSString *)address;
 - (void)start:(NSString *)url;
+- (void)startUserSelection:(NSString *)url;
 - (void)resume;
 - (void)pause;
 - (void)clearUnfinished;
 - (void)deleteLocalFile:(NSDictionary *)item completion:(void (^)(BOOL, NSString *))completion;
+- (void)deleteSelection:(NSString *)url track:(NSString *)track completion:(void (^)(BOOL, NSString *))completion;
 - (void)removeQueued:(NSString *)url;
 - (void)play:(NSUInteger)position;
 - (void)submitPending;
@@ -222,14 +226,42 @@ static void afterSourceSheet(UIAlertController *sheet, void (^completion)(void))
         engine.userPaused = [intent[@"paused"] boolValue];
         engine.resumeURL = intent[@"activeURL"] ?: engine.pending[@"url"];
         engine.registeredTracks = intent[@"tracks"] ?: @{};
+        engine.selectionEdits = SGAutomaticSelectionEdits([NSUserDefaults.standardUserDefaults objectForKey:selectionEditsKey]);
+        if (!engine.selectionEdits) {
+            engine.userPaused = YES;
+            engine.message = @"L’historique des suppressions est illisible. La préparation est suspendue pour conserver tes fichiers.";
+        }
         engine.collectionErrors = @{};
         engine.devicePendingURL = SGAutomaticSpotifyURL([NSUserDefaults.standardUserDefaults stringForKey:@"spotifyglass.automaticDownloads.pendingDevice"]);
+        // A crash after persisting an exclusion must not let an older queue or
+        // resume receipt recreate a selection that the user already removed.
+        NSMutableArray *restoredQueue = [engine.queuedURLs mutableCopy] ?: [NSMutableArray array];
+        NSMutableDictionary *restoredTracks = [engine.registeredTracks mutableCopy];
+        for (NSString *url in engine.selectionEdits) {
+            NSDictionary *edit = engine.selectionEdits[url];
+            if ([edit[@"all"] boolValue]) {
+                [restoredQueue removeObject:url]; [restoredTracks removeObjectForKey:url];
+                if ([engine.resumeURL isEqual:url]) engine.resumeURL = nil;
+                if ([engine.pending[@"url"] isEqual:url]) { engine.pending = nil; engine.alternativeAcceptRequested = NO; }
+                if ([engine.devicePendingURL isEqual:url]) {
+                    engine.devicePendingURL = nil;
+                    [NSUserDefaults.standardUserDefaults removeObjectForKey:@"spotifyglass.automaticDownloads.pendingDevice"];
+                }
+            } else if (restoredTracks[url]) {
+                NSMutableArray *tracks = [restoredTracks[url] mutableCopy]; [tracks removeObjectsInArray:edit[@"tracks"]];
+                if (tracks.count) restoredTracks[url] = tracks; else [restoredTracks removeObjectForKey:url];
+            }
+        }
+        engine.queuedURLs = restoredQueue; engine.registeredTracks = restoredTracks;
+        [NSUserDefaults.standardUserDefaults setObject:restoredQueue forKey:queueKey];
+        [engine persistIntent];
         engine.root = SGDownloadRoot([NSUserDefaults.standardUserDefaults stringForKey:pairKey]);
         NSDictionary *stored = [NSUserDefaults.standardUserDefaults dictionaryForKey:@"spotifyglass.automaticDownloads.history"];
         NSMutableDictionary *valid = [NSMutableDictionary dictionary];
         for (id key in stored) {
             NSData *data = [NSJSONSerialization isValidJSONObject:stored[key]] ? [NSJSONSerialization dataWithJSONObject:stored[key] options:0 error:nil] : nil;
             NSDictionary *job = SGAutomaticJob(data);
+            job = engine.selectionEdits ? SGAutomaticApplySelectionEdits(job, engine.selectionEdits) : nil;
             if (job && [key isEqual:job[@"url"]]) valid[key] = job;
         }
         engine.history = valid;
@@ -357,6 +389,7 @@ static void afterSourceSheet(UIAlertController *sheet, void (^completion)(void))
 }
 - (void)saveJob:(NSDictionary *)job {
     job = [self merged:job];
+    if (!job) return;
     self.job = job;
     NSMutableDictionary *history = [self.history mutableCopy] ?: [NSMutableDictionary dictionary];
     history[job[@"url"]] = job;
@@ -365,6 +398,8 @@ static void afterSourceSheet(UIAlertController *sheet, void (^completion)(void))
     [NSUserDefaults.standardUserDefaults setObject:job[@"url"] forKey:@"spotifyglass.automaticDownloads.last"];
 }
 - (NSDictionary *)merged:(NSDictionary *)job {
+    if (!self.selectionEdits) return nil;
+    job = SGAutomaticApplySelectionEdits(job, self.selectionEdits);
     if (!job) return nil;
     NSMutableDictionary *available = [NSMutableDictionary dictionary];
     NSMutableSet *checked = [NSMutableSet set];
@@ -687,10 +722,22 @@ static void afterSourceSheet(UIAlertController *sheet, void (^completion)(void))
         });
     });
 }
+- (void)startUserSelection:(NSString *)url {
+    if (self.clearing || !self.selectionEdits) return;
+    NSString *canonical = SGAutomaticSpotifyURL(url); if (!canonical) return;
+    // Only an explicit arrow/link request may restore an entirely removed selection.
+    if ([self.selectionEdits[canonical][@"all"] boolValue]) {
+        NSMutableDictionary *edits = [self.selectionEdits mutableCopy]; [edits removeObjectForKey:canonical];
+        self.selectionEdits = edits; [NSUserDefaults.standardUserDefaults setObject:edits forKey:selectionEditsKey];
+    }
+    [self start:canonical];
+}
 - (void)start:(NSString *)url {
+    if (!self.selectionEdits) return;
     if (self.clearing) { [self update:@"Nettoyage en cours. Les fichiers téléchargés sont conservés."]; return; }
     NSString *canonical = SGAutomaticSpotifyURL(url);
     if (!canonical) return;
+    if ([self.selectionEdits[canonical][@"all"] boolValue]) return;
     if (self.busy || self.pending || self.waitingForPC) {
         if ([canonical isEqual:self.pending[@"url"]] || [canonical isEqual:self.resumeURL]) {
             if (!self.busy) [self resume]; else [self update:@"Cette sélection est déjà en cours."];
@@ -1157,6 +1204,7 @@ static void afterSourceSheet(UIAlertController *sheet, void (^completion)(void))
     });
 }
 - (void)resume {
+    if (!self.selectionEdits) return;
     if (self.busy) return;
     self.userPaused = NO; self.interrupted = NO; self.reconnectTicket++;
     [self persistIntent];
@@ -1254,6 +1302,137 @@ static void afterSourceSheet(UIAlertController *sheet, void (^completion)(void))
         if (last) [prefs setObject:last forKey:@"spotifyglass.automaticDownloads.last"];
         else [prefs removeObjectForKey:@"spotifyglass.automaticDownloads.last"];
         [self finish:@"Attentes et échecs retirés. Tes morceaux téléchargés sont conservés." generation:generation];
+    });
+}
+- (void)deleteSelection:(NSString *)url track:(NSString *)track completion:(void (^)(BOOL, NSString *))completion {
+    NSString *selectionURL = SGAutomaticSpotifyURL(url), *trackURL = track ? SGAutomaticSpotifyURL(track) : nil;
+    NSDictionary *edits = SGAutomaticSelectionEdit(self.selectionEdits, selectionURL, trackURL);
+    if (self.clearing || !self.selectionEdits || !selectionURL || (track && !trackURL) || !self.history[selectionURL] || !edits) {
+        completion(NO, @"La sélection a changé ou une suppression est en cours. Actualise puis réessaie."); return;
+    }
+    if (self.alternativeAcceptRequested) {
+        completion(NO, @"Termine la validation de la version choisie avant de supprimer une sélection."); return;
+    }
+    // Cancel first, then drain the shared serial worker before taking file and
+    // reference snapshots. A late importer cannot restore a deleted selection.
+    self.busy = YES; self.clearing = YES; self.userPaused = YES; self.interrupted = YES;
+    self.reconnectTicket++; NSUInteger generation = ++self.generation;
+    [self.active cancel]; [(SGNativeAudioRequest *)self.resolverToken cancel];
+    [self persistIntent]; [self update:@"Suppression de la sélection en cours…"];
+    dispatch_async(self.worker, ^{
+        // Variant completion forwards once more to main before saving its
+        // receipt. Drain both hops before deciding which files are shared.
+        dispatch_sync(dispatch_get_main_queue(), ^{});
+        dispatch_sync(dispatch_get_main_queue(), ^{});
+        NSDictionary *selected = [self merged:self.history[selectionURL]];
+        NSMutableArray *removedRows = [NSMutableArray array];
+        for (NSDictionary *row in selected[@"items"])
+            if (!trackURL || [row[@"spotify"] isEqual:trackURL]) [removedRows addObject:row];
+        if (!selected || (trackURL && !removedRows.count)) {
+            [self finish:@"Ce titre n'est plus dans cette sélection." generation:generation];
+            dispatch_async(dispatch_get_main_queue(), ^{ completion(NO, @"Ce titre n'est plus dans cette sélection."); }); return;
+        }
+        NSMutableDictionary *history = [self.history mutableCopy];
+        NSDictionary *remaining = SGAutomaticApplySelectionEdits(selected, edits);
+        if (remaining) history[selectionURL] = remaining; else [history removeObjectForKey:selectionURL];
+        NSMutableSet *protectedURLs = [NSMutableSet set], *protectedPaths = [NSMutableSet set];
+        void (^protect)(NSDictionary *) = ^(NSDictionary *row) {
+            if (row[@"spotify"]) [protectedURLs addObject:row[@"spotify"]];
+            NSURL *file = rowFile(row); if (file) [protectedPaths addObject:file.URLByStandardizingPath.path];
+            NSDictionary *local = self.localRows[row[@"spotify"] ?: @""];
+            file = rowFile(local); if (file) [protectedPaths addObject:file.URLByStandardizingPath.path];
+        };
+        for (NSDictionary *job in history.allValues) for (NSDictionary *row in job[@"items"]) protect(row);
+        for (NSString *other in self.registeredTracks) if (![other isEqual:selectionURL])
+            for (NSString *identity in self.registeredTracks[other]) protect(@{@"spotify":identity});
+        for (NSString *other in self.queuedURLs) if (![other isEqual:selectionURL] && [other containsString:@"/track/"]) protect(@{@"spotify":other});
+        if (![self.pending[@"url"] isEqual:selectionURL] && ![self.pending[@"kind"] isEqual:@"alternative"]) {
+            for (NSString *identity in self.pending[@"track_urls"]) protect(@{@"spotify":identity});
+            if ([self.pending[@"url"] containsString:@"/track/"]) protect(@{@"spotify":self.pending[@"url"]});
+        }
+        if (![self.resumeURL isEqual:selectionURL] && [self.resumeURL containsString:@"/track/"] && ![self.pending[@"kind"] isEqual:@"alternative"])
+            protect(@{@"spotify":self.resumeURL});
+        // Standalone personal imports and derived versions also own their file.
+        NSUserDefaults *prefs = NSUserDefaults.standardUserDefaults;
+        for (NSDictionary *record in SGLocalImportRecords([prefs arrayForKey:@"spotifyglass.localImports.records.v1"])) {
+            NSDictionary *target = record[@"target"];
+            BOOL removedTarget = [target[@"selection"] isEqual:selectionURL] && (!trackURL || [target[@"track"] isEqual:trackURL]);
+            if (record[@"installed"] && !removedTarget) protect(record[@"installed"]);
+        }
+        for (NSDictionary *record in SGAudioVariantRecords([prefs arrayForKey:@"spotifyglass.audioVariants.records.v1"]))
+            if (record[@"installed"]) protect(record[@"installed"]);
+        NSMutableDictionary *candidates = [NSMutableDictionary dictionary];
+        NSMutableSet *removedURLs = [NSMutableSet set];
+        for (NSDictionary *row in removedRows) {
+            NSString *identity = row[@"spotify"]; if (identity) [removedURLs addObject:identity];
+            for (NSDictionary *candidate in @[row, self.localRows[identity ?: @""] ?: @{}]) {
+                NSURL *file = rowFile(candidate);
+                if (file && ![protectedURLs containsObject:identity] && ![protectedPaths containsObject:file.URLByStandardizingPath.path])
+                    candidates[file.URLByStandardizingPath.path] = candidate;
+            }
+        }
+        // Persist the logical removal before touching files. A crash may leave
+        // a file to clean up, but cannot re-enqueue or restore the removed row.
+        self.selectionEdits = edits; self.history = history;
+        [prefs setObject:edits forKey:selectionEditsKey];
+        [prefs setObject:history forKey:@"spotifyglass.automaticDownloads.history"];
+        dispatch_sync(dispatch_get_main_queue(), ^{
+            NSMutableArray *queue = [self.queuedURLs mutableCopy]; [queue removeObject:selectionURL]; self.queuedURLs = queue;
+            NSMutableDictionary *registered = [self.registeredTracks mutableCopy];
+            [registered removeObjectForKey:selectionURL];
+            if ([remaining[@"items"] count]) registered[selectionURL] = [remaining[@"items"] valueForKey:@"spotify"];
+            self.registeredTracks = registered;
+            BOOL cancelAlternative = [self.pending[@"kind"] isEqual:@"alternative"] && [removedURLs containsObject:self.pending[@"url"]];
+            if ([self.pending[@"url"] isEqual:selectionURL] || cancelAlternative) self.pending = nil;
+            if ([self.devicePendingURL isEqual:selectionURL]) {
+                self.devicePendingURL = nil; [prefs removeObjectForKey:@"spotifyglass.automaticDownloads.pendingDevice"];
+            }
+            if ([self.resumeURL isEqual:selectionURL] || cancelAlternative) self.resumeURL = [remaining[@"items"] count] ? selectionURL : nil;
+            if (!self.pending && !self.resumeURL) self.waitingForPC = NO;
+            if (cancelAlternative) {
+                NSURL *file = self.candidateFile;
+                self.candidateFile = nil; self.candidateRow = nil; self.alternativeJob = nil;
+                if (file) dispatch_async(self.worker, ^{ [NSFileManager.defaultManager removeItemAtURL:file error:nil]; });
+            }
+            if ([self.job[@"url"] isEqual:selectionURL]) self.job = remaining;
+            if (self.job) [prefs setObject:self.job[@"url"] forKey:@"spotifyglass.automaticDownloads.last"];
+            else [prefs removeObjectForKey:@"spotifyglass.automaticDownloads.last"];
+            [prefs setObject:self.queuedURLs forKey:queueKey]; [self persistIntent];
+        });
+        NSMutableDictionary *localPaths = [NSMutableDictionary dictionary];
+        for (NSString *identity in self.localRows) {
+            NSString *path = rowFile(self.localRows[identity]).URLByStandardizingPath.path;
+            if (path) localPaths[identity] = path;
+        }
+        NSMutableSet *deletedPaths = [NSMutableSet set]; NSUInteger failures = 0, removedFiles = 0;
+        for (NSString *path in candidates) {
+            if (![NSFileManager.defaultManager fileExistsAtPath:path]) { [deletedPaths addObject:path]; continue; }
+            NSDictionary *item = SGAutomaticLibraryDeletionItem(candidates[path]);
+            if (item && SGAutomaticLibraryDelete(item, nil)) { [deletedPaths addObject:path]; removedFiles++; }
+            else failures++;
+        }
+        NSMutableDictionary *locals = [self.localRows mutableCopy], *errors = [self.importErrors mutableCopy];
+        for (NSString *identity in self.localRows) {
+            NSDictionary *row = self.localRows[identity];
+            NSString *path = localPaths[identity];
+            if ([deletedPaths containsObject:path ?: @""] ||
+                ([removedURLs containsObject:identity] && ![protectedURLs containsObject:identity] && !rowFile(row))) {
+                [locals removeObjectForKey:identity]; [self.covers removeObjectForKey:identity];
+                if (row[@"id"]) [verifiedFiles() removeObjectForKey:[row[@"id"] stringByAppendingPathExtension:row[@"extension"] ?: @"mp3"]];
+            }
+        }
+        for (NSString *identity in removedURLs) if (![protectedURLs containsObject:identity]) [errors removeObjectForKey:identity];
+        self.localRows = locals; self.importErrors = errors;
+        NSMutableDictionary *collectionErrors = [self.collectionErrors mutableCopy]; [collectionErrors removeObjectForKey:selectionURL]; self.collectionErrors = collectionErrors;
+        [prefs setObject:locals forKey:@"spotifyglass.automaticDownloads.localRows"];
+        [prefs setObject:errors forKey:@"spotifyglass.automaticDownloads.errors"];
+        self.verificationRevision++; [statusCounts() removeAllObjects];
+        NSString *message = [NSString stringWithFormat:@"%@ supprimé%@. %lu fichier(s) effacé(s) de l'iPhone. Les fichiers utilisés ailleurs sont conservés.",
+            trackURL ? @"Morceau" : @"Sélection", trackURL ? @"" : @"e", (unsigned long)removedFiles];
+        if (failures) message = [message stringByAppendingFormat:@" %lu fichier(s) n'ont pas pu être effacés : consulte Gérer les fichiers locaux.", (unsigned long)failures];
+        if (self.pending || self.resumeURL || self.queuedURLs.count) message = [message stringByAppendingString:@" Les préparations restantes sont en pause ; utilise Reprendre pour continuer."];
+        [self finish:message generation:generation];
+        dispatch_async(dispatch_get_main_queue(), ^{ completion(YES, message); });
     });
 }
 - (void)deleteLocalFile:(NSDictionary *)item completion:(void (^)(BOOL, NSString *))completion {
@@ -1367,6 +1546,7 @@ static void afterSourceSheet(UIAlertController *sheet, void (^completion)(void))
 @end
 
 @interface SGAutomaticDownloadsPage : SGPage <UIDocumentPickerDelegate>
+@property (nonatomic, copy) NSString *selectionURL;
 @property (nonatomic, strong) UIView *note;
 @property (nonatomic, strong) UISegmentedControl *filter;
 @property (nonatomic, strong) UIView *filterHeader;
@@ -1390,12 +1570,13 @@ static void afterSourceSheet(UIAlertController *sheet, void (^completion)(void))
 - (void)addLink;
 - (void)showActions:(UITableViewCell *)cell;
 - (void)fillCell:(UITableViewCell *)cell at:(NSIndexPath *)path;
+- (void)confirmDeleteSelection:(NSString *)url track:(NSString *)track title:(NSString *)title;
 @end
 @implementation SGAutomaticDownloadsPage
 - (instancetype)init { if ((self = [super initWithStyle:UITableViewStyleInsetGrouped])) self.title = @"Téléchargements"; return self; }
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.note = SGNote(@"Garde Spotify ouvert pendant la préparation. Les fichiers terminés restent disponibles hors ligne.");
+    self.note = SGNote(self.selectionURL ? @"Glisse un titre vers la gauche pour le supprimer de cette sélection. Les fichiers utilisés ailleurs sont conservés." : @"Garde Spotify ouvert pendant la préparation. Les fichiers terminés restent disponibles hors ligne.");
     self.tableView.tableHeaderView = self.note;
     self.filter = [[UISegmentedControl alloc] initWithItems:@[@"Tout", @"À compléter", @"Téléchargés"]];
     self.filter.selectedSegmentIndex = 0; self.filter.accessibilityLabel = @"Afficher les morceaux";
@@ -1417,13 +1598,14 @@ static void afterSourceSheet(UIAlertController *sheet, void (^completion)(void))
 - (void)refresh:(NSNotification *)note {
     if (note && !self.viewIfLoaded.window) return;
     SGAutomaticDownloads *engine = SGAutomaticDownloads.shared;
+    NSDictionary *sourceJob = self.selectionURL ? engine.history[self.selectionURL] : engine.job;
     NSString *oldURL = self.displayJob[@"url"];
     NSArray *oldPositions = self.positions, *oldHistory = self.historyURLs, *oldQueue = self.queuedURLs;
     // Progress ticks reuse immutable snapshots and never re-scan every audio file.
-    if (!self.summary || self.rawJob != engine.job || self.rawLocals != engine.localRows || self.rawErrors != engine.importErrors || self.verificationRevision != engine.verificationRevision || !note) {
-        self.rawJob = engine.job; self.rawLocals = engine.localRows; self.rawErrors = engine.importErrors;
+    if (!self.summary || self.rawJob != sourceJob || self.rawLocals != engine.localRows || self.rawErrors != engine.importErrors || self.verificationRevision != engine.verificationRevision || !note) {
+        self.rawJob = sourceJob; self.rawLocals = engine.localRows; self.rawErrors = engine.importErrors;
         self.verificationRevision = engine.verificationRevision;
-        self.displayJob = [engine merged:engine.job];
+        self.displayJob = [engine merged:sourceJob];
         NSMutableSet *ready = [NSMutableSet set], *checked = [NSMutableSet set];
         for (NSDictionary *row in self.displayJob[@"items"]) {
             NSString *url = row[@"spotify"];
@@ -1439,11 +1621,12 @@ static void afterSourceSheet(UIAlertController *sheet, void (^completion)(void))
         BOOL ready = [self.readyURLs containsObject:items[i][@"spotify"]];
         if (self.filter.selectedSegmentIndex == 0 || (self.filter.selectedSegmentIndex == 1 && !ready) || (self.filter.selectedSegmentIndex == 2 && ready)) [positions addObject:@(i)];
     }
-    self.positions = positions; self.queuedURLs = engine.queuedURLs ?: @[];
+    self.positions = positions; self.queuedURLs = self.selectionURL ? @[] : engine.queuedURLs ?: @[];
     self.displayHistory = engine.history;
     NSMutableArray *history = [[engine.history.allKeys sortedArrayUsingSelector:@selector(compare:)] mutableCopy];
-    [history removeObject:self.displayJob[@"url"] ?: @""]; self.historyURLs = history;
+    self.historyURLs = self.selectionURL ? @[] : history;
     self.filterTitle.text = self.displayJob[@"name"] ?: @"Mes morceaux";
+    if (self.selectionURL) self.title = self.displayJob[@"name"] ?: @"Sélection supprimée";
     BOOL sameSelection = [(oldURL ?: @"") isEqual:(self.displayJob[@"url"] ?: @"")];
     BOOL structural = !sameSelection || ![oldPositions isEqual:self.positions] || ![oldHistory isEqual:self.historyURLs] || ![oldQueue isEqual:self.queuedURLs];
     if (structural) {
@@ -1464,9 +1647,9 @@ static void afterSourceSheet(UIAlertController *sheet, void (^completion)(void))
     [super viewDidLayoutSubviews];
     if (CACurrentMediaTime() - self.lastInsetCheck > 0.7) { self.lastInsetCheck = CACurrentMediaTime(); SGInsetForBars(self.tableView); }
 }
-- (NSInteger)numberOfSectionsInTableView:(UITableView *)table { return 4; }
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)table { return self.selectionURL ? 2 : 4; }
 - (NSInteger)tableView:(UITableView *)table numberOfRowsInSection:(NSInteger)section {
-    return section == 0 ? 5 : section == 1 ? MAX(1, self.positions.count) : section == 2 ? self.queuedURLs.count : self.historyURLs.count;
+    return section == 0 ? (self.selectionURL ? 0 : 5) : section == 1 ? MAX(1, self.positions.count) : section == 2 ? self.queuedURLs.count : self.historyURLs.count;
 }
 - (NSString *)tableView:(UITableView *)table titleForHeaderInSection:(NSInteger)section {
     return section == 2 && self.queuedURLs.count ? @"À suivre" : section == 3 && self.historyURLs.count ? @"Mes sélections" : nil;
@@ -1477,14 +1660,16 @@ static void afterSourceSheet(UIAlertController *sheet, void (^completion)(void))
     return title ? SGSectionHeader(table, title) : nil;
 }
 - (CGFloat)tableView:(UITableView *)table heightForHeaderInSection:(NSInteger)section {
+    if (self.selectionURL && section == 0) return 0.01;
     return section == 1 ? 82 : [self tableView:table titleForHeaderInSection:section] ? SGSectionHeaderHeight : 12;
 }
 - (NSString *)tableView:(UITableView *)table titleForFooterInSection:(NSInteger)section {
+    if (section == 3 && self.historyURLs.count) return @"Touche une sélection pour voir ses titres. Glisse vers la gauche pour la supprimer.";
     if (section == 2 && self.queuedURLs.count) return @"Glisse une sélection vers la gauche pour la retirer de la file.";
     if (section != 1 || ![self.displayJob[@"items"] count]) return nil;
     return self.displayJob[@"completeMetadata"] && ![self.displayJob[@"completeMetadata"] boolValue] ?
-        @"La liste accessible peut être incomplète. Glisse un titre téléchargé vers la gauche pour changer de version." :
-        @"Glisse un titre téléchargé vers la gauche pour chercher une autre version et l’écouter avant de choisir.";
+        @"La liste accessible peut être incomplète. Glisse un titre vers la gauche pour le supprimer ou gérer ses versions." :
+        @"Glisse un titre vers la gauche pour le supprimer ou gérer ses versions.";
 }
 - (CGFloat)tableView:(UITableView *)table heightForRowAtIndexPath:(NSIndexPath *)path { return path.section == 0 && path.row == 0 ? 142 : 70; }
 - (UITableViewCell *)tableView:(UITableView *)table cellForRowAtIndexPath:(NSIndexPath *)path {
@@ -1531,7 +1716,8 @@ static void afterSourceSheet(UIAlertController *sheet, void (^completion)(void))
     } else if (path.section == 1) {
         if (!self.positions.count) {
             NSString *title = !total ? @"Aucun morceau pour le moment" : self.filter.selectedSegmentIndex == 2 ? @"Pas encore de fichier terminé" : @"Tout est disponible sur l'iPhone";
-            SGFillCell(cell, title, !total ? @"Lance une playlist avec sa flèche de téléchargement." : nil, SGGrey(), @"music.note"); return;
+            if (!total && self.selectionURL) title = @"Aucun titre dans cette sélection";
+            SGFillCell(cell, title, !total && !self.selectionURL ? @"Lance une playlist avec sa flèche de téléchargement." : nil, SGGrey(), @"music.note"); return;
         }
         NSDictionary *row = self.displayJob[@"items"][[self.positions[path.row] unsignedIntegerValue]];
         BOOL active = engine.busy && [row[@"spotify"] isEqual:engine.activeSpotify] && ![self.readyURLs containsObject:row[@"spotify"]];
@@ -1556,21 +1742,37 @@ static void afterSourceSheet(UIAlertController *sheet, void (^completion)(void))
     }
 }
 - (UISwipeActionsConfiguration *)tableView:(UITableView *)table trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)path {
+    if (SGAutomaticDownloads.shared.clearing) return nil;
     if (path.section == 1 && path.row < self.positions.count) {
         NSUInteger index = [self.positions[path.row] unsignedIntegerValue];
         if (index >= [self.displayJob[@"items"] count]) return nil;
         NSDictionary *row = self.displayJob[@"items"][index];
-        if (!onPhone(row)) return nil;
+        NSString *selectionURL = self.displayJob[@"url"], *trackURL = row[@"spotify"], *title = row[@"title"];
+        UIContextualAction *remove = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleDestructive title:@"Supprimer" handler:^(UIContextualAction *action, UIView *view, void (^done)(BOOL)) {
+            done(NO); [self confirmDeleteSelection:selectionURL track:trackURL title:title];
+        }];
+        NSMutableArray *actions = [NSMutableArray arrayWithObject:remove];
+        if (onPhone(row)) {
         UIContextualAction *version = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleNormal title:@"Changer de version" handler:^(UIContextualAction *action, UIView *view, void (^done)(BOOL)) {
             done(NO); [SGAutomaticDownloads.shared startAlternative:row];
         }];
         version.backgroundColor = UIColor.systemIndigoColor;
         UIContextualAction *audio = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleNormal title:@"Versions audio" handler:^(UIContextualAction *action, UIView *view, void (^done)(BOOL)) {
-            done(YES);
+            done(NO);
             dispatch_async(dispatch_get_main_queue(), ^{ SGShowPage(self, SGAudioVariantsPageCreate(row)); });
         }];
         audio.backgroundColor = SGGreen();
-        UISwipeActionsConfiguration *configuration = [UISwipeActionsConfiguration configurationWithActions:@[audio, version]];
+        [actions addObjectsFromArray:@[audio, version]];
+        }
+        UISwipeActionsConfiguration *configuration = [UISwipeActionsConfiguration configurationWithActions:actions];
+        configuration.performsFirstActionWithFullSwipe = NO; return configuration;
+    }
+    if (path.section == 3 && path.row < self.historyURLs.count) {
+        NSString *url = self.historyURLs[path.row], *title = self.displayHistory[url][@"name"];
+        UIContextualAction *remove = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleDestructive title:@"Supprimer" handler:^(UIContextualAction *action, UIView *view, void (^done)(BOOL)) {
+            done(NO); [self confirmDeleteSelection:url track:nil title:title];
+        }];
+        UISwipeActionsConfiguration *configuration = [UISwipeActionsConfiguration configurationWithActions:@[remove]];
         configuration.performsFirstActionWithFullSwipe = NO; return configuration;
     }
     if (path.section != 2 || path.row >= self.queuedURLs.count) return nil;
@@ -1588,18 +1790,22 @@ static void afterSourceSheet(UIAlertController *sheet, void (^completion)(void))
         if (path.row >= self.positions.count) return;
         NSUInteger index = [self.positions[path.row] unsignedIntegerValue];
         if (index >= [self.displayJob[@"items"] count]) return;
-        if ([engine.job[@"id"] isEqual:self.displayJob[@"id"]] && index < [engine.job[@"items"] count] &&
-            [engine.job[@"items"][index][@"spotify"] isEqual:self.displayJob[@"items"][index][@"spotify"]]) {
-            NSDictionary *row = self.displayJob[@"items"][index];
-            if (onPhone(row)) [engine play:index]; else [self repair:row selection:self.displayJob cell:[table cellForRowAtIndexPath:path]];
+        NSString *identity = self.displayJob[@"items"][index][@"spotify"];
+        NSDictionary *selection = [engine merged:engine.history[self.displayJob[@"url"] ?: @""]];
+        NSDictionary *row = nil;
+        for (NSDictionary *candidate in selection[@"items"]) if ([candidate[@"spotify"] isEqual:identity]) { row = candidate; break; }
+        if (row) {
+            if (onPhone(row)) SGAutomaticPlayLocalAudio(row, self);
+            else [self repair:row selection:selection cell:[table cellForRowAtIndexPath:path]];
         } else [self refresh:nil];
         return;
     }
     if (path.section == 2) { if (path.row < self.queuedURLs.count) [engine removeQueued:self.queuedURLs[path.row]]; return; }
     if (path.section == 3) {
         if (path.row >= self.historyURLs.count) return;
-        if (engine.busy) { tell(@"Mets la préparation en pause pour ouvrir une autre sélection."); return; }
-        [engine selectJob:self.displayHistory[self.historyURLs[path.row]]]; [self refresh:nil]; return;
+        SGAutomaticDownloadsPage *page = [SGAutomaticDownloadsPage new];
+        page.selectionURL = self.historyURLs[path.row];
+        SGShowPage(self, page); return;
     }
     if (path.row == 0) return;
     if (path.row == 2) { [self addLink]; return; }
@@ -1612,6 +1818,22 @@ static void afterSourceSheet(UIAlertController *sheet, void (^completion)(void))
     else if (engine.job || engine.devicePendingURL || engine.pending || engine.queuedURLs.count) [engine resume];
     else [self addLink];
 }
+- (void)confirmDeleteSelection:(NSString *)url track:(NSString *)track title:(NSString *)title {
+    if (!url || SGAutomaticDownloads.shared.clearing) return;
+    NSString *message = track ? @"Retirer ce titre de cette sélection et effacer sa copie sur l’iPhone si elle n’est utilisée nulle part ailleurs ?" : @"Retirer cette sélection et effacer ses fichiers sur l’iPhone, sauf ceux utilisés ailleurs ?";
+    message = [message stringByAppendingString:@" La playlist Spotify reste inchangée. Les téléchargements en cours seront mis en pause."];
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:title ?: @"Supprimer" message:message preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Annuler" style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Supprimer" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
+        [SGAutomaticDownloads.shared deleteSelection:url track:track completion:^(BOOL success, NSString *result) {
+            [self refresh:nil];
+            UIAlertController *feedback = [UIAlertController alertControllerWithTitle:success ? @"Suppression terminée" : @"Suppression impossible" message:result preferredStyle:UIAlertControllerStyleAlert];
+            [feedback addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+            if (self.viewIfLoaded.window && !self.presentedViewController) [self presentViewController:feedback animated:YES completion:nil];
+        }];
+    }]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
 - (void)addLink {
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Ajouter une sélection" message:@"Colle le lien Spotify d'un morceau ou d'une playlist." preferredStyle:UIAlertControllerStyleAlert];
     [alert addTextFieldWithConfigurationHandler:^(UITextField *field) { field.keyboardType = UIKeyboardTypeURL; field.autocorrectionType = UITextAutocorrectionTypeNo; field.autocapitalizationType = UITextAutocapitalizationTypeNone; field.placeholder = @"https://open.spotify.com/…"; }];
@@ -1619,7 +1841,7 @@ static void afterSourceSheet(UIAlertController *sheet, void (^completion)(void))
     __weak UIAlertController *weak = alert;
     [alert addAction:[UIAlertAction actionWithTitle:SGAutomaticDownloads.shared.busy ? @"Ajouter à la file" : @"Télécharger" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
         NSString *url = SGAutomaticSpotifyURL(weak.textFields.firstObject.text);
-        if (url) [SGAutomaticDownloads.shared start:url]; else [SGAutomaticDownloads.shared update:@"Lien invalide : utilise un lien de morceau ou de playlist Spotify."];
+        if (url) [SGAutomaticDownloads.shared startUserSelection:url]; else [SGAutomaticDownloads.shared update:@"Lien invalide : utilise un lien de morceau ou de playlist Spotify."];
     }]];
     [self presentViewController:alert animated:YES completion:nil];
 }
@@ -1903,7 +2125,7 @@ BOOL SGAutomaticDownloadEntity(id entity, UIView *source) {
             (engine.waitingForPC && [url isEqual:engine.resumeURL]);
         BOOL queued = [engine.queuedURLs containsObject:url];
         if (!saved && !current && !queued && !engine.collectionErrors[url]) {
-            [engine start:url]; [[[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight] impactOccurred]; return;
+            [engine startUserSelection:url]; [[[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight] impactOccurred]; return;
         }
         UIViewController *owner = SGTopController();
         if (!owner || owner.presentedViewController) return;
@@ -1923,7 +2145,7 @@ BOOL SGAutomaticDownloadEntity(id entity, UIView *source) {
         }]];
         else if (queued) [sheet addAction:[UIAlertAction actionWithTitle:@"Retirer de la file" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) { [engine removeQueued:url]; }]];
         else if (![status[@"state"] isEqual:@"ready"]) [sheet addAction:[UIAlertAction actionWithTitle:engine.busy ? @"Ajouter à la file" : @"Reprendre les titres manquants" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-            if (engine.busy || engine.pending || engine.waitingForPC || !saved) [engine start:url];
+            if (engine.busy || engine.pending || engine.waitingForPC || !saved) [engine startUserSelection:url];
             else { [engine selectJob:saved]; [engine resume]; }
         }]];
         BOOL canSelect = !engine.pending && !engine.waitingForPC;
