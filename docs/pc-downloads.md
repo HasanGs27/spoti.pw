@@ -1,5 +1,23 @@
 # Téléchargements avec le PC
 
+## Choisir une source sur YouTube
+
+Toucher un morceau **À compléter**, puis **Rechercher sur YouTube**. Le navigateur intégré ouvre une recherche avec son titre et son artiste. Rechercher, ouvrir et écouter la vidéo souhaitée, puis toucher **Utiliser cette vidéo** en bas à droite. Aucun copier-coller n'est nécessaire : le PC associé prépare exactement le lien choisi, sans rechercher une autre vidéo à sa place.
+
+Le bouton s'active uniquement sur une page vidéo valide. **Annuler** ferme le navigateur sans créer de demande. La recherche et la préécoute nécessitent Internet. Le navigateur s'ouvre en plein écran, avec retour, avance et actualisation ; ses données de navigation sont temporaires et la lecture vidéo s'arrête à sa fermeture.
+
+L'iPhone contrôle le fichier avant de l'associer au titre manquant. Une vidéo ayant une introduction, une fin ou une durée différente peut être refusée : choisir alors la version audio du morceau. Le choix manuel d'une vidéo n'atteste pas qu'il s'agit du même enregistrement. Un fichier déjà associé entre-temps reste conservé.
+
+## Ajouter un morceau absent de Spotify
+
+Dans **Téléchargements → Ajouter un morceau**, choisir **Rechercher sur YouTube** ou **Coller un lien audio ou YouTube**. Après avoir choisi la vidéo, vérifier le titre et, si nécessaire, renseigner l'artiste. Toucher **Ajouter**.
+
+Le compagnon PC existant est utilisé, avec la même association et le même réseau local. Les liens directs doivent fournir un fichier MP3 ou M4A public en HTTPS. Après préparation et vérification, le fichier apparaît dans **Bibliothèque → Fichiers locaux**, avec la miniature de la vidéo ou la pochette incorporée. Si aucune image valide n'est disponible, une image neutre est utilisée. Un ajout personnel ne crée pas de titre dans le catalogue Spotify ni de fausse association avec une playlist Spotify.
+
+Garder la page des ajouts ouverte pour recevoir le fichier. Quitter la page ou mettre le transfert en pause conserve la demande ; le PC peut terminer la préparation de son côté. Revenir permet de reprendre le transfert. Un échec ou une interruption du PC reste visible et peut être relancé en touchant le morceau. Aucun message « disponible hors ligne » n'est affiché avant l'enregistrement vérifié sur l'iPhone. Supprimer un fichier local ne le retélécharge pas automatiquement.
+
+Les ajouts ont une file distincte, avec une préparation à la fois, dix demandes actives au maximum et un délai de quatre minutes par tentative. Les limites de trente minutes par morceau et de 100 Mo restent appliquées. Les fichiers sont conservés sur le PC dans le dossier des imports personnels ; le nettoyage habituel des téléchargements ne supprime pas ce dossier. L'iPhone garde jusqu'à 80 demandes dans son suivi et retire seulement les plus anciennes terminées lorsque cette limite est atteinte, sans supprimer leurs fichiers.
+
 Le PC prépare les fichiers ; l'iPhone les récupère et les vérifie avant d'afficher la flèche verte. Une fois les fichiers enregistrés sur l'iPhone, leur lecture hors ligne ne nécessite plus le PC.
 
 ## Utilisation
