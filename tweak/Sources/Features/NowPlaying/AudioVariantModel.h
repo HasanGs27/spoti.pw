@@ -9,3 +9,6 @@ NSArray<NSDictionary *> *SGAudioVariantStoreRecord(id records, NSDictionary *rec
 NSString *SGAudioVariantKey(NSDictionary *request);
 NSString *SGAudioVariantLabel(NSDictionary *request);
 NSDictionary *SGAudioVariantReadyRow(id value);
+// A catalogue recording or an original personal import, never a derived copy.
+NSDictionary *SGAudioVariantSourceRow(id value);
+BOOL SGAudioVariantMatchesSource(NSDictionary *request, NSDictionary *sourceRow);

@@ -4,6 +4,9 @@
 #import "AutomaticDownloadTransfer.h"
 #import "AutomaticDownloadState.h"
 #import "AudioVariantsPage.h"
+#import "AudioVariantModel.h"
+#import "PlayerAudioToolsModel.h"
+#import "Headers/SPTPlayer.h"
 #import "LocalImportModel.h"
 #import "LocalImportsPage.h"
 #import "YouTubeSourceBrowser.h"
@@ -21,6 +24,7 @@
 #import <AVFoundation/AVFoundation.h>
 #import <CommonCrypto/CommonDigest.h>
 #import <math.h>
+#import <sys/stat.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
 static NSString *const changed = @"SGAutomaticDownloadsDidChange";
@@ -48,6 +52,7 @@ static NSCache *statusCounts(void) {
 - (void)setPages:(NSArray *)pages;
 - (void)setTracks:(NSArray *)tracks;
 - (void)setMetadata:(NSDictionary *)metadata;
+- (void)setPlaybackSpeed:(NSNumber *)speed;
 - (id)playContext:(id)context options:(id)options;
 @end
 
@@ -1742,6 +1747,83 @@ static void afterSourceSheet(UIAlertController *sheet, void (^completion)(void))
 
 UIViewController *SGAutomaticDownloadsPageCreate(void) { return [SGAutomaticDownloadsPage new]; }
 void SGAutomaticDownloadObservePlayer(id player) { observedPlayer = player; }
+NSDictionary *SGAutomaticPlayingTrack(void) {
+    if (!NSThread.isMainThread) return nil;
+    id player = observedPlayer;
+    if (![player respondsToSelector:@selector(state)]) return nil;
+    @try {
+        SPTPlayerState *state = [(id<SPTPlayer>)player state];
+        SPTPlayerTrack *track = [state respondsToSelector:@selector(track)] ? state.track : nil;
+        id raw = [track respondsToSelector:@selector(URI)] ? track.URI : nil;
+        NSString *uri = [raw isKindOfClass:NSURL.class] ? [raw absoluteString] : raw;
+        if (![uri isKindOfClass:NSString.class] || uri.length > 4096 ||
+            (![uri hasPrefix:@"spotify:local:"] && ![SGAutomaticSpotifyURL(uri) hasPrefix:@"https://open.spotify.com/track/"])) return nil;
+        NSString *title = [track respondsToSelector:@selector(trackTitle)] ? track.trackTitle : nil;
+        NSString *artist = [track respondsToSelector:@selector(artistName)] ? track.artistName : nil;
+        return @{@"uri":uri, @"title":[title isKindOfClass:NSString.class] ? title : @"Morceau", @"artist":[artist isKindOfClass:NSString.class] ? artist : @""};
+    } @catch (NSException *exception) { return nil; }
+}
+static BOOL audioToolsReceiptMatches(NSDictionary *record) {
+    NSURL *file = SGAutomaticLibraryFile(record[@"installed"]); struct stat info;
+    if (!file || lstat(file.path.fileSystemRepresentation,&info) || !S_ISREG(info.st_mode) ||
+        info.st_size != [record[@"installed"][@"bytes"] longLongValue]) return NO;
+    NSString *stamp = [NSString stringWithFormat:@"%llu:%llu:%lld:%lld:%ld:%lld:%ld",
+        (unsigned long long)info.st_dev,(unsigned long long)info.st_ino,(long long)info.st_size,
+        (long long)info.st_mtimespec.tv_sec,info.st_mtimespec.tv_nsec,(long long)info.st_ctimespec.tv_sec,info.st_ctimespec.tv_nsec];
+    return [record[@"stamp"] isEqual:stamp];
+}
+NSDictionary *SGAutomaticAudioToolsSource(id entity) {
+    if (!NSThread.isMainThread) return nil;
+    NSString *uri = [entity isKindOfClass:NSURL.class] ? [entity absoluteString] : entity;
+    if (![uri isKindOfClass:NSString.class]) return nil;
+    NSDictionary *catalogue = SGAutomaticDownloadedRow(uri);
+    if (catalogue) return SGAudioVariantSourceRow(catalogue);
+    if (![uri hasPrefix:@"spotify:local:"]) return nil;
+    NSMutableArray *rows = [NSMutableArray array];
+    for (NSDictionary *row in SGAutomaticDownloads.shared.localRows.allValues) if (onPhone(row)) [rows addObject:row];
+    for (NSDictionary *record in SGLocalImportRecords([NSUserDefaults.standardUserDefaults arrayForKey:@"spotifyglass.localImports.records.v1"])) {
+        // A repaired catalogue item is already resolved above. Personal jobs
+        // retain the PC's source hash even if iOS retagged its installed copy.
+        if (!record[@"target"] && record[@"job"][@"row"] && audioToolsReceiptMatches(record)) [rows addObject:record[@"job"][@"row"]];
+    }
+    return SGPlayerAudioSourceForLocalURI(uri,rows);
+}
+void SGAutomaticPlayLocalAudio(NSDictionary *input, UIViewController *owner) {
+    if (!NSThread.isMainThread) { dispatch_async(dispatch_get_main_queue(), ^{ SGAutomaticPlayLocalAudio(input,owner); }); return; }
+    NSDictionary *row = SGAudioVariantReadyRow(input);
+    if (!row) return;
+    SGAutomaticDownloads *engine = SGAutomaticDownloads.shared;
+    __weak UIViewController *weakOwner = owner;
+    dispatch_async(engine.worker, ^{
+        BOOL verified = verifyRow(row);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            UIViewController *page = weakOwner; if (!page || !page.viewIfLoaded.window || page.presentedViewController) return;
+            if (!verified || !onPhone(row)) { tell(@"Cette copie n'est plus disponible. Enregistre-la de nouveau avant de l'écouter."); return; }
+            id player = observedPlayer;
+            Class contextClass = NSClassFromString(@"SPTPlayerContext"), pageClass = NSClassFromString(@"SPTPlayerContextPage");
+            Class trackClass = NSClassFromString(@"SPTPlayerTrack"), optionsClass = NSClassFromString(@"SPTPlayOptions");
+            if (![player respondsToSelector:@selector(playContext:options:)] || !contextClass || !pageClass || !trackClass || !optionsClass) {
+                tell(@"Le lecteur n'est pas disponible. Cette version reste accessible dans Fichiers locaux."); return;
+            }
+            @try {
+                NSURL *uri = [NSURL URLWithString:SGAutomaticLocalURI(row)];
+                id track = [[trackClass alloc] initWithURI:uri albumURI:nil artistURI:nil andUID:NSUUID.UUID.UUIDString];
+                if (!track || !uri) return;
+                [track setMetadata:@{@"title":row[@"title"],@"artist_name":row[@"artist"],@"album_title":row[@"album"],
+                    @"duration":[NSString stringWithFormat:@"%.0f",[row[@"seconds"] doubleValue]*1000]}];
+                id nativePage = [pageClass new]; [nativePage setTracks:@[track]];
+                id context = [[contextClass alloc] initWithDictionary:@{}]; [context setURI:uri]; [context setPages:@[nativePage]];
+                id options = [optionsClass new];
+                // The file already contains its chosen speed. Start this copy
+                // at normal playback rate instead of compounding an old setting.
+                if ([options respondsToSelector:@selector(setPlaybackSpeed:)]) [options setPlaybackSpeed:@1];
+                engine.playTask = [player playContext:context options:options];
+                // This is a request to Spotify's normal player, never a second
+                // audio session and never an automatic replacement of a queue.
+            } @catch (NSException *exception) { tell(@"La lecture n'a pas démarré. Ouvre cette version dans Fichiers locaux."); }
+        });
+    });
+}
 NSDictionary *SGAutomaticDownloadedRow(id entity) {
     NSString *url = SGAutomaticSpotifyURL(entity);
     NSDictionary *row = url ? SGAutomaticDownloads.shared.localRows[url] : nil;
@@ -1904,8 +1986,7 @@ void SGAutomaticImportAudioVersion(NSURL *root, NSDictionary *row,
     void (^progress)(NSUInteger, NSUInteger), void (^completion)(NSDictionary *, NSString *)) {
     if (!completion) return;
     SGAutomaticDownloads *engine = SGAutomaticDownloads.shared;
-    NSDictionary *selection = SGAutomaticSingleTrackSelection(row);
-    NSDictionary *validated = [selection[@"items"] firstObject];
+    NSDictionary *validated = SGAudioVariantReadyRow(row);
     NSURL *endpoint = SGDownloadRoot(root.absoluteString);
     // Use the same serial worker as normal/alternative imports: its transfer
     // cache may prune a previous .stage only after the previous caller used it.
@@ -1928,8 +2009,15 @@ void SGAutomaticImportAudioVersion(NSURL *root, NSDictionary *row,
                 request[@"expectedTitle"] = validated[@"title"];
                 request[@"expectedArtist"] = validated[@"artist"];
                 request[@"expectedSeconds"] = validated[@"seconds"];
-                installed = SGAutomaticInstallAudioCancellable(staging, request, stopped, &error);
+                if (validated[@"spotify"]) installed = SGAutomaticInstallAudioCancellable(staging, request, stopped, &error);
+                else { [request removeObjectForKey:@"position"]; installed = SGAutomaticInstallLocalAudioCancellable(staging, request, stopped, &error); }
                 [NSFileManager.defaultManager removeItemAtURL:staging error:nil];
+            }
+            if (installed && !validated[@"spotify"]) {
+                NSMutableDictionary *receipt = [installed mutableCopy];
+                for (NSString *key in @[@"local_id",@"source_id",@"source_local_id",@"source_url",@"sourceURL",@"sourceKind",@"variant_kind",@"variant_speed"])
+                    if (validated[key]) receipt[key] = validated[key];
+                installed = receipt; // Preserve the actual installed digest/size.
             }
         }
         dispatch_async(dispatch_get_main_queue(), ^{

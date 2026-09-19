@@ -28,9 +28,17 @@ static NSString *requestError(id value, NSString *fallback) {
     NSString *message = [error stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
     return message.length ? message : fallback;
 }
+static void afterVariantAlert(UIAlertController *alert, void (^completion)(void)) {
+    if (!completion) return;
+    if (!alert.presentingViewController) { completion(); return; }
+    id<UIViewControllerTransitionCoordinator> transition = alert.transitionCoordinator;
+    if (alert.isBeingDismissed && transition && [transition animateAlongsideTransition:nil completion:^(id<UIViewControllerTransitionCoordinatorContext> context) { completion(); }]) return;
+    [alert dismissViewControllerAnimated:YES completion:completion];
+}
 
 @interface SGAudioVariantsPage : SGPage <NSURLSessionDataDelegate>
 @property(nonatomic, copy) NSDictionary *source;
+@property(nonatomic, copy) NSString *focusedKind;
 @property(nonatomic, copy) NSDictionary *capabilities;
 @property(nonatomic, copy) NSDictionary<NSString *, NSDictionary *> *records;
 @property(nonatomic, copy) NSDictionary<NSString *, NSDictionary *> *serverJobs;
@@ -53,7 +61,7 @@ static NSString *requestError(id value, NSString *fallback) {
 @property(nonatomic) double progress;
 @property(nonatomic) NSTimeInterval lastProgress;
 @property(nonatomic) NSUInteger retryAttempt;
-- (instancetype)initWithRow:(NSDictionary *)row;
+- (instancetype)initWithRow:(NSDictionary *)row kind:(NSString *)kind;
 - (void)loadRecords;
 - (BOOL)saveRecord:(NSDictionary *)record;
 - (NSDictionary *)option:(NSNumber *)rate;
@@ -73,9 +81,11 @@ static NSString *requestError(id value, NSString *fallback) {
 @end
 
 @implementation SGAudioVariantsPage
-- (instancetype)initWithRow:(NSDictionary *)row {
+- (instancetype)initWithRow:(NSDictionary *)row kind:(NSString *)kind {
     if ((self = [super initWithStyle:UITableViewStyleInsetGrouped])) {
-        self.title = @"Versions audio"; self.source = SGAudioVariantReadyRow(row);
+        self.focusedKind = [@[@"speed", @"instrumental"] containsObject:kind ?: @""] ? kind : nil;
+        self.title = [self.focusedKind isEqual:@"speed"] ? @"Vitesse" : [self.focusedKind isEqual:@"instrumental"] ? @"Sans voix" : @"Versions audio";
+        self.source = SGAudioVariantSourceRow(row);
         self.records = @{}; self.serverJobs = @{};
         self.message = self.source ? @"Connexion au PC associé…" : @"Choisis d'abord un morceau téléchargé sur cet iPhone.";
         [self loadRecords];
@@ -111,7 +121,7 @@ static NSString *requestError(id value, NSString *fallback) {
     NSMutableDictionary *records = [NSMutableDictionary dictionary];
     for (NSDictionary *record in SGAudioVariantRecords([NSUserDefaults.standardUserDefaults arrayForKey:variantsKey])) {
         NSDictionary *request = record[@"request"];
-        if ([request[@"source_id"] isEqual:self.source[@"id"]] && [request[@"spotify"] isEqual:self.source[@"spotify"]])
+        if (SGAudioVariantMatchesSource(request, self.source))
             records[SGAudioVariantKey(request)] = record;
     }
     self.records = records;
@@ -124,15 +134,19 @@ static NSString *requestError(id value, NSString *fallback) {
 
 - (NSDictionary *)option:(NSNumber *)rate {
     if (!self.source) return nil;
-    NSMutableDictionary *value = [@{@"source_id":self.source[@"id"], @"spotify":self.source[@"spotify"], @"kind":rate ? @"speed" : @"instrumental"} mutableCopy];
+    NSMutableDictionary *value = [@{@"source_id":self.source[@"id"], @"kind":rate ? @"speed" : @"instrumental"} mutableCopy];
+    if (self.source[@"local_id"]) value[@"source_local_id"] = self.source[@"local_id"];
+    else value[@"spotify"] = self.source[@"spotify"];
     if (rate) value[@"speed"] = rate; return value;
 }
 - (NSArray *)options {
     if (!self.source) return @[];
     NSMutableArray *options = [NSMutableArray array];
-    for (NSNumber *rate in @[@0.75, @1.25, @1.5, @2]) [options addObject:[self option:rate]];
+    if (![self.focusedKind isEqual:@"instrumental"])
+        for (NSNumber *rate in @[@0.75, @1.25, @1.5, @2]) [options addObject:[self option:rate]];
     NSDictionary *instrumental = [self option:nil]; NSString *key = SGAudioVariantKey(instrumental);
-    if ([self.capabilities[@"instrumental"] boolValue] || self.records[key] || self.serverJobs[key]) [options addObject:instrumental];
+    if (![self.focusedKind isEqual:@"speed"] && ([self.capabilities[@"instrumental"] boolValue] || self.records[key] || self.serverJobs[key]))
+        [options addObject:instrumental];
     return options;
 }
 - (NSString *)pendingKey {
@@ -213,9 +227,15 @@ static NSString *requestError(id value, NSString *fallback) {
             NSMutableDictionary *jobs = [NSMutableDictionary dictionary];
             for (NSDictionary *job in listing[@"jobs"]) {
                 NSString *key = SGAudioVariantKey(job);
-                if ([job[@"source_id"] isEqual:result.source[@"id"]] && [job[@"spotify"] isEqual:result.source[@"spotify"]] && !jobs[key]) jobs[key] = job;
+                if (SGAudioVariantMatchesSource(job, result.source) && !jobs[key]) jobs[key] = job;
             }
             result.serverJobs = jobs; result.busy = NO; result.message = @"PC connecté. Choisis une copie à créer.";
+            if (result.source[@"local_id"] && ![result.capabilities[@"localSources"] boolValue]) {
+                result.message = @"Mets le compagnon PC à jour pour créer des versions de tes imports personnels.";
+                [result refreshUI]; return;
+            }
+            if ([result.focusedKind isEqual:@"instrumental"] && ![result options].count)
+                result.message = @"Le module sans voix n'est pas disponible sur ce PC.";
             [result continuePending]; [result refreshUI];
         }];
     });
@@ -268,6 +288,9 @@ static NSString *requestError(id value, NSString *fallback) {
         double expected = [self.source[@"seconds"] doubleValue] / ([job[@"kind"] isEqual:@"speed"] ? [job[@"speed"] doubleValue] : 1.);
         if (fabs([row[@"seconds"] doubleValue] - expected) > fmax(3., expected * .03)) {
             [self fail:@"La durée de cette copie ne correspond pas à l’option choisie." key:key]; return;
+        }
+        if (self.source[@"local_id"] && ![row[@"source_url"] isEqual:self.source[@"source_url"]]) {
+            [self fail:@"Cette copie ne correspond pas à la source choisie. L'original est conservé." key:key]; return;
         }
         self.importing = YES; self.transferStarted = NO; self.progress = 0; self.message = @"Copie prête sur le PC. En attente du transfert vers l’iPhone…"; [self refreshUI];
         NSString *requestID = record[@"request"][@"request_id"]; __weak typeof(self) weak = self;
@@ -330,18 +353,30 @@ static NSString *requestError(id value, NSString *fallback) {
     }];
 }
 - (void)choose:(NSDictionary *)option {
-    if (self.busy) return;
+    if (self.presentedViewController) return;
     NSString *key = SGAudioVariantKey(option); NSDictionary *old = self.records[key];
     if (isInstalled(old)) {
         UIAlertController *alert = [UIAlertController alertControllerWithTitle:old[@"installed"][@"title"]
             message:@"Cette copie est disponible dans Bibliothèque → Fichiers locaux. Le morceau original reste inchangé."
             preferredStyle:UIAlertControllerStyleAlert];
-        [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleCancel handler:nil]];
+        __weak typeof(self) weak = self; __weak UIAlertController *weakAlert = alert;
+        NSDictionary *installed = old[@"installed"];
+        [alert addAction:[UIAlertAction actionWithTitle:@"Écouter cette version" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+            afterVariantAlert(weakAlert, ^{
+                SGAudioVariantsPage *page = weak;
+                if (!page || !page.visible) return;
+                if (isInstalled(old)) SGAutomaticPlayLocalAudio(installed, page);
+                else { page.message = @"La copie locale a changé. Actualise cette page avant de la relancer."; [page refreshUI]; }
+            });
+        }]];
+        [alert addAction:[UIAlertAction actionWithTitle:@"Fermer" style:UIAlertActionStyleCancel handler:nil]];
         [self presentViewController:alert animated:YES completion:nil]; return;
     }
+    if (self.busy) return;
     NSDictionary *job = old[@"job"] ?: self.serverJobs[key];
     BOOL terminal = [@[@"error", @"interrupted"] containsObject:job[@"state"] ?: @""];
     BOOL supported = [option[@"kind"] isEqual:@"instrumental"] ? [self.capabilities[@"instrumental"] boolValue] : [self.capabilities[@"speeds"] containsObject:option[@"speed"]];
+    if (self.source[@"local_id"] && ![self.capabilities[@"localSources"] boolValue]) supported = NO;
     if ((!job || terminal) && !supported) { self.message = @"Cette option n’est pas disponible sur le PC associé."; [self refreshUI]; return; }
     NSMutableDictionary *request = [old[@"request"] mutableCopy] ?: [option mutableCopy];
     if (!request[@"request_id"] || terminal) request[@"request_id"] = NSUUID.UUID.UUIDString;
@@ -370,7 +405,7 @@ static NSString *requestError(id value, NSString *fallback) {
         NSDictionary *option = options[path.row]; NSString *key = SGAudioVariantKey(option); NSDictionary *record = self.records[key], *job = record[@"job"] ?: self.serverJobs[key];
         BOOL installed = isInstalled(record), current = self.busy && [self.selectedKey isEqual:key];
         NSString *detail = [option[@"kind"] isEqual:@"instrumental"] ? @"Créer une copie instrumentale ; la préparation peut prendre plusieurs minutes" : @"Créer une copie en conservant la hauteur de la voix";
-        if (installed) detail = @"Disponible dans Fichiers locaux";
+        if (installed) detail = @"Sur l'iPhone · toucher pour écouter cette version";
         else if (current && self.importing) detail = self.transferStarted ? [NSString stringWithFormat:@"Transfert vers l'iPhone · %.0f %%", self.progress * 100] : @"Prête sur le PC · en attente du transfert vers l'iPhone";
         else if (record[@"error"]) detail = record[@"error"];
         else if ([record[@"paused"] boolValue]) detail = @"En pause · toucher pour reprendre";
@@ -379,7 +414,7 @@ static NSString *requestError(id value, NSString *fallback) {
         else if (record) detail = @"Demande conservée · toucher pour reprendre";
         SGFillCell(cell, SGAudioVariantLabel(option), detail, installed ? SGGreen() : record[@"error"] ? SGRed() : nil,
             installed ? @"checkmark.circle.fill" : [option[@"kind"] isEqual:@"instrumental"] ? @"waveform" : @"speedometer");
-        cell.selectionStyle = self.busy ? UITableViewCellSelectionStyleNone : UITableViewCellSelectionStyleDefault;
+        cell.selectionStyle = self.busy && !installed ? UITableViewCellSelectionStyleNone : UITableViewCellSelectionStyleDefault;
         cell.accessibilityTraits = UIAccessibilityTraitButton;
     }
     UIListContentConfiguration *content = [cell.contentConfiguration isKindOfClass:UIListContentConfiguration.class] ? (UIListContentConfiguration *)cell.contentConfiguration : nil;
@@ -404,4 +439,7 @@ static NSString *requestError(id value, NSString *fallback) {
 }
 @end
 
-UIViewController *SGAudioVariantsPageCreate(NSDictionary *downloadedRow) { return [[SGAudioVariantsPage alloc] initWithRow:downloadedRow]; }
+UIViewController *SGAudioVariantsPageCreateForKind(NSDictionary *downloadedRow, NSString *kind) {
+    return [[SGAudioVariantsPage alloc] initWithRow:downloadedRow kind:kind];
+}
+UIViewController *SGAudioVariantsPageCreate(NSDictionary *downloadedRow) { return SGAudioVariantsPageCreateForKind(downloadedRow, nil); }

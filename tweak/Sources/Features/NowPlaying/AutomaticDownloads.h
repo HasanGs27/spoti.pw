@@ -9,6 +9,10 @@ static inline BOOL SGAutomaticDownloadIsEnabled(void) {
 UIViewController *SGAutomaticDownloadsPageCreate(void);
 BOOL SGAutomaticDownloadEntity(id entity, UIView *source);
 void SGAutomaticDownloadObservePlayer(id player);
+// Main-thread snapshots and an explicit play action for the full-player tools.
+NSDictionary *SGAutomaticPlayingTrack(void);
+NSDictionary *SGAutomaticAudioToolsSource(id entity);
+void SGAutomaticPlayLocalAudio(NSDictionary *row, UIViewController *owner);
 // Standalone derived copies share the serial file importer, but never replace the
 // canonical downloaded recording or its playlist associations. Call from main.
 void SGAutomaticPrepareAudioToolsPC(void (^completion)(NSURL *root, NSString *error));

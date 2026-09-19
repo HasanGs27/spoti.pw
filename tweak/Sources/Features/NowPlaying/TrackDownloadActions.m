@@ -61,6 +61,9 @@ static void downloadTrack(NSString *url) {
 
 @interface SGTrackDownloadAction : NSObject <SPTContextMenuAction, SPTDismissContextMenuAction>
 @property(nonatomic, copy) NSString *targetURL;
+#ifndef SG_TRACK_DOWNLOAD_ACTION_TEST
+- (UIColor *)iconColor;
+#endif
 @end
 @implementation SGTrackDownloadAction
 - (NSString *)identifier { return @"spoti.download.track"; }
@@ -90,13 +93,17 @@ static void downloadTrack(NSString *url) {
     NSString *state = downloadStatus(self.targetURL)[@"state"];
     NSString *symbol = [state isEqual:@"ready"] ? @"arrow.down.circle.fill" : [state isEqual:@"queued"] ? @"clock" :
         [state isEqual:@"paused"] ? @"pause.circle" : @"arrow.down.circle";
-    return [UIImage systemImageNamed:symbol];
+    // Spotify's dark menu can retain light UIKit traits. Bake the action tint
+    // into the symbol so both native adapters display it consistently, even
+    // when a reused image view ignores iconColor or has a default black tint.
+    return [[UIImage systemImageNamed:symbol] imageWithTintColor:self.iconColor
+                                                 renderingMode:UIImageRenderingModeAlwaysOriginal];
 }
 - (UIColor *)iconColor {
     NSString *state = downloadStatus(self.targetURL)[@"state"];
     if ([state isEqual:@"ready"]) return [UIColor colorWithRed:.114 green:.843 blue:.376 alpha:1];
     if ([state isEqual:@"error"] || [state isEqual:@"partial"]) return UIColor.systemRedColor;
-    return UIColor.labelColor;
+    return [UIColor colorWithWhite:0.70 alpha:1];
 }
 #endif
 @end
