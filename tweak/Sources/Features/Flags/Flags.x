@@ -26,6 +26,11 @@ BOOL SGGlassOwnsFlag(NSString *key) {
 
 static id forced(NSString *key) {
     id value = SGFlagOverride(key);
+    // The shipped music-speed UI has an explicit Bool activation flag. Enable
+    // that native entry point, keeping a user's flag override and opt-out first.
+    // This does not override the active player's speed/Connect restrictions.
+    if (!value && ![NSUserDefaults.standardUserDefaults boolForKey:@"SGNativeSpeedProbeDisabled"] &&
+        [key isEqualToString:@"ios-playbackcontrol-playbackspeed-impl.enable_playback_speed_for_music"]) value = @YES;
     if (!value && SGFlag(SGKeySpotifyGlass, NO) && SGGlassOwnsFlag(key)) value = @YES;
     if (!value && SGAdBlockForcesFlagOff(key)) value = @NO;
     if (!value) value = SGLyricsForcedFlag(key);
