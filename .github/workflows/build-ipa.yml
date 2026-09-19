@@ -19,6 +19,7 @@ on:
     paths:
       - "tweak/Sources/Features/NowPlaying/**"
       - "tweak/Sources/Features/AdBlock/**"
+      - "tweak/Sources/Settings/**"
       - "scripts/pipeline.sh"
       - "docs/app-icon.jpg"
       - ".github/workflows/build-ipa.yml"
