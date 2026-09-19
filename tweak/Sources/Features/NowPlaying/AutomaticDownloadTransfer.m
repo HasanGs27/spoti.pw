@@ -71,18 +71,38 @@ static BOOL SGTransferDirectory(NSURL *directory) {
     return YES;
 }
 
-// Only names owned by this module can be removed. A .stage file belongs to a
-// completed previous call: the serial caller consumes it before another call.
-static BOOL SGTransferPrune(NSURL *directory, NSString *keepName, unsigned long long reserve,
+// Only names owned by this module can be removed. The serial caller may retain
+// one completed stage while the user previews an alternative version.
+static BOOL SGTransferPrune(NSURL *directory, NSString *keepName, NSURL *protectedCandidate,
+                           unsigned long long reserve,
                            unsigned long long limit, NSUInteger maxEntries) {
+    NSString *protectedName = nil;
+    unsigned long long protectedBytes = 0;
+    if (protectedCandidate) {
+        // Validate before any mutation. Never turn a malformed/external path into
+        // permission to prune without protecting the user's pending candidate.
+        if (![protectedCandidate isKindOfClass:NSURL.class] || !protectedCandidate.isFileURL ||
+            protectedCandidate.baseURL || protectedCandidate.host.length ||
+            protectedCandidate.query || protectedCandidate.fragment) return NO;
+        NSString *name = protectedCandidate.lastPathComponent;
+        if (!SGTransferMatches(name, @"^[a-f0-9]{64}-[A-Fa-f0-9-]{36}\\.stage\\.(mp3|m4a)$") ||
+            ![protectedCandidate.path isEqual:[directory.path stringByAppendingPathComponent:name]]) return NO;
+        struct stat st;
+        if (!SGTransferRegular(protectedCandidate, &st) || st.st_size < 1024 ||
+            (unsigned long long)st.st_size > SGTransferFileLimit) return NO;
+        protectedName = name;
+        protectedBytes = (unsigned long long)st.st_size;
+    }
+    NSUInteger count = 1 + (protectedName ? 1 : 0);
+    if (reserve > limit || protectedBytes > limit - reserve || count > maxEntries) return NO;
     NSFileManager *fm = NSFileManager.defaultManager;
     NSArray *files = [fm contentsOfDirectoryAtURL:directory includingPropertiesForKeys:nil options:0 error:nil];
     NSMutableArray *entries = [NSMutableArray array];
-    unsigned long long bytes = reserve;
+    unsigned long long bytes = reserve + protectedBytes;
     NSTimeInterval now = NSDate.date.timeIntervalSince1970;
     for (NSURL *file in files) {
         NSString *name = file.lastPathComponent;
-        if ([name isEqual:keepName]) continue;
+        if ([name isEqual:keepName] || [name isEqual:protectedName]) continue;
         BOOL stage = SGTransferMatches(name, @"^[a-f0-9]{64}-[A-Fa-f0-9-]{36}\\.stage\\.(mp3|m4a)$");
         if (!stage && !SGTransferMatches(name, @"^[a-f0-9]{64}\\.part$")) continue;
         struct stat st;
@@ -102,7 +122,7 @@ static BOOL SGTransferPrune(NSURL *directory, NSString *keepName, unsigned long 
     [entries sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
         return [a[@"date"] compare:b[@"date"]];
     }];
-    NSUInteger count = entries.count + 1;
+    count += entries.count;
     for (NSDictionary *entry in entries) {
         if (bytes <= limit && count <= maxEntries) break;
         if ([fm removeItemAtURL:entry[@"file"] error:nil]) {
@@ -265,6 +285,12 @@ static Class SGTransferTestProtocolClass;
 
 NSURL *SGAutomaticTransferFile(NSURL *companionRoot, NSDictionary *row, BOOL (^cancelled)(void),
     void (^taskStarted)(NSURLSessionTask *task), void (^progress)(NSUInteger, NSUInteger), NSString **error) {
+    return SGAutomaticTransferFilePreservingCandidate(companionRoot, row, nil, cancelled, taskStarted, progress, error);
+}
+
+NSURL *SGAutomaticTransferFilePreservingCandidate(NSURL *companionRoot, NSDictionary *row, NSURL *protectedCandidateURL,
+    BOOL (^cancelled)(void), void (^taskStarted)(NSURLSessionTask *task),
+    void (^progress)(NSUInteger, NSUInteger), NSString **error) {
     if (error) *error = nil;
     if (cancelled && cancelled()) return nil;
     NSURL *root = SGTransferRoot(companionRoot);
@@ -288,7 +314,8 @@ NSURL *SGAutomaticTransferFile(NSURL *companionRoot, NSDictionary *row, BOOL (^c
     NSString *key = SGTransferKey(root, hash, byteValue, extension);
     NSString *name = [key stringByAppendingString:@".part"];
     NSURL *file = [directory URLByAppendingPathComponent:name];
-    if (!SGTransferDirectory(directory) || !SGTransferPrune(directory, name, expected, SGTransferCacheLimit, SGTransferCacheEntries)) {
+    if (!SGTransferDirectory(directory) || !SGTransferPrune(directory, name, protectedCandidateURL,
+        expected, SGTransferCacheLimit, SGTransferCacheEntries)) {
         if (error) *error = @"Impossible de réserver le stockage temporaire du transfert.";
         return nil;
     }
@@ -539,6 +566,77 @@ int main(void) {
         SGTransferTestConsume(SGAutomaticTransferFile(root, row, nil, nil, nil, &reason), data);
         assert(SGMockRequests == requests); // cancelled at EOF resumes without downloading again
 
+        // A preview candidate survives subsequent transfers, even for the same
+        // content hash. Only its exact UUID stage is retained; another completed
+        // unowned stage is still pruned. Age must not invalidate the preview.
+        SGTransferMock(200, full, data, NO);
+        NSURL *candidate = SGAutomaticTransferFile(root, row, nil, nil, nil, &reason);
+        assert(candidate && [[NSData dataWithContentsOfURL:candidate] isEqual:data]);
+        NSURL *orphan = SGAutomaticTransferFilePreservingCandidate(root, row, candidate, nil, nil, nil, &reason);
+        assert(orphan && ![orphan isEqual:candidate]);
+        assert([[NSData dataWithContentsOfURL:candidate] isEqual:data]);
+        assert([fm setAttributes:@{NSFileModificationDate:[NSDate dateWithTimeIntervalSinceNow:-(SGTransferTTL + 60)]}
+            ofItemAtPath:candidate.path error:nil]);
+        NSURL *independent = SGAutomaticTransferFilePreservingCandidate(root, row, candidate, nil, nil, nil, &reason);
+        assert(independent && ![independent isEqual:candidate]);
+        assert(![fm fileExistsAtPath:orphan.path]);
+        SGTransferTestConsume(independent, data);
+        assert([[NSData dataWithContentsOfURL:candidate] isEqual:data]);
+
+        // The protected 8192-byte file counts in BOTH budgets. Evict another
+        // prefix when needed; fail without deleting anything when protection
+        // plus the incoming reservation alone exceeds a limit.
+        NSURL *budgetOld = [SGTransferTestDirectory URLByAppendingPathComponent:
+            [[@"a" stringByPaddingToLength:64 withString:@"a" startingAtIndex:0] stringByAppendingString:@".part"]];
+        NSURL *budgetNew = [SGTransferTestDirectory URLByAppendingPathComponent:
+            [[@"b" stringByPaddingToLength:64 withString:@"b" startingAtIndex:0] stringByAppendingString:@".part"]];
+        assert([prefix writeToURL:budgetOld atomically:YES]);
+        assert([prefix writeToURL:budgetNew atomically:YES]);
+        assert([fm setAttributes:@{NSFileModificationDate:[NSDate dateWithTimeIntervalSinceNow:-60]}
+            ofItemAtPath:budgetOld.path error:nil]);
+        assert(SGTransferPrune(SGTransferTestDirectory, @"reserved.part", candidate, 2048, 12288, 3));
+        assert(![fm fileExistsAtPath:budgetOld.path] && [fm fileExistsAtPath:budgetNew.path]);
+        assert(!SGTransferPrune(SGTransferTestDirectory, @"reserved.part", candidate, 2048, 10239, 3));
+        assert(!SGTransferPrune(SGTransferTestDirectory, @"reserved.part", candidate, 2048, 16384, 1));
+        assert([fm fileExistsAtPath:budgetNew.path]);
+        assert([[NSData dataWithContentsOfURL:candidate] isEqual:data]);
+        // Count, independently of bytes, must also evict the remaining prefix.
+        assert(SGTransferPrune(SGTransferTestDirectory, @"reserved.part", candidate, 2048, 16384, 2));
+        assert(![fm fileExistsAtPath:budgetNew.path]);
+
+        // Invalid protection is an error, not an invitation to prune without it.
+        // No request starts and no existing stage, unrelated file or link target
+        // is deleted. All files here belong only to this synthetic sandbox.
+        NSURL *unrelated = [SGTransferTestDirectory URLByAppendingPathComponent:@"unrelated.stage.mp3"];
+        NSURL *externalCandidate = [sandbox URLByAppendingPathComponent:candidate.lastPathComponent];
+        NSURL *missingCandidate = [SGTransferTestDirectory URLByAppendingPathComponent:
+            [NSString stringWithFormat:@"%@-%@.stage.mp3", hash, NSUUID.UUID.UUIDString]];
+        NSURL *linkedCandidate = [SGTransferTestDirectory URLByAppendingPathComponent:
+            [NSString stringWithFormat:@"%@-%@.stage.mp3", hash, NSUUID.UUID.UUIDString]];
+        NSURL *directoryCandidate = [SGTransferTestDirectory URLByAppendingPathComponent:
+            [NSString stringWithFormat:@"%@-%@.stage.mp3", hash, NSUUID.UUID.UUIDString]];
+        assert([data writeToURL:unrelated atomically:YES]);
+        assert([data writeToURL:externalCandidate atomically:YES]);
+        assert(!symlink(externalCandidate.fileSystemRepresentation, linkedCandidate.fileSystemRepresentation));
+        assert([fm createDirectoryAtURL:directoryCandidate withIntermediateDirectories:NO attributes:nil error:nil]);
+        requests = SGMockRequests;
+        for (NSURL *invalid in @[unrelated, externalCandidate, missingCandidate, linkedCandidate, directoryCandidate,
+            [NSURL URLWithString:[candidate.absoluteString stringByAppendingString:@"?unexpected=1"]],
+            [NSURL URLWithString:@"https://example.com/candidate.stage.mp3"]]) {
+            assert(!SGAutomaticTransferFilePreservingCandidate(root, row, invalid, nil, nil, nil, &reason));
+            assert(reason.length && SGMockRequests == requests);
+            assert([[NSData dataWithContentsOfURL:candidate] isEqual:data]);
+            assert([[NSData dataWithContentsOfURL:externalCandidate] isEqual:data]);
+            assert([[NSData dataWithContentsOfURL:unrelated] isEqual:data]);
+        }
+        struct stat linked;
+        assert(!lstat(linkedCandidate.fileSystemRepresentation, &linked) && S_ISLNK(linked.st_mode));
+        assert(!unlink(linkedCandidate.fileSystemRepresentation));
+        assert([fm removeItemAtURL:directoryCandidate error:nil]);
+        assert([fm removeItemAtURL:unrelated error:nil]);
+        assert([fm removeItemAtURL:externalCandidate error:nil]);
+        SGTransferTestConsume(candidate, data);
+
         // Immutable identity protects against a different PC, size, hash or extension.
         NSString *key = SGTransferKey(root, hash, @8192, @"m4a");
         assert(![key isEqual:SGTransferKey(root, hash, @8192, @"mp3")]);
@@ -567,7 +665,7 @@ int main(void) {
             NSDate *date = [NSDate dateWithTimeIntervalSinceNow:i == 0 ? -(SGTransferTTL + 60) : -60 * (4 - i)];
             assert([fm setAttributes:@{NSFileModificationDate:date} ofItemAtPath:url.path error:nil]);
         }
-        assert(SGTransferPrune(SGTransferTestDirectory, @"reserved.part", 2048, 6144, 3));
+        assert(SGTransferPrune(SGTransferTestDirectory, @"reserved.part", nil, 2048, 6144, 3));
         NSArray *remaining = [fm contentsOfDirectoryAtPath:SGTransferTestDirectory.path error:nil];
         assert(remaining.count == 2);
         assert(([remaining containsObject:[NSString stringWithFormat:@"%064u.part", 3]]));

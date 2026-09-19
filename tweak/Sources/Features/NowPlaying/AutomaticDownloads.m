@@ -1995,11 +1995,10 @@ void SGAutomaticImportAudioVersion(NSURL *root, NSDictionary *row,
         NSDictionary *installed = nil;
         BOOL (^stopped)(void) = ^BOOL { return (cancelled && cancelled()) || ![engine.root isEqual:endpoint]; };
         if (!validated || !endpoint || stopped()) error = @"Transfert arrêté ou informations de version invalides.";
-        else if (engine.candidateFile || [engine.pending[@"kind"] isEqual:@"alternative"])
-            error = @"Termine le choix de l’autre enregistrement avant d’importer cette copie.";
         else {
             installed = SGAutomaticLibraryReuse(nil, validated, stopped);
-            NSURL *staging = installed ? nil : SGAutomaticTransferFile(endpoint, validated, stopped, taskStarted, progress, &error);
+            NSURL *staging = installed ? nil : SGAutomaticTransferFilePreservingCandidate(endpoint, validated,
+                engine.candidateFile, stopped, taskStarted, progress, &error);
             if (staging) {
                 // Bind validation and tags to the derivative, not the original
                 // catalogue duration/title. No canonical track mapping is saved.
@@ -2042,13 +2041,14 @@ void SGAutomaticImportLocalSource(NSURL *root, NSDictionary *row, NSDictionary *
             return (cancelled && cancelled()) || ![engine.root isEqual:endpoint] || (reserved && engine.generation != engineGeneration);
         };
         if (!validated || !endpoint || (target && !reference) || stopped()) error = @"Transfert arrêté ou source invalide.";
-        else if (engine.candidateFile || [engine.pending[@"kind"] isEqual:@"alternative"])
-            error = @"Termine le choix de l'autre version avant d'importer ce morceau.";
         else if (reference) {
             // Resolve the original metadata again. A stale browser must never
             // bind its selection to the current player or a different row.
             dispatch_sync(dispatch_get_main_queue(), ^{
                 if (stopped()) { error = @"Transfert arrêté."; return; }
+                if (engine.candidateFile || [engine.pending[@"kind"] isEqual:@"alternative"]) {
+                    error = @"Une autre version attend ton choix dans Téléchargements → Options et nettoyage. Termine ce choix, puis reprends cet ajout."; return;
+                }
                 if (engine.busy || engine.clearing) { error = @"Mets les autres téléchargements en pause, puis reprends cet ajout."; return; }
                 selection = [engine merged:engine.history[reference[@"selection"]]];
                 catalogue = SGLocalImportTargetRow(selection, reference);
@@ -2065,7 +2065,11 @@ void SGAutomaticImportLocalSource(NSURL *root, NSDictionary *row, NSDictionary *
             // A previously repaired target is reused rather than silently
             // replaced by a late result from another source selection.
             if (catalogue && verifyRow(catalogue)) installed = catalogue;
-            NSURL *staging = installed ? nil : SGAutomaticTransferFile(endpoint, validated, stopped, taskStarted, progress, &error);
+            // A personal file has no catalogue mapping to replace. It can be
+            // installed while another recording awaits a choice, provided the
+            // transfer cache retains that recording's preview until the choice.
+            NSURL *staging = installed ? nil : SGAutomaticTransferFilePreservingCandidate(endpoint, validated,
+                engine.candidateFile, stopped, taskStarted, progress, &error);
             if (staging) {
                 if (catalogue) {
                     NSMutableDictionary *request = [catalogue mutableCopy];
