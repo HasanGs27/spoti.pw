@@ -96,6 +96,18 @@ jobs:
             tweak/Sources/Features/NowPlaying/LocalDownloadManifest.m -o "$RUNNER_TEMP/audio-variant-test"
           "$RUNNER_TEMP/audio-variant-test"
 
+      - name: Test YouTube selection and personal import model
+        run: |
+          clang -fobjc-arc -fblocks -Wall -Werror -framework Foundation -DSG_YOUTUBE_SOURCE_TEST=1 \
+            tweak/Sources/Features/NowPlaying/YouTubeSourceModel.m -o "$RUNNER_TEMP/youtube-source-test"
+          "$RUNNER_TEMP/youtube-source-test"
+          clang -fobjc-arc -fblocks -Wall -Werror -framework Foundation -DSG_LOCAL_IMPORT_TEST=1 \
+            tweak/Sources/Features/NowPlaying/LocalImportModel.m \
+            tweak/Sources/Features/NowPlaying/YouTubeSourceModel.m \
+            tweak/Sources/Features/NowPlaying/AutomaticDownloadModel.m \
+            tweak/Sources/Features/NowPlaying/LocalDownloadManifest.m -o "$RUNNER_TEMP/local-import-test"
+          "$RUNNER_TEMP/local-import-test"
+
       - name: Test native audio resolver
         run: bash scripts/test-native-audio.sh
 
