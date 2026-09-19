@@ -3,7 +3,7 @@
 // part's glass, hide switches and flags (Navbar, Player, Home & Library), Premium, ads & privacy
 // and Labs, All flags, a searchable list of every flag with an override per flag, and Mod, the
 // build, its updates and links. The same row leads the side drawer's list (trees/test6.txt), above
-// Your plan, so the page is a tap from Home, and holding Home on the tab bar opens it too. The tweaks read the switches when they run, so a change
+// Your plan, followed by a direct Downloads shortcut. Holding Home opens settings too. The tweaks read the switches when they run, so a change
 // shows after Spotify restarts; the tab editor on the Navbar page applies as soon as the bar lays
 // out again.
 //
@@ -19,12 +19,14 @@
 #import "Features/Navbar/Navbar.h"
 #import "Features/Home/Home.h"
 #import "Features/NowPlaying/NowPlaying.h"
+#import "Features/NowPlaying/AutomaticDownloads.h"
 #import "Features/AdBlock/AdBlock.h"
 #import "Features/Flags/Flags.h"
 #import "Features/About/About.h"
+#import <math.h>
 
 static const CGFloat kRowHeight = 56;
-static char kRowKey, kInsetKey;
+static char kRowKey, kDownloadsRowKey, kInsetKey;
 
 static SGModRow *pageRow(NSString *title, NSString *symbol, UIViewController *(^page)(void)) {
     return SGWithSymbol(SGPageRow(title, page), symbol);
@@ -65,6 +67,9 @@ static UIViewController *modSettingsPage(void) {
 // drawn like the drawer's own rows: no chevron, icon and title 4pt further in.
 @interface SGModSettingsRow : UIControl
 @property (nonatomic) BOOL drawer;
+@property (nonatomic, readonly) BOOL downloads;
+@property (nonatomic) BOOL opening;
+- (instancetype)initWithFrame:(CGRect)frame downloads:(BOOL)downloads;
 @end
 
 @implementation SGModSettingsRow {
@@ -74,13 +79,22 @@ static UIViewController *modSettingsPage(void) {
 }
 
 - (instancetype)initWithFrame:(CGRect)frame {
+    return [self initWithFrame:frame downloads:NO];
+}
+
+- (instancetype)initWithFrame:(CGRect)frame downloads:(BOOL)downloads {
     if (!(self = [super initWithFrame:frame])) return nil;
-    _icon = SGSymbolView(@"slider.horizontal.3", 20, UIImageSymbolWeightRegular, 24);
+    _downloads = downloads;
+    _icon = SGSymbolView(downloads ? @"arrow.down.circle" : @"slider.horizontal.3", 20, UIImageSymbolWeightRegular, 24);
     _title = [UILabel new];
-    _title.text = @"Mod Settings";
+    _title.text = downloads ? @"Téléchargements" : @"Mod Settings";
     _title.textColor = UIColor.whiteColor;
     _chevron = SGSymbolView(@"chevron.right", 11, UIImageSymbolWeightSemibold, 12);
     for (UIView *v in @[_icon, _title, _chevron]) [self addSubview:v];
+    self.isAccessibilityElement = YES;
+    self.accessibilityTraits = UIAccessibilityTraitButton;
+    self.accessibilityLabel = _title.text;
+    self.accessibilityIdentifier = downloads ? @"spoti.drawer.downloads" : @"spoti.settings.shortcut";
     [self addTarget:self action:@selector(open) forControlEvents:UIControlEventTouchUpInside];
     return self;
 }
@@ -102,6 +116,7 @@ static UIViewController *modSettingsPage(void) {
 
 static UINavigationController *navigationIn(UIViewController *page) {
     if ([page isKindOfClass:UINavigationController.class]) return (UINavigationController *)page;
+    if ([page isKindOfClass:UITabBarController.class]) return navigationIn(((UITabBarController *)page).selectedViewController);
     for (UIViewController *child in page.childViewControllers) {
         UINavigationController *found = navigationIn(child);
         if (found) return found;
@@ -112,17 +127,23 @@ static UINavigationController *navigationIn(UIViewController *page) {
 // The drawer is presented over the app, so its row closes it first and pushes onto the stack it
 // was covering, the way the drawer's own rows open their pages.
 - (void)open {
+    if (self.opening) return;
     UIViewController *owner = nil;
     for (UIResponder *r = self; r && !owner; r = r.nextResponder) {
         if ([r isKindOfClass:UIViewController.class]) owner = (UIViewController *)r;
     }
+    if (!owner) return;
+    BOOL downloads = self.downloads;
     UIViewController *presenting = self.drawer ? owner.presentingViewController : nil;
     if (!presenting) {
-        SGShowPage(owner, modSettingsPage());
+        SGShowPage(owner, downloads ? SGAutomaticDownloadsPageCreate() : modSettingsPage());
         return;
     }
+    self.opening = YES;
     [presenting dismissViewControllerAnimated:YES completion:^{
-        SGShowPage(navigationIn(presenting).topViewController ?: presenting, modSettingsPage());
+        SGShowPage(navigationIn(presenting).topViewController ?: presenting,
+            downloads ? SGAutomaticDownloadsPageCreate() : modSettingsPage());
+        self.opening = NO;
     }];
 }
 
@@ -142,18 +163,27 @@ void SGOpenModSettings(UIView *source) {
 // At the end of the settings list, or above the first row of the drawer's, with the inset for it
 // added again whenever Spotify resets the inset.
 static void placeRow(UICollectionView *list, SGModSettingsRow *row) {
-    SGAdoptFonts(list, row);
+    SGModSettingsRow *downloads = row.drawer ? objc_getAssociatedObject(list, &kDownloadsRowKey) : nil;
+    // Adopt only native cell fonts, not the second shortcut's fallback font.
+    if (row.drawer) for (UICollectionViewCell *cell in list.visibleCells) SGAdoptFonts(cell, row);
+    else SGAdoptFonts(list, row);
     CGFloat bottom = list.contentSize.height;
+    CGFloat reserved = kRowHeight * (downloads ? 2 : 1);
     row.hidden = !row.drawer && bottom <= 0;
-    row.frame = CGRectMake(0, row.drawer ? -kRowHeight : bottom, list.bounds.size.width, kRowHeight);
+    row.frame = CGRectMake(0, row.drawer ? -reserved : bottom, list.bounds.size.width, kRowHeight);
+    if (downloads) downloads.frame = CGRectMake(0, -kRowHeight, list.bounds.size.width, kRowHeight);
 
     UIEdgeInsets inset = list.contentInset;
     NSValue *applied = objc_getAssociatedObject(list, &kInsetKey);
-    if (applied && UIEdgeInsetsEqualToEdgeInsets(inset, applied.UIEdgeInsetsValue)) return;
-    if (row.drawer) inset.top += kRowHeight;
+    // Changes to another edge must not add the shortcut height again.
+    if (applied && (row.drawer ? inset.top == applied.UIEdgeInsetsValue.top : inset.bottom == applied.UIEdgeInsetsValue.bottom)) return;
+    BOOL atTop = row.drawer && !list.dragging && !list.decelerating && !list.tracking &&
+        fabs(list.contentOffset.y + list.adjustedContentInset.top) <= 1;
+    if (row.drawer) inset.top += reserved;
     else inset.bottom += kRowHeight;
     objc_setAssociatedObject(list, &kInsetKey, [NSValue valueWithUIEdgeInsets:inset], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     list.contentInset = inset;
+    if (atTop) list.contentOffset = CGPointMake(list.contentOffset.x, -list.adjustedContentInset.top);
 }
 
 // Media quality, Playback, Account and most of the rest of settings are the same controller class
@@ -210,11 +240,18 @@ static BOOL isSettingsRoot(UIViewController *list) {
     %orig;
     SGForEachView(((UIViewController *)self).view, ^(UIView *v) {
         if (![v isKindOfClass:UICollectionView.class] || ![NSStringFromClass(v.class) containsString:@"SideDrawerListCollectionView"]) return;
-        if (objc_getAssociatedObject(v, &kRowKey)) return;
-        SGModSettingsRow *row = [[SGModSettingsRow alloc] initWithFrame:CGRectZero];
-        row.drawer = YES;
-        objc_setAssociatedObject(v, &kRowKey, row, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        [v addSubview:row];
+        if (!objc_getAssociatedObject(v, &kRowKey)) {
+            SGModSettingsRow *row = [[SGModSettingsRow alloc] initWithFrame:CGRectZero];
+            row.drawer = YES;
+            objc_setAssociatedObject(v, &kRowKey, row, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            [v addSubview:row];
+        }
+        if (!objc_getAssociatedObject(v, &kDownloadsRowKey)) {
+            SGModSettingsRow *downloads = [[SGModSettingsRow alloc] initWithFrame:CGRectZero downloads:YES];
+            downloads.drawer = YES;
+            objc_setAssociatedObject(v, &kDownloadsRowKey, downloads, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            [v addSubview:downloads];
+        }
     });
 }
 %end
