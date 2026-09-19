@@ -31,7 +31,7 @@ Depuis la racine de l’espace de travail, après préparation du compagnon :
 ```
 
 Le script télécharge les paquets et le modèle officiels, contrôle leurs empreintes,
-puis sépare un signal généré de huit secondes. Il n’emploie aucune chanson de la
+puis sépare un signal généré de douze secondes. Il n’emploie aucune chanson de la
 bibliothèque. Il écrit `config.json` avec `ready: true` seulement après réussite
 du test CUDA. `--validate-only` répète cette vérification sans installation ni
 téléchargement. Les chemins ci-dessus sont ceux de l’environnement compagnon ;
@@ -58,6 +58,9 @@ processus de séparation avant chaque chargement.
 Les poids ne sont pas stockés dans Git. La provenance et les versions installées
 restent dans le dossier du studio. Après l’installation, la génération n’a pas
 besoin d’Internet et n’effectue aucun téléchargement de modèle à la volée.
+L’adaptateur traduit la fenêtre officielle de 352 800 échantillons en 801 trames
+STFT (pas de 441), le format attendu par audio-separator ; le YAML et les poids
+officiels restent inchangés.
 
 ## Limites et vérification
 
