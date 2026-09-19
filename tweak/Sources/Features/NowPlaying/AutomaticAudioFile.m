@@ -171,18 +171,40 @@ static BOOL writeM4A(AVURLAsset *asset, NSURL *outputURL, NSString *title, NSStr
         (__bridge NSString *)([mime isEqual:@"image/png"] ? kCMMetadataBaseDataType_PNG : kCMMetadataBaseDataType_JPEG))];
     return writeM4AItems(asset, outputURL, metadata, cancelled);
 }
+static NSDictionary *installAudio(NSURL *staging, NSDictionary *requested, BOOL catalogue,
+    BOOL (^cancelled)(void), NSString **reason);
 NSDictionary *SGAutomaticInstallAudio(NSURL *staging, NSDictionary *requested, NSString **reason) {
     return SGAutomaticInstallAudioCancellable(staging, requested, nil, reason);
 }
 NSDictionary *SGAutomaticInstallAudioCancellable(NSURL *staging, NSDictionary *requested, BOOL (^cancelled)(void), NSString **reason) {
+    return installAudio(staging, requested, YES, cancelled, reason);
+}
+NSDictionary *SGAutomaticInstallLocalAudioCancellable(NSURL *staging, NSDictionary *requested, BOOL (^cancelled)(void), NSString **reason) {
+    return installAudio(staging, requested, NO, cancelled, reason);
+}
+static NSDictionary *installAudio(NSURL *staging, NSDictionary *requested, BOOL catalogue,
+    BOOL (^cancelled)(void), NSString **reason) {
     if (reason) *reason = nil;
     if (stopped(cancelled)) return failure(reason, @"Transfert arrêté.");
     if (![requested isKindOfClass:NSDictionary.class]) return failure(reason, @"Le morceau à associer au fichier est invalide.");
     NSString *spotify = SGAutomaticSpotifyURL(requested[@"spotify"]);
     NSNumber *position = requested[@"position"];
-    if (!staging.isFileURL || ![spotify containsString:@"/track/"] || ![position isKindOfClass:NSNumber.class] ||
-        position.doubleValue != position.unsignedIntegerValue || position.unsignedIntegerValue < 1 || position.unsignedIntegerValue > 500)
+    if (!staging.isFileURL || (catalogue && (![spotify containsString:@"/track/"] || ![position isKindOfClass:NSNumber.class] ||
+        position.doubleValue != position.unsignedIntegerValue || position.unsignedIntegerValue < 1 || position.unsignedIntegerValue > 500)))
         return failure(reason, @"Le morceau à associer au fichier est invalide.");
+    if (!catalogue) {
+        if (requested[@"spotify"] || requested[@"position"])
+            return failure(reason, @"Un import local indépendant ne doit pas contenir d'association Spotify.");
+        for (NSString *key in @[@"title", @"artist", @"album", @"sourceURL", @"source_url", @"sourceKind", @"sourceID", @"local_id", @"quality"]) {
+            id value = requested[key];
+            NSUInteger limit = [@[@"sourceURL", @"source_url"] containsObject:key] ? 4096 : 512;
+            if (value && (![value isKindOfClass:NSString.class] || [value length] > limit))
+                return failure(reason, @"Les informations de la source sont invalides.");
+        }
+        for (NSString *key in @[@"sourceURL", @"source_url"])
+            if (requested[key] && !SGAutomaticAudioSource(requested[key]))
+                return failure(reason, @"Le lien de provenance de la source est invalide.");
+    }
     NSFileManager *fm = NSFileManager.defaultManager;
     NSNumber *size = nil, *regular = nil, *link = nil;
     [staging getResourceValue:&size forKey:NSURLFileSizeKey error:nil];
@@ -219,16 +241,22 @@ NSDictionary *SGAutomaticInstallAudioCancellable(NSURL *staging, NSDictionary *r
             if ([item.commonKey isEqual:AVMetadataCommonKeyAlbumName]) album = item.stringValue ?: @"";
             if ([item.commonKey isEqual:AVMetadataCommonKeyArtwork] && pictureType(item.dataValue)) artwork = item.dataValue;
         }
-        NSString *title = label(requested[@"expectedTitle"]), *artist = label(requested[@"expectedArtist"]);
+        NSString *originalAlbum = album;
+        NSString *title = catalogue ? label(requested[@"expectedTitle"]) : @"";
+        NSString *artist = catalogue ? label(requested[@"expectedArtist"]) : @"";
         if (!title.length) title = originalTitle.length ? originalTitle : label(requested[@"title"]);
         if (!artist.length) artist = originalArtist.length ? originalArtist : label(requested[@"artist"]);
+        if (!catalogue && !album.length) album = label(requested[@"album"]);
         if (!title.length || !artist.length || [title isEqual:@"Recherche du morceau..."])
             return failure(reason, @"Il manque le titre ou l'artiste. Choisis un fichier qui contient ces informations.");
+        if (!catalogue && (![title stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet].length ||
+                           ![artist stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet].length))
+            return failure(reason, @"Il manque le titre ou l'artiste du fichier local.");
         if (title.length > 512 || artist.length > 512 || album.length > 512)
             return failure(reason, @"Les informations du fichier sont trop volumineuses.");
         BOOL addedCover = !artwork && pictureType(requested[@"artworkData"]);
         if (addedCover) artwork = requested[@"artworkData"];
-        BOOL retag = ![title isEqual:originalTitle] || ![artist isEqual:originalArtist] || addedCover;
+        BOOL retag = ![title isEqual:originalTitle] || ![artist isEqual:originalArtist] || addedCover || ![album isEqual:originalAlbum];
         NSURL *prepared = staging;
         if (stopped(cancelled)) return failure(reason, @"Transfert arrêté.");
         if (retag) {
@@ -262,20 +290,29 @@ NSDictionary *SGAutomaticInstallAudioCancellable(NSURL *staging, NSDictionary *r
             return failure(reason, @"Le fichier préparé dépasse la limite de 100 Mo.");
         NSString *hash = audioHash(prepared, cancelled);
         if (!hash) return failure(reason, stopped(cancelled) ? @"Transfert arrêté." : @"La vérification du fichier a échoué.");
-        NSMutableDictionary *result = [@{@"position":position, @"spotify":spotify, @"state":@"ready", @"id":hash,
+        NSMutableDictionary *result = [@{@"state":@"ready", @"id":hash,
             @"bytes":preparedSize, @"seconds":@(seconds), @"title":title, @"artist":artist, @"album":album, @"extension":ext} mutableCopy];
-        for (NSString *key in @[@"expectedTitle", @"expectedArtist", @"expectedArtists", @"expectedSeconds", @"coverURL", @"sourceURL", @"sourceKind", @"sourceID"])
+        if (catalogue) { result[@"position"] = position; result[@"spotify"] = spotify; }
+        NSArray *extraKeys = catalogue ? @[@"expectedTitle", @"expectedArtist", @"expectedArtists", @"expectedSeconds", @"coverURL", @"sourceURL", @"sourceKind", @"sourceID"] :
+            @[@"expectedSeconds", @"sourceURL", @"source_url", @"sourceKind", @"sourceID", @"local_id", @"quality"];
+        for (NSString *key in extraKeys)
             if (requested[key] && requested[key] != NSNull.null) result[key] = requested[key];
-        NSDictionary *wrapper = @{@"version":@2, @"id":@"00000000000000000000000000000000", @"url":spotify,
-            @"state":@"complete", @"name":@"", @"message":@"", @"scope":@"", @"items":@[[result mutableCopy]]};
-        NSMutableDictionary *validationRow = [result mutableCopy]; validationRow[@"position"] = @1;
-        NSMutableDictionary *validation = [wrapper mutableCopy]; validation[@"items"] = @[validationRow];
-        if (![NSJSONSerialization isValidJSONObject:validation] || !SGAutomaticJob([NSJSONSerialization dataWithJSONObject:validation options:0 error:nil]))
+        if (!catalogue) result[@"cover"] = @(artwork != nil);
+        if (catalogue) {
+            NSDictionary *wrapper = @{@"version":@2, @"id":@"00000000000000000000000000000000", @"url":spotify,
+                @"state":@"complete", @"name":@"", @"message":@"", @"scope":@"", @"items":@[[result mutableCopy]]};
+            NSMutableDictionary *validationRow = [result mutableCopy]; validationRow[@"position"] = @1;
+            NSMutableDictionary *validation = [wrapper mutableCopy]; validation[@"items"] = @[validationRow];
+            if (![NSJSONSerialization isValidJSONObject:validation] || !SGAutomaticJob([NSJSONSerialization dataWithJSONObject:validation options:0 error:nil]))
+                return failure(reason, @"Les informations de la source sont invalides.");
+        } else if (![NSJSONSerialization isValidJSONObject:result])
             return failure(reason, @"Les informations de la source sont invalides.");
         // Reuse audio already imported manually or by another playlist, including
         // copies whose only difference is container metadata. The library requires
         // identical compressed audio, never just a matching title.
-        NSDictionary *existing = SGAutomaticLibraryReuse(prepared, result, cancelled);
+        // Independent imports only reuse their exact content-addressed destination.
+        // They never enter Spotify's alias/playlist lookup with a fabricated identity.
+        NSDictionary *existing = catalogue ? SGAutomaticLibraryReuse(prepared, result, cancelled) : nil;
         if (existing) return existing;
         if (stopped(cancelled)) return failure(reason, @"Transfert arrêté.");
         NSURL *docs = [fm URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask].firstObject;
@@ -432,6 +469,48 @@ int main(void) { @autoreleasepool {
     assert(!SGAutomaticInstallAudio(source, request, &reason)); [fm removeItemAtURL:source error:nil];
     source = testInput([[@"<html>Not audio</html>" stringByPaddingToLength:2048 withString:@" " startingAtIndex:0] dataUsingEncoding:NSUTF8StringEncoding], @"mp3");
     assert(!SGAutomaticInstallAudio(source, request, &reason)); [fm removeItemAtURL:source error:nil];
-    puts("Audio import: PASS (MP3 bytes preserved, M4A passthrough + cover, deduplication, duration check, cancellation, truncated audio/HTML rejection)");
+    // Independent imports never manufacture a Spotify track or enter its association map.
+    NSMutableDictionary *local = [@{@"title":@"Local fixture", @"artist":@"Local artist", @"album":@"Local album",
+        @"expectedSeconds":@(completeMP3Duration), @"local_id":@"0123456789abcdef0123456789abcdef",
+        @"sourceURL":@"https://www.youtube.com/watch?v=abcdefghijk", @"source_url":@"https://www.youtube.com/watch?v=abcdefghijk",
+        @"sourceKind":@"youtube", @"artworkData":[[NSData alloc] initWithBase64EncodedString:coverFixture options:0]} mutableCopy];
+    source = testInput(raw, @"mp3");
+    assert(!SGAutomaticInstallAudio(source, local, &reason)); // Existing catalogue API still requires a track.
+    assert(!SGAutomaticInstallLocalAudioCancellable(source, request, nil, &reason)); // Explicit catalogue row is rejected.
+    assert(!SGAutomaticInstallLocalAudioCancellable(source, local, ^BOOL{ return YES; }, &reason));
+    assert([[NSData dataWithContentsOfURL:source] isEqual:raw]);
+    row = SGAutomaticInstallLocalAudioCancellable(source, local, nil, &reason);
+    if (!row) NSLog(@"Independent local import failed: %@", reason);
+    assert(row && !row[@"spotify"] && !row[@"position"] && !row[@"artworkData"]);
+    assert([row[@"title"] isEqual:local[@"title"]] && [row[@"artist"] isEqual:local[@"artist"]] && [row[@"album"] isEqual:local[@"album"]]);
+    assert([row[@"local_id"] isEqual:local[@"local_id"]] && [row[@"sourceURL"] isEqual:local[@"sourceURL"]] &&
+        [row[@"source_url"] isEqual:local[@"source_url"]] && [row[@"sourceKind"] isEqual:local[@"sourceKind"]]);
+    target = SGAutomaticLibraryFile(row); installed = [NSData dataWithContentsOfURL:target];
+    assert(installed.length > raw.length && [audioHash(target, nil) isEqual:row[@"id"]]);
+    assert([[installed subdataWithRange:NSMakeRange(installed.length - raw.length, raw.length)] isEqual:raw]);
+    assert([row[@"cover"] boolValue]);
+    duplicate = testInput(installed, @"mp3");
+    local[@"title"] = @"Unused fallback title"; local[@"expectedTitle"] = @"Never a catalogue label";
+    again = SGAutomaticInstallLocalAudioCancellable(duplicate, local, nil, &reason);
+    assert([again[@"id"] isEqual:row[@"id"]] && [again[@"title"] isEqual:row[@"title"]] && !again[@"spotify"]);
+    [fm removeItemAtURL:duplicate error:nil];
+    NSData *occupant = [@"Keep this different existing file" dataUsingEncoding:NSUTF8StringEncoding];
+    assert([occupant writeToURL:target atomically:YES]);
+    duplicate = testInput(installed, @"mp3");
+    assert(!SGAutomaticInstallLocalAudioCancellable(duplicate, local, nil, &reason));
+    assert([[NSData dataWithContentsOfURL:target] isEqual:occupant]);
+    [fm removeItemAtURL:duplicate error:nil]; [fm removeItemAtURL:target error:nil]; [fm removeItemAtURL:source error:nil];
+    source = testInput(raw, @"mp3"); local[@"expectedSeconds"] = @180;
+    assert(!SGAutomaticInstallLocalAudioCancellable(source, local, nil, &reason) && [reason containsString:@"durée"]);
+    assert([[NSData dataWithContentsOfURL:source] isEqual:raw]); [fm removeItemAtURL:source error:nil];
+    [local removeObjectForKey:@"expectedSeconds"];
+    source = testInput([raw subdataWithRange:NSMakeRange(0, raw.length / 2)], @"mp3");
+    assert(!SGAutomaticInstallLocalAudioCancellable(source, local, nil, &reason)); [fm removeItemAtURL:source error:nil];
+    source = testInput(m4a, @"download");
+    row = SGAutomaticInstallLocalAudioCancellable(source, @{}, nil, &reason);
+    assert(row && !row[@"spotify"] && !row[@"position"] && [row[@"extension"] isEqual:@"m4a"]);
+    target = SGAutomaticLibraryFile(row);
+    assert([[NSData dataWithContentsOfURL:target] isEqual:m4a]); [fm removeItemAtURL:target error:nil]; [fm removeItemAtURL:source error:nil];
+    puts("Audio import: PASS (MP3 bytes preserved, M4A passthrough + cover, independent local imports, deduplication, duration check, cancellation, truncated audio/HTML rejection)");
 } return 0; }
 #endif

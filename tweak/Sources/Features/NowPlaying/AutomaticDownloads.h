@@ -16,6 +16,12 @@ void SGAutomaticImportAudioVersion(NSURL *root, NSDictionary *row,
     BOOL (^cancelled)(void), void (^taskStarted)(NSURLSessionTask *task),
     void (^progress)(NSUInteger received, NSUInteger total),
     void (^completion)(NSDictionary *installedRow, NSString *error));
+// A user-chosen source has its own identity. Optional target is an existing
+// catalogue history reference; absent target means a standalone local file.
+void SGAutomaticImportLocalSource(NSURL *root, NSDictionary *row, NSDictionary *target,
+    BOOL (^cancelled)(void), void (^taskStarted)(NSURLSessionTask *task),
+    void (^progress)(NSUInteger received, NSUInteger total),
+    void (^completion)(NSDictionary *installedRow, NSString *error));
 // Main-thread snapshot. Green is reserved for files verified by the download engine.
 // Keys: state (idle/queued/running/ready/incomplete/error/partial/paused), completed, total, progress.
 // queuePosition is one-based for queued collections, otherwise zero.

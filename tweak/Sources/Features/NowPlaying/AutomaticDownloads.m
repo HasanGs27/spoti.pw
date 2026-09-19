@@ -4,6 +4,10 @@
 #import "AutomaticDownloadTransfer.h"
 #import "AutomaticDownloadState.h"
 #import "AudioVariantsPage.h"
+#import "LocalImportModel.h"
+#import "LocalImportsPage.h"
+#import "YouTubeSourceBrowser.h"
+#import "YouTubeSourceModel.h"
 #import "AutomaticPCDiscovery.h"
 #import "AutomaticAudioFile.h"
 #import "AutomaticAudioLibrary.h"
@@ -98,6 +102,12 @@ static void tell(NSString *message) {
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Téléchargements" message:message preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleCancel handler:nil]];
     [owner presentViewController:alert animated:YES completion:nil];
+}
+static void afterSourceSheet(UIAlertController *sheet, void (^completion)(void)) {
+    if (!sheet.presentingViewController) { completion(); return; }
+    id<UIViewControllerTransitionCoordinator> transition = sheet.transitionCoordinator;
+    if (sheet.isBeingDismissed && transition && [transition animateAlongsideTransition:nil completion:^(id<UIViewControllerTransitionCoordinatorContext> context) { completion(); }]) return;
+    [sheet dismissViewControllerAnimated:YES completion:completion];
 }
 
 @interface SGAutomaticDownloads : NSObject <NSURLSessionTaskDelegate, NSURLSessionDownloadDelegate, UIDocumentInteractionControllerDelegate>
@@ -1451,7 +1461,7 @@ static void tell(NSString *message) {
 }
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)table { return 4; }
 - (NSInteger)tableView:(UITableView *)table numberOfRowsInSection:(NSInteger)section {
-    return section == 0 ? 4 : section == 1 ? MAX(1, self.positions.count) : section == 2 ? self.queuedURLs.count : self.historyURLs.count;
+    return section == 0 ? 5 : section == 1 ? MAX(1, self.positions.count) : section == 2 ? self.queuedURLs.count : self.historyURLs.count;
 }
 - (NSString *)tableView:(UITableView *)table titleForHeaderInSection:(NSInteger)section {
     return section == 2 && self.queuedURLs.count ? @"À suivre" : section == 3 && self.historyURLs.count ? @"Mes sélections" : nil;
@@ -1511,6 +1521,7 @@ static void tell(NSString *message) {
             else if (!engine.busy && engine.waitingForPC) title = engine.userPaused ? @"Reprendre la connexion" : @"Mettre l’attente en pause";
             SGFillCell(cell, title, engine.busy ? @"Les morceaux terminés seront conservés" : nil, SGGreen(), engine.busy ? @"pause.circle.fill" : allReady ? @"play.circle.fill" : @"arrow.down.circle.fill");
         } else if (path.row == 2) SGFillCell(cell, @"Ajouter un lien Spotify", engine.busy ? @"Ajouter une sélection à la suite" : @"Un morceau ou une playlist", nil, @"plus.circle");
+        else if (path.row == 3) SGFillCell(cell, @"Ajouter un morceau", @"YouTube ou lien audio · même absent de Spotify", nil, @"music.note.badge.plus");
         else SGFillCell(cell, @"Options et nettoyage", @"Mode PC / iPhone · réessayer · nettoyer", nil, @"slider.horizontal.3");
     } else if (path.section == 1) {
         if (!self.positions.count) {
@@ -1587,7 +1598,8 @@ static void tell(NSString *message) {
     }
     if (path.row == 0) return;
     if (path.row == 2) { [self addLink]; return; }
-    if (path.row == 3) { [self showActions:[table cellForRowAtIndexPath:path]]; return; }
+    if (path.row == 3) { SGShowPage(self, SGLocalImportsPageCreate(nil, nil, nil, nil)); return; }
+    if (path.row == 4) { [self showActions:[table cellForRowAtIndexPath:path]]; return; }
     if (engine.candidateFile && !engine.busy) { [engine resume]; return; }
     if (engine.waitingForPC && !engine.userPaused && !engine.busy) { [engine pause]; return; }
     if (engine.busy) [engine pause];
@@ -1665,6 +1677,20 @@ static void tell(NSString *message) {
     UIAlertController *sheet = [UIAlertController alertControllerWithTitle:row[@"title"]
         message:engine.importErrors[row[@"spotify"]] ?: @"Choisis une source pour ce morceau. La flèche passera au vert après vérification."
         preferredStyle:UIAlertControllerStyleActionSheet];
+    __weak UIAlertController *sourceSheet = sheet;
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Rechercher sur YouTube" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        NSString *title = row[@"expectedTitle"] ?: row[@"title"] ?: @"";
+        NSString *artist = row[@"expectedArtist"] ?: row[@"artist"] ?: @"";
+        NSString *query = [NSString stringWithFormat:@"%@ %@ audio", title, artist];
+        __weak typeof(self) weak = self;
+        UIViewController *browser = SGYouTubeSourceBrowserCreate(query, ^(NSURL *url, NSString *suggestedTitle) {
+            SGAutomaticDownloadsPage *page = weak; if (!page) return;
+            NSDictionary *target = SGLocalImportTarget(@{@"selection":selection[@"url"] ?: @"", @"track":row[@"spotify"] ?: @"", @"position":row[@"position"] ?: @0});
+            if (!target) { [engine update:@"Ce morceau n'est plus dans la sélection. Rouvre sa liste."]; return; }
+            SGShowPage(page, SGLocalImportsPageCreate(url, title, artist, target));
+        });
+        afterSourceSheet(sourceSheet, ^{ [self presentViewController:browser animated:YES completion:nil]; });
+    }]];
     [sheet addAction:[UIAlertAction actionWithTitle:@"Choisir un fichier audio" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
         self.pickedRow = row; self.pickedSelection = selection;
         UIDocumentPickerViewController *picker = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeAudio] asCopy:YES];
@@ -1673,7 +1699,7 @@ static void tell(NSString *message) {
     }]];
     [sheet addAction:[UIAlertAction actionWithTitle:@"Coller un lien audio ou YouTube" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
         UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Lien du fichier audio"
-            message:@"Lien direct vers un MP3/M4A, ou lien d'une vidéo YouTube / YouTube Music correspondant au morceau. Le titre, l'artiste et la durée seront vérifiés. Le réseau mobile peut être utilisé."
+            message:@"Lien direct vers un MP3/M4A, ou lien d'une vidéo YouTube correspondant au morceau. YouTube sera préparé sur le PC associé. La durée du fichier sera contrôlée avant l'association au morceau."
             preferredStyle:UIAlertControllerStyleAlert];
         [alert addTextFieldWithConfigurationHandler:^(UITextField *field) {
             field.keyboardType = UIKeyboardTypeURL; field.autocapitalizationType = UITextAutocapitalizationTypeNone;
@@ -1684,14 +1710,16 @@ static void tell(NSString *message) {
         [alert addAction:[UIAlertAction actionWithTitle:@"Importer" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
             NSString *text = [weak.textFields.firstObject.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
             NSURL *candidate = [NSURL URLWithString:text];
-            BOOL youtube = [candidate.scheme.lowercaseString isEqual:@"https"] && !candidate.user && !candidate.password &&
-                [@[@"youtube.com", @"www.youtube.com", @"music.youtube.com", @"youtu.be"] containsObject:candidate.host.lowercaseString];
+            NSURL *youtube = SGYouTubeCanonicalVideoURL(candidate);
             NSURL *url = SGAutomaticAudioSource(text);
-            if (youtube) [engine repairRow:row selection:selection source:candidate];
+            if (youtube) {
+                NSDictionary *target = SGLocalImportTarget(@{@"selection":selection[@"url"] ?: @"", @"track":row[@"spotify"] ?: @"", @"position":row[@"position"] ?: @0});
+                if (target) afterSourceSheet(weak, ^{ SGShowPage(self, SGLocalImportsPageCreate(youtube, row[@"expectedTitle"] ?: row[@"title"], row[@"expectedArtist"] ?: row[@"artist"], target)); });
+            }
             else if (url) [engine importAudio:url row:row selection:selection];
             else [engine update:@"Lien invalide : utilise l'adresse HTTPS du fichier audio, sans identifiants de connexion."];
         }]];
-        [self presentViewController:alert animated:YES completion:nil];
+        afterSourceSheet(sourceSheet, ^{ [self presentViewController:alert animated:YES completion:nil]; });
     }]];
     [sheet addAction:[UIAlertAction actionWithTitle:@"Rechercher à nouveau sur l’iPhone" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
         [engine repairRow:row selection:selection source:nil];
@@ -1906,6 +1934,79 @@ void SGAutomaticImportAudioVersion(NSURL *root, NSDictionary *row,
         }
         dispatch_async(dispatch_get_main_queue(), ^{
             completion(installed, installed ? nil : error ?: @"La copie n’a pas pu être enregistrée. Réessaie.");
+        });
+    });
+}
+
+void SGAutomaticImportLocalSource(NSURL *root, NSDictionary *row, NSDictionary *target,
+    BOOL (^cancelled)(void), void (^taskStarted)(NSURLSessionTask *),
+    void (^progress)(NSUInteger, NSUInteger), void (^completion)(NSDictionary *, NSString *)) {
+    if (!completion) return;
+    SGAutomaticDownloads *engine = SGAutomaticDownloads.shared;
+    NSDictionary *validated = SGLocalImportReadyRow(row), *reference = SGLocalImportTarget(target);
+    NSURL *endpoint = SGDownloadRoot(root.absoluteString);
+    dispatch_async(engine.worker, ^{
+        __block NSString *error = nil;
+        __block NSDictionary *catalogue = nil, *selection = nil;
+        __block NSUInteger engineGeneration = 0;
+        __block BOOL reserved = NO;
+        BOOL (^stopped)(void) = ^BOOL {
+            return (cancelled && cancelled()) || ![engine.root isEqual:endpoint] || (reserved && engine.generation != engineGeneration);
+        };
+        if (!validated || !endpoint || (target && !reference) || stopped()) error = @"Transfert arrêté ou source invalide.";
+        else if (engine.candidateFile || [engine.pending[@"kind"] isEqual:@"alternative"])
+            error = @"Termine le choix de l'autre version avant d'importer ce morceau.";
+        else if (reference) {
+            // Resolve the original metadata again. A stale browser must never
+            // bind its selection to the current player or a different row.
+            dispatch_sync(dispatch_get_main_queue(), ^{
+                if (stopped()) { error = @"Transfert arrêté."; return; }
+                if (engine.busy || engine.clearing) { error = @"Mets les autres téléchargements en pause, puis reprends cet ajout."; return; }
+                selection = [engine merged:engine.history[reference[@"selection"]]];
+                catalogue = SGLocalImportTargetRow(selection, reference);
+                if (!catalogue) {
+                    error = @"La sélection d'origine a changé. Rouvre le morceau à compléter."; return;
+                }
+                engine.busy = YES; engineGeneration = ++engine.generation; reserved = YES;
+                engine.activeSpotify = reference[@"track"]; engine.activeCollection = reference[@"selection"];
+                [engine update:@"Enregistrement de la source choisie…"];
+            });
+        }
+        __block NSDictionary *installed = nil;
+        if (!error && !stopped()) {
+            // A previously repaired target is reused rather than silently
+            // replaced by a late result from another source selection.
+            if (catalogue && verifyRow(catalogue)) installed = catalogue;
+            NSURL *staging = installed ? nil : SGAutomaticTransferFile(endpoint, validated, stopped, taskStarted, progress, &error);
+            if (staging) {
+                if (catalogue) {
+                    NSMutableDictionary *request = [catalogue mutableCopy];
+                    request[@"sourceURL"] = validated[@"sourceURL"]; request[@"sourceKind"] = validated[@"sourceKind"];
+                    // The catalogue's expected duration is retained. Explicit
+                    // choice does not make a long music video the album audio.
+                    installed = SGAutomaticInstallAudioCancellable(staging, request, stopped, &error);
+                } else {
+                    NSMutableDictionary *request = [validated mutableCopy]; [request removeObjectForKey:@"position"];
+                    installed = SGAutomaticInstallLocalAudioCancellable(staging, request, stopped, &error);
+                }
+                [NSFileManager.defaultManager removeItemAtURL:staging error:nil];
+            }
+        }
+        if (reserved) {
+            dispatch_sync(dispatch_get_main_queue(), ^{
+                if (engine.generation != engineGeneration) {
+                    // The file may have committed just before a global pause.
+                    // Keep it, but do not report a completed catalogue repair
+                    // until its exact association has also been committed.
+                    installed = nil; error = @"L’association du morceau a été interrompue. Reprends cet ajout ; le fichier déjà enregistré sera réutilisé."; return;
+                }
+                if (installed) { markVerified(installed); [engine remember:installed]; [engine setRow:installed inJob:selection]; }
+                else if (error && !stopped()) [engine saveError:error row:catalogue];
+                [engine finish:installed ? @"Morceau complété avec la source choisie." : error ?: @"Ajout interrompu." generation:engineGeneration];
+            });
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            completion(installed, installed ? nil : error ?: @"Le morceau n'a pas pu être enregistré. Tu peux reprendre cet ajout.");
         });
     });
 }
