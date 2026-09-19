@@ -11,13 +11,13 @@ Le PC prépare les fichiers ; l'iPhone les récupère et les vérifie avant d'af
 
 La page du compagnon affiche les demandes récentes et les fichiers prêts **sur le PC**. Ce compteur ne confirme pas leur présence sur l'iPhone : la flèche verte dans l'application sert à cela. Les commandes de nettoyage de l'application conservent les fichiers déjà téléchargés.
 
-## Éviter et ranger les doublons sur l'iPhone
+## Gérer les fichiers de l’iPhone
 
-Un morceau déjà enregistré et vérifié peut être utilisé dans plusieurs sélections sans créer une nouvelle copie sur l'iPhone. Les positions et les répétitions voulues dans une playlist restent conservées : partager un fichier ne supprime pas les entrées de la playlist.
+Un morceau déjà enregistré et vérifié peut être utilisé dans plusieurs sélections sans créer une nouvelle copie sur l’iPhone. Les positions et répétitions voulues dans les playlists restent conservées.
 
-Pour les copies déjà présentes, ouvrir **Téléchargements automatiques → Options et nettoyage → Ranger les doublons**. Les copies reconnues comme doublons sont déplacées dans une archive interne ; elles ne sont pas supprimées définitivement. **Restaurer les doublons** permet de les remettre. L'archive conserve donc de l'espace occupé sur l'iPhone. Un nom de morceau identique ne suffit pas, à lui seul, à fusionner deux fichiers ou deux versions.
+Ouvrir **Téléchargements → Options et nettoyage → Gérer les fichiers locaux**. Cette page affiche les fichiers audio présents, y compris les anciens imports manuels. Rechercher un titre, puis toucher sa ligne ou la faire glisser vers la gauche. La confirmation **Supprimer définitivement** efface uniquement le fichier sélectionné, sans archive ni corbeille. Vérifier le nom et le dossier pour distinguer deux copies.
 
-Après un rangement, laisser Spotify relire les fichiers locaux ; si l'ancienne liste reste affichée, fermer puis rouvrir l'application. Les fichiers déjà enregistrés restent écoutables sans le PC.
+Toutes les playlists utilisant ce même fichier perdent cette copie hors ligne. Les autres fichiers et les playlists Spotify restent conservés. Une nouvelle demande de téléchargement explicite peut récupérer le morceau de nouveau si sa source est disponible. Le PC conserve sa propre copie préparée ; cette action libère uniquement le stockage de l’iPhone. Si Spotify affiche encore l’ancienne ligne après suppression, fermer puis rouvrir l’application. Un fichier en cours de lecture peut occuper de l’espace jusqu’à ce que le lecteur le ferme.
 
 ## Limites actuelles
 
@@ -46,4 +46,4 @@ Installer les versions de `scripts/download-requirements.txt` dans un environnem
 
 `scripts/automatic_downloads.py --bind <IPv4-LAN> --data <dossier-jobs> --session <session.json> --ffmpeg <chemin-ffmpeg>` conserve l'association existante. Le lien de session est privé : ne pas le publier. Le compagnon est limité au réseau local et s'arrête après six heures au maximum ; il se relance avec le même lanceur. Il ne démarre pas automatiquement avec Windows.
 
-Le protocole reste en version 2 : les optimisations du compagnon n'exigent pas de reconstruire l'IPA compatible existante. Les commandes de rangement et de restauration sur l'iPhone nécessitent la version de l'application qui les intègre.
+Le protocole reste en version 2 : les optimisations du compagnon n'exigent pas de reconstruire l'IPA compatible existante. La gestion des fichiers locaux sur l’iPhone nécessite la nouvelle version de l’application.
