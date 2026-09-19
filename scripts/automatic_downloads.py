@@ -792,7 +792,7 @@ class Queue:
             with self.lock: self.running_jobs.discard(ident)
 
 
-def handler_for(queue, host, port, token, variants=None):
+def handler_for(queue, host, port, token, variants=None, local_imports=None):
     base, origin = '/' + token, f'http://{host}:{port}'
     nonce = secrets.token_urlsafe(18)
     page = r'''<!doctype html>
@@ -941,7 +941,7 @@ p{margin:8px 0;color:#b6c2ba}.connection{display:inline-flex;gap:8px;align-items
         def do_POST(self):
             path = urlsplit(self.path)
             if (self.headers.get('Host') != f'{host}:{port}' or path.query or path.fragment or
-                path.path not in (base+'/jobs', base+'/accept-version', base+'/storage/cleanup', base+'/audio-variants') or self.headers.get('Origin') not in (None, origin) or
+                path.path not in (base+'/jobs', base+'/accept-version', base+'/storage/cleanup', base+'/audio-variants', base+'/local-imports', base+'/local-imports/cancel') or self.headers.get('Origin') not in (None, origin) or
                 self.headers.get('Content-Type', '').split(';')[0] != 'application/json'):
                 return self.reply(403, {'error':'Requête refusée.'})
             try:
@@ -951,6 +951,13 @@ p{margin:8px 0;color:#b6c2ba}.connection{display:inline-flex;gap:8px;align-items
                 payload = self.rfile.read(size)
                 if len(payload) != size: raise ValueError('Requête incomplète.')
                 request = json.loads(payload)
+                if path.path in (base+'/local-imports', base+'/local-imports/cancel'):
+                    if local_imports is None: return self.reply(503, {'error':'Les imports personnels ne sont pas disponibles sur ce compagnon.'})
+                    from local_imports import LocalImportRequestError
+                    try:
+                        result = local_imports.cancel(request) if path.path.endswith('/cancel') else local_imports.submit(request)
+                        return self.reply(200 if path.path.endswith('/cancel') else 202, result)
+                    except LocalImportRequestError as error: return self.reply(400, {'error':str(error)[:300]})
                 if path.path == base+'/audio-variants':
                     if variants is None: return self.reply(503, {'error':'Les versions audio ne sont pas disponibles sur ce compagnon.'})
                     from download_variants import VariantRequestError
@@ -974,7 +981,14 @@ p{margin:8px 0;color:#b6c2ba}.connection{display:inline-flex;gap:8px;align-items
             if path in (base, base + '/'):
                 return self.reply(200, page, 'text/html; charset=utf-8')
             if path == base + '/hello': return self.reply(200, {'version':2,'service':'spoti-auto-downloads'})
-            if path == base + '/capabilities': return self.reply(200, dict(CAPABILITIES, audioVariants=variants is not None))
+            if path == base + '/capabilities': return self.reply(200, dict(CAPABILITIES, audioVariants=variants is not None, localImports=local_imports is not None))
+            if path == base + '/local-imports':
+                return self.reply(200, local_imports.listing()) if local_imports is not None else self.reply(404, {})
+            import_id = path.removeprefix(base + '/local-imports/')
+            if re.fullmatch('[a-f0-9]{32}', import_id):
+                if local_imports is None: return self.reply(404, {})
+                try: return self.reply(200, local_imports.get(import_id))
+                except KeyError: return self.reply(404, {})
             if path == base + '/audio-variants':
                 return self.reply(200, variants.listing()) if variants is not None else self.reply(404, {})
             variant_id = path.removeprefix(base + '/audio-variants/')
@@ -1071,11 +1085,13 @@ def main():
                 token = candidate
         except (ValueError, KeyError, TypeError, OSError): pass
     queue = Queue(args.data, args.ffmpeg, start=False)
-    server = timer = variants = None
+    server = timer = variants = local_imports = None
     try:
         from download_variants import VariantQueue
+        from local_imports import LocalImportQueue
         variants = VariantQueue(queue, args.ffmpeg)
-        server = ThreadingHTTPServer((args.bind, args.port), handler_for(queue, args.bind, args.port, token, variants))
+        local_imports = LocalImportQueue(queue, args.ffmpeg)
+        server = ThreadingHTTPServer((args.bind, args.port), handler_for(queue, args.bind, args.port, token, variants, local_imports))
         url = f'http://{args.bind}:{args.port}/{token}/'
         args.session.parent.mkdir(parents=True, exist_ok=True)
         atomic_document(args.session, dict(session_fields, url=url))
@@ -1091,6 +1107,7 @@ def main():
     finally:
         if timer: timer.cancel()
         if server: server.server_close()
+        if local_imports: local_imports.shutdown(wait=True)
         if variants: variants.shutdown(wait=True)
         queue.pool.shutdown(wait=True, cancel_futures=True)
 
