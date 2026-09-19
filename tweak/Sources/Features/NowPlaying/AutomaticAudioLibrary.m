@@ -535,7 +535,10 @@ static NSDictionary *testRequest(NSURL *file) {
 }
 int main(void) { @autoreleasepool {
     NSFileManager *fm = NSFileManager.defaultManager;
-    NSURL *root = [[NSURL fileURLWithPath:NSTemporaryDirectory() isDirectory:YES] URLByAppendingPathComponent:NSUUID.UUID.UUIDString isDirectory:YES];
+    // Match documents() in production: the trusted root is canonical before any
+    // child is created. macOS NSTemporaryDirectory may itself use /var -> /private/var.
+    NSURL *temporary = [[NSURL fileURLWithPath:NSTemporaryDirectory() isDirectory:YES] URLByResolvingSymlinksInPath];
+    NSURL *root = [temporary URLByAppendingPathComponent:NSUUID.UUID.UUIDString isDirectory:YES];
     testDocuments = [root URLByAppendingPathComponent:@"Documents" isDirectory:YES];
     testSupport = [root URLByAppendingPathComponent:@"Application Support" isDirectory:YES];
     NSString *suite = [@"SGAutomaticLibraryTests." stringByAppendingString:NSUUID.UUID.UUIDString];
@@ -552,6 +555,12 @@ int main(void) { @autoreleasepool {
     NSURL *hidden = testWrite(@".hidden/hidden.mp3", bare);
     // Existing manual file is adopted by true hash, without moving or duplicating it.
     NSDictionary *reused = SGAutomaticLibraryReuse(nil, oldRow, nil);
+    if (![reused[@"id"] isEqual:oldRow[@"id"]]) {
+        fprintf(stderr, "Exact reuse diagnostics: canonicalRoot=%d relativePath=%d scanned=%lu regular=%d stamp=%d hash=%d request=%d\n",
+            [testDocuments.path isEqual:testDocuments.URLByResolvingSymlinksInPath.path], relativePath(old) != nil,
+            (unsigned long)scan(nil).count, regularFile(old, nil), fileStamp(old) != nil,
+            [fileHash(old, nil) isEqual:oldRow[@"id"]], SGAutomaticSpotifyURL(oldRow[@"spotify"]) != nil);
+    }
     assert([reused[@"id"] isEqual:oldRow[@"id"]]);
     assert([SGAutomaticLibraryFile(reused).path isEqual:old.path]);
     assert(!SGAutomaticLibraryReuse(nil, oldRow, ^BOOL{ return YES; }));
@@ -561,7 +570,9 @@ int main(void) { @autoreleasepool {
     NSURL *keeper = testWrite(@"Spoti Downloads/covered.mp3", covered);
     NSDictionary *keeperRow = testRequest(keeper);
     assert(![oldRow[@"id"] isEqual:keeperRow[@"id"]]);
-    assert([packetHash(audioInfo(old, @"mp3"), nil) isEqual:packetHash(audioInfo(keeper, @"mp3"), nil)]);
+    NSString *oldPackets = packetHash(audioInfo(old, @"mp3"), nil), *keeperPackets = packetHash(audioInfo(keeper, @"mp3"), nil);
+    if (![oldPackets isEqual:keeperPackets]) fprintf(stderr, "Packet identity diagnostics: old=%d keeper=%d same=%d\n", oldPackets != nil, keeperPackets != nil, [oldPackets isEqual:keeperPackets]);
+    assert([oldPackets isEqual:keeperPackets]);
     reused = SGAutomaticLibraryReuse(staging, oldRow, nil);
     assert([reused[@"id"] isEqual:keeperRow[@"id"]] && [reused[@"bytes"] isEqual:keeperRow[@"bytes"]]);
     assert([SGAutomaticLibraryFile(reused).path isEqual:keeper.path]);
