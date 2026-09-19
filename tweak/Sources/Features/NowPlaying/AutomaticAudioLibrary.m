@@ -194,7 +194,7 @@ static NSString *mp3PacketHash(NSMutableDictionary *info, BOOL (^cancelled)(void
         status = AudioFileGetProperty(file, kAudioFilePropertyPacketSizeUpperBound, &size, &maximum);
         if (status || !maximum || maximum > 1024 * 1024) return packetFailure("mp3-packet-size", status);
         CC_SHA256_CTX state; CC_SHA256_Init(&state);
-        NSString *signature = [NSString stringWithFormat:@"MPEG-packets-v1/%u/%u/%.17g/%u/%u/%u/%u/%u/%llu",
+        NSString *signature = [NSString stringWithFormat:@"MPEG-packets-v2/%u/%u/%.17g/%u/%u/%u/%u/%u/%llu",
             (unsigned)format.mFormatID, (unsigned)format.mFormatFlags, format.mSampleRate, (unsigned)format.mChannelsPerFrame,
             (unsigned)format.mFramesPerPacket, (unsigned)format.mBytesPerFrame, (unsigned)format.mBytesPerPacket,
             (unsigned)format.mBitsPerChannel, (unsigned long long)count];
@@ -202,17 +202,38 @@ static NSString *mp3PacketHash(NSMutableDictionary *info, BOOL (^cancelled)(void
         CC_SHA256_Update(&state, signatureData.bytes, (CC_LONG)signatureData.length);
         // Preserve all decoder configuration and trim information when provided.
         AudioFilePropertyID properties[] = {kAudioFilePropertyMagicCookieData, kAudioFilePropertyChannelLayout, kAudioFilePropertyPacketTableInfo};
+        const char *propertyNames[] = {"magic-cookie", "channel-layout", "packet-table"};
         for (NSUInteger i = 0; i < sizeof(properties) / sizeof(properties[0]); i++) {
-            UInt32 length = 0; status = AudioFileGetPropertyInfo(file, properties[i], &length, NULL);
-            if (status && status != kAudioFileUnsupportedPropertyError) return packetFailure("mp3-config-size", status);
+            UInt32 length = 0, writable = 0; status = AudioFileGetPropertyInfo(file, properties[i], &length, &writable);
+            NSMutableData *configuration = nil;
+#ifdef SG_AUTOMATIC_LIBRARY_TEST
+            fprintf(stderr, "MP3 optional property: name=%s id=%u status=%d bytes=%u writable=%u\n", propertyNames[i], (unsigned)properties[i], (int)status, length, writable);
+#endif
+            // A size-query failure is not proof of absence. Retry the actual read
+            // with the known fixed packet-table size, or a bounded maximum buffer.
+            if (status == kAudioFileBadPropertySizeError) {
+                UInt32 capacity = properties[i] == kAudioFilePropertyPacketTableInfo ? sizeof(AudioFilePacketTableInfo) : 65536;
+                configuration = [NSMutableData dataWithLength:capacity]; length = capacity;
+                status = AudioFileGetProperty(file, properties[i], &length, configuration.mutableBytes);
+#ifdef SG_AUTOMATIC_LIBRARY_TEST
+                fprintf(stderr, "MP3 optional direct read: name=%s status=%d bytes=%u capacity=%u\n", propertyNames[i], (int)status, length, capacity);
+#endif
+                if (!status && length > capacity) return packetFailure("mp3-config-bound", 0);
+                if (status) configuration = nil;
+                else [configuration setLength:length];
+            }
+            if (status && status != kAudioFileUnsupportedPropertyError) return packetFailure(propertyNames[i], status);
             if (status) length = 0;
             if (length > 65536) return packetFailure("mp3-config-bound", 0);
-            uint32_t header[2] = {CFSwapInt32HostToBig(properties[i]), CFSwapInt32HostToBig(length)};
+            // Keep absence/error markers distinct from successfully returned data.
+            uint32_t header[3] = {CFSwapInt32HostToBig(properties[i]), CFSwapInt32HostToBig((UInt32)status), CFSwapInt32HostToBig(length)};
             CC_SHA256_Update(&state, header, sizeof(header));
             if (length) {
-                NSMutableData *configuration = [NSMutableData dataWithLength:length]; UInt32 actual = length;
-                status = AudioFileGetProperty(file, properties[i], &actual, configuration.mutableBytes);
-                if (status || actual != length) return packetFailure("mp3-config", status);
+                if (!configuration) {
+                    configuration = [NSMutableData dataWithLength:length]; UInt32 actual = length;
+                    status = AudioFileGetProperty(file, properties[i], &actual, configuration.mutableBytes);
+                    if (status || actual != length) return packetFailure(propertyNames[i], status);
+                }
                 CC_SHA256_Update(&state, configuration.bytes, length);
             }
         }
