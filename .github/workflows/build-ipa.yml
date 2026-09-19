@@ -80,6 +80,22 @@ jobs:
             tweak/Sources/Features/NowPlaying/LocalDownloadManifest.m -o "$RUNNER_TEMP/native-collection-test"
           "$RUNNER_TEMP/native-collection-test"
 
+      - name: Test individual track menu actions
+        run: |
+          clang -fobjc-arc -fblocks -Wall -Werror -framework Foundation -DSG_TRACK_DOWNLOAD_ACTION_TEST=1 \
+            tweak/Sources/Features/NowPlaying/TrackDownloadActions.m \
+            tweak/Sources/Features/NowPlaying/AutomaticDownloadModel.m \
+            tweak/Sources/Features/NowPlaying/LocalDownloadManifest.m -o "$RUNNER_TEMP/track-action-test"
+          "$RUNNER_TEMP/track-action-test"
+
+      - name: Test separate audio versions
+        run: |
+          clang -fobjc-arc -fblocks -Wall -Werror -framework Foundation -DSG_AUDIO_VARIANT_TEST=1 \
+            tweak/Sources/Features/NowPlaying/AudioVariantModel.m \
+            tweak/Sources/Features/NowPlaying/AutomaticDownloadModel.m \
+            tweak/Sources/Features/NowPlaying/LocalDownloadManifest.m -o "$RUNNER_TEMP/audio-variant-test"
+          "$RUNNER_TEMP/audio-variant-test"
+
       - name: Test native audio resolver
         run: bash scripts/test-native-audio.sh
 
