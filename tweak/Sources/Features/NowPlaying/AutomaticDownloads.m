@@ -1,6 +1,7 @@
 // One durable queue for on-device preparation, optional PC preparation, and manual repairs.
 #import "AutomaticDownloads.h"
 #import "AutomaticDownloadModel.h"
+#import "AutomaticDownloadTransfer.h"
 #import "AutomaticAudioFile.h"
 #import "AutomaticAudioLibrary.h"
 #import "AutomaticLocalFilesPage.h"
@@ -596,7 +597,7 @@ static void tell(NSString *message) {
         [self follow:job root:root generation:generation];
     });
 }
-- (NSDictionary *)importRow:(NSDictionary *)row root:(NSURL *)root generation:(NSUInteger)generation {
+- (NSDictionary *)importRow:(NSDictionary *)row root:(NSURL *)root generation:(NSUInteger)generation failure:(NSString **)failure {
     if (verifyRow(row)) return row;
     BOOL (^cancelled)(void) = ^BOOL { return generation != self.generation; };
     NSDictionary *existing = SGAutomaticLibraryReuse(nil, row, cancelled);
@@ -613,9 +614,16 @@ static void tell(NSString *message) {
     // New writes always use our own canonical destination, never an old mapping
     // to a manually imported file which the user may since have replaced.
     NSURL *target = [directory URLByAppendingPathComponent:[row[@"id"] stringByAppendingPathExtension:row[@"extension"] ?: @"mp3"]];
-    NSURL *url = [[root URLByAppendingPathComponent:@"file"] URLByAppendingPathComponent:row[@"id"]];
     self.preparingAudio = YES; self.transferProgress = 0;
-    NSURL *file = [self fetch:[NSURLRequest requestWithURL:url] limit:[row[@"bytes"] unsignedIntegerValue] generation:generation];
+    NSURL *file = SGAutomaticTransferFile(root, row, cancelled, ^(NSURLSessionTask *task) {
+        self.active = task;
+    }, ^(NSUInteger received, NSUInteger total) {
+        if (cancelled() || !total) return;
+        self.transferProgress = MIN(0.98, (double)received / (double)total);
+        CFTimeInterval now = CACurrentMediaTime();
+        if (now - self.lastProgressNotification > 0.4) { self.lastProgressNotification = now; [self update:nil]; }
+    }, failure);
+    self.active = nil;
     self.preparingAudio = NO; self.transferProgress = 0;
     if (!file) return nil;
     NSNumber *bytes = nil; [file getResourceValue:&bytes forKey:NSURLFileSizeKey error:nil];
@@ -654,11 +662,12 @@ static void tell(NSString *message) {
             if (![row[@"state"] isEqual:@"ready"] || [checked containsObject:attempt]) continue;
             self.activeSpotify = row[@"spotify"];
             [self update:[@"Enregistrement sur l’iPhone : " stringByAppendingString:row[@"title"]]];
-            NSDictionary *installed = [self importRow:row root:root generation:generation];
+            NSString *transferFailure = nil;
+            NSDictionary *installed = [self importRow:row root:root generation:generation failure:&transferFailure];
             if (!installed) {
                 if (generation == self.generation) {
                     NSMutableDictionary *errors = [self.importErrors mutableCopy] ?: [NSMutableDictionary dictionary];
-                    errors[row[@"spotify"]] = @"Transfert échoué · toucher pour réessayer ou ajouter un fichier";
+                    errors[row[@"spotify"]] = transferFailure ?: @"Transfert échoué · toucher pour réessayer ou ajouter un fichier";
                     self.importErrors = errors;
                     [NSUserDefaults.standardUserDefaults setObject:errors forKey:@"spotifyglass.automaticDownloads.errors"];
                 }
