@@ -17,3 +17,7 @@ NSDictionary *SGAutomaticDownloadStatus(id entity);
 NSDictionary *SGAutomaticDownloadedRow(id track);
 NSArray<NSDictionary *> *SGAutomaticDownloadedRows(id playlist);
 void SGAutomaticDownloadRegisterTracks(id entity, NSArray *tracks);
+// Local file management. Completion always runs on the main queue; nil items means unavailable.
+void SGAutomaticListLocalFiles(void (^completion)(NSArray<NSDictionary *> *items, NSString *message));
+// Call only after the user confirms permanent deletion of this exact listed file.
+void SGAutomaticDeleteLocalFile(NSDictionary *item, void (^completion)(BOOL success, NSString *message));

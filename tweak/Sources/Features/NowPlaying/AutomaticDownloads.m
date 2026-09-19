@@ -3,6 +3,7 @@
 #import "AutomaticDownloadModel.h"
 #import "AutomaticAudioFile.h"
 #import "AutomaticAudioLibrary.h"
+#import "AutomaticLocalFilesPage.h"
 #import "NativeDownloadCollection.h"
 #import "NativeAudioResolver.h"
 #import "LocalDownloadManifest.h"
@@ -132,8 +133,7 @@ static void tell(NSString *message) {
 - (void)resume;
 - (void)pause;
 - (void)clearUnfinished;
-- (void)organizeDuplicates:(BOOL)restore;
-- (void)refreshLibraryAssociations;
+- (void)deleteLocalFile:(NSDictionary *)item completion:(void (^)(BOOL, NSString *))completion;
 - (void)removeQueued:(NSString *)url;
 - (void)play:(NSUInteger)position;
 - (void)submitPending;
@@ -203,7 +203,6 @@ static void tell(NSString *message) {
         audioConfig.allowsCellularAccess = YES;
         engine.audioSession = [NSURLSession sessionWithConfiguration:audioConfig delegate:engine delegateQueue:nil];
         dispatch_async(engine.worker, ^{
-            [engine refreshLibraryAssociations];
             // Hashes are checked off the UI thread after launch; an old green state is not trusted.
             NSMutableDictionary *candidates = [engine.localRows mutableCopy];
             for (NSDictionary *job in engine.history.allValues)
@@ -815,58 +814,65 @@ static void tell(NSString *message) {
         [self finish:@"Attentes et échecs retirés. Tes morceaux téléchargés sont conservés." generation:generation];
     });
 }
-- (void)refreshLibraryAssociations {
-    // The library journal survives a quit between moving a duplicate and saving
-    // the queue. Reconcile only against the replacement's verified real file.
-    NSDictionary *replacements = SGAutomaticLibraryReplacements();
-    if (!replacements.count) return;
-    [verifiedFiles() removeAllObjects]; [statusCounts() removeAllObjects];
-    NSDictionary *(^remap)(NSDictionary *) = ^NSDictionary *(NSDictionary *row) {
-        if (![row[@"state"] isEqual:@"ready"]) return row;
-        NSString *key = [row[@"id"] stringByAppendingPathExtension:row[@"extension"] ?: @"mp3"];
-        NSDictionary *replacement = replacements[key];
-        if (!replacement) return row;
-        NSMutableDictionary *candidate = [row mutableCopy];
-        for (NSString *field in @[@"id", @"bytes", @"seconds", @"title", @"artist", @"album", @"extension"])
-            if (replacement[field]) candidate[field] = replacement[field];
-        return verifyRow(candidate) ? candidate : row;
-    };
-    NSMutableDictionary *locals = [NSMutableDictionary dictionary];
-    for (NSString *identity in self.localRows) locals[identity] = remap(self.localRows[identity]);
-    NSMutableDictionary *history = [NSMutableDictionary dictionary];
-    for (NSString *url in self.history) {
-        NSMutableDictionary *job = [self.history[url] mutableCopy];
-        NSMutableArray *items = [NSMutableArray array];
-        for (NSDictionary *row in job[@"items"]) {
-            NSDictionary *copy = remap(row); [items addObject:copy];
-            if (!verifyRow(locals[copy[@"spotify"]]) && verifyRow(copy)) {
-                NSMutableDictionary *local = [copy mutableCopy]; local[@"position"] = @1;
-                locals[copy[@"spotify"]] = local;
-            }
-        }
-        job[@"items"] = items; history[url] = job;
-    }
-    self.localRows = locals; self.history = history;
-    if (self.job[@"url"]) self.job = history[self.job[@"url"]] ?: self.job;
-    NSUserDefaults *prefs = NSUserDefaults.standardUserDefaults;
-    [prefs setObject:locals forKey:@"spotifyglass.automaticDownloads.localRows"];
-    [prefs setObject:history forKey:@"spotifyglass.automaticDownloads.history"];
-    self.verificationRevision += 1;
-}
-- (void)organizeDuplicates:(BOOL)restore {
-    if (self.busy || self.clearing) { tell(@"Mets les téléchargements en pause avant de ranger les fichiers."); return; }
+- (void)deleteLocalFile:(NSDictionary *)item completion:(void (^)(BOOL, NSString *))completion {
+    if (self.busy || self.clearing) { completion(NO, @"Mets les téléchargements en pause avant de supprimer un fichier."); return; }
     self.busy = YES; self.clearing = YES; self.userPaused = YES;
     NSUInteger generation = ++self.generation;
-    [self update:restore ? @"Restauration des copies mises de côté…" : @"Vérification des doublons sur l'iPhone…"];
+    [self update:@"Suppression du fichier sélectionné."];
     dispatch_async(self.worker, ^{
-        BOOL (^cancelled)(void) = ^BOOL { return generation != self.generation; };
-        void (^progress)(NSString *) = ^(NSString *message) { [self update:message]; };
-        NSDictionary *result = restore ? SGAutomaticLibraryRestore(cancelled, progress) : SGAutomaticLibraryClean(cancelled, progress);
-        [self refreshLibraryAssociations];
-        [verifiedFiles() removeAllObjects]; [statusCounts() removeAllObjects];
-        for (NSDictionary *row in self.localRows.allValues) verifyRow(row);
-        self.verificationRevision += 1;
-        [self finish:result[@"message"] ?: @"Vérification terminée. Rouvre Fichiers locaux pour actualiser la liste." generation:generation];
+        NSURL *documents = [[NSFileManager.defaultManager URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask].firstObject URLByResolvingSymlinksInPath];
+        NSString *relative = [item[@"path"] isKindOfClass:NSString.class] ? item[@"path"] : @"";
+        NSString *selected = [documents URLByAppendingPathComponent:relative].URLByStandardizingPath.path;
+        // Snapshot associations BEFORE the library removes its path mapping.
+        NSMutableSet *keys = [NSMutableSet set];
+        void (^collect)(NSDictionary *) = ^(NSDictionary *row) {
+            if (![row[@"state"] isEqual:@"ready"] || !row[@"id"]) return;
+            if ([rowFile(row).URLByResolvingSymlinksInPath.path isEqual:selected])
+                [keys addObject:[row[@"id"] stringByAppendingPathExtension:row[@"extension"] ?: @"mp3"]];
+        };
+        for (NSDictionary *row in self.localRows.allValues) collect(row);
+        for (NSDictionary *job in self.history.allValues) for (NSDictionary *row in job[@"items"]) collect(row);
+        NSError *error = nil;
+        BOOL removed = SGAutomaticLibraryDelete(item, &error);
+        if (removed) {
+            BOOL (^matches)(NSDictionary *) = ^BOOL(NSDictionary *row) {
+                return row[@"id"] && [keys containsObject:[row[@"id"] stringByAppendingPathExtension:row[@"extension"] ?: @"mp3"]];
+            };
+            NSMutableDictionary *locals = [self.localRows mutableCopy];
+            NSMutableDictionary *errors = [self.importErrors mutableCopy];
+            for (NSString *identity in self.localRows) if (matches(self.localRows[identity])) {
+                [locals removeObjectForKey:identity]; [errors removeObjectForKey:identity];
+                [self.covers removeObjectForKey:identity];
+            }
+            NSMutableDictionary *history = [NSMutableDictionary dictionary];
+            for (NSString *url in self.history) {
+                NSMutableDictionary *job = [self.history[url] mutableCopy];
+                NSMutableArray *rows = [NSMutableArray array]; BOOL affected = NO;
+                for (NSDictionary *row in job[@"items"]) {
+                    if (!matches(row)) { [rows addObject:row]; continue; }
+                    NSMutableDictionary *copy = [row mutableCopy];
+                    copy[@"state"] = @"waiting";
+                    if (!copy[@"expectedSeconds"] && copy[@"seconds"]) copy[@"expectedSeconds"] = copy[@"seconds"];
+                    for (NSString *key in @[@"id", @"bytes", @"progress", @"errorMessage"]) [copy removeObjectForKey:key];
+                    [errors removeObjectForKey:copy[@"spotify"]];
+                    [rows addObject:copy]; affected = YES;
+                }
+                if (affected) { job[@"items"] = rows; job[@"state"] = @"partial"; job[@"message"] = @"Un fichier a été supprimé de cet iPhone."; }
+                history[url] = job;
+            }
+            self.localRows = locals; self.history = history; self.importErrors = errors;
+            if (self.job[@"url"]) self.job = history[self.job[@"url"]] ?: self.job;
+            NSUserDefaults *prefs = NSUserDefaults.standardUserDefaults;
+            [prefs setObject:locals forKey:@"spotifyglass.automaticDownloads.localRows"];
+            [prefs setObject:history forKey:@"spotifyglass.automaticDownloads.history"];
+            [prefs setObject:errors forKey:@"spotifyglass.automaticDownloads.errors"];
+            for (NSString *key in keys) [verifiedFiles() removeObjectForKey:key];
+            [statusCounts() removeAllObjects];
+            self.verificationRevision += 1;
+        }
+        NSString *message = removed ? @"Fichier supprimé définitivement de cet iPhone. Si une ancienne ligne reste dans Fichiers locaux, rouvre Spotify." : error.localizedDescription ?: @"Le fichier n’a pas été supprimé. Actualise la liste puis réessaie.";
+        [self finish:message generation:generation];
+        dispatch_async(dispatch_get_main_queue(), ^{ completion(removed, message); });
     });
 }
 - (void)play:(NSUInteger)position {
@@ -1154,17 +1160,10 @@ static void tell(NSString *message) {
     UIAlertAction *retry = [UIAlertAction actionWithTitle:@"Réessayer les titres manquants" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) { [engine resume]; }];
     retry.enabled = !engine.busy && self.displayJob != nil; [sheet addAction:retry];
     [sheet addAction:[UIAlertAction actionWithTitle:@"Nettoyer les téléchargements" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) { [engine clearUnfinished]; }]];
-    UIAlertAction *duplicates = [UIAlertAction actionWithTitle:@"Ranger les doublons" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-        UIAlertController *explanation = [UIAlertController alertControllerWithTitle:@"Ranger les doublons"
-            message:@"Les copies avec le même contenu audio seront mises de côté. Une copie restera disponible. Les versions différentes seront conservées. Tu pourras annuler avec « Restaurer les doublons ». Garde Spotify ouvert pendant la vérification."
-            preferredStyle:UIAlertControllerStyleAlert];
-        [explanation addAction:[UIAlertAction actionWithTitle:@"Annuler" style:UIAlertActionStyleCancel handler:nil]];
-        [explanation addAction:[UIAlertAction actionWithTitle:@"Ranger" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) { [engine organizeDuplicates:NO]; }]];
-        [self presentViewController:explanation animated:YES completion:nil];
+    UIAlertAction *files = [UIAlertAction actionWithTitle:@"Gérer les fichiers locaux" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        SGShowPage(self, [SGAutomaticLocalFilesPage new]);
     }];
-    duplicates.enabled = !engine.busy; [sheet addAction:duplicates];
-    UIAlertAction *restore = [UIAlertAction actionWithTitle:@"Restaurer les doublons" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) { [engine organizeDuplicates:YES]; }];
-    restore.enabled = !engine.busy; [sheet addAction:restore];
+    files.enabled = !engine.busy; [sheet addAction:files];
     [sheet addAction:[UIAlertAction actionWithTitle:@"Fermer" style:UIAlertActionStyleCancel handler:nil]];
     sheet.popoverPresentationController.sourceView = cell ?: self.view;
     sheet.popoverPresentationController.sourceRect = cell ? cell.bounds : self.view.bounds;
@@ -1350,4 +1349,27 @@ BOOL SGAutomaticDownloadEntity(id entity, UIView *source) {
         [owner presentViewController:sheet animated:YES completion:nil];
     });
     return YES;
+}
+
+void SGAutomaticListLocalFiles(void (^completion)(NSArray<NSDictionary *> *, NSString *)) {
+    if (!completion) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        SGAutomaticDownloads *engine = SGAutomaticDownloads.shared;
+        if (engine.busy || engine.clearing) { completion(nil, @"Mets les téléchargements en pause pour gérer les fichiers locaux."); return; }
+        engine.busy = YES; engine.clearing = YES;
+        dispatch_async(engine.worker, ^{
+            NSArray *items = SGAutomaticLibraryItems(nil);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                engine.busy = NO; engine.clearing = NO;
+                [engine update:engine.message];
+                completion(items, items.count ? @"Touche un fichier ou glisse vers la gauche pour le supprimer de l’iPhone." : @"Aucun fichier audio local trouvé.");
+            });
+        });
+    });
+}
+void SGAutomaticDeleteLocalFile(NSDictionary *item, void (^completion)(BOOL, NSString *)) {
+    if (!completion) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [SGAutomaticDownloads.shared deleteLocalFile:item completion:completion];
+    });
 }

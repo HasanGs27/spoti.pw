@@ -5,6 +5,10 @@
 #import <CommonCrypto/CommonDigest.h>
 #import <ImageIO/ImageIO.h>
 #import <math.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
 
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
@@ -21,7 +25,7 @@ static NSObject *pathLock(void) {
     dispatch_once(&once, ^{ lock = [NSObject new]; }); return lock;
 }
 #ifdef SG_AUTOMATIC_LIBRARY_TEST
-static NSURL *testDocuments, *testSupport;
+static NSURL *testDocuments;
 static NSUserDefaults *testDefaults;
 #endif
 static BOOL cancelledNow(BOOL (^cancelled)(void)) { return cancelled && cancelled(); }
@@ -48,7 +52,8 @@ static NSString *rowKey(NSDictionary *row) {
 }
 static BOOL safeRelative(id value) {
     if (![value isKindOfClass:NSString.class] || ![value length] || [value length] > 2048 || [value isAbsolutePath] ||
-        [value containsString:@"\\"] || [value hasPrefix:@"~"]) return NO;
+        [value containsString:@"\\"] || [value hasPrefix:@"~"] ||
+        [value rangeOfCharacterFromSet:[NSCharacterSet characterSetWithRange:NSMakeRange(0, 1)]].location != NSNotFound) return NO;
     for (NSString *part in [value pathComponents])
         if (!part.length || [part isEqual:@"."] || [part isEqual:@".."] || [part isEqual:@"/"]) return NO;
     return [[value stringByStandardizingPath] isEqual:value];
@@ -496,169 +501,111 @@ NSDictionary *SGAutomaticLibraryReuse(NSURL *prepared, NSDictionary *requested, 
         if (probe) [NSFileManager.defaultManager removeItemAtURL:probe error:nil];
     }
 }
-static NSURL *archiveDirectory(void) {
-    NSURL *support;
-#ifdef SG_AUTOMATIC_LIBRARY_TEST
-    support = testSupport;
-#else
-    support = [NSFileManager.defaultManager URLsForDirectory:NSApplicationSupportDirectory inDomains:NSUserDomainMask].firstObject;
-#endif
-    support = support.URLByResolvingSymlinksInPath;
-    if (!support) return nil;
-    NSURL *archive = [support URLByAppendingPathComponent:@"Spoti Audio Archive" isDirectory:YES];
-    NSFileManager *fm = NSFileManager.defaultManager;
-    if (![archive.URLByResolvingSymlinksInPath.path isEqual:archive.path]) return nil;
-    if (![fm createDirectoryAtURL:archive withIntermediateDirectories:YES attributes:@{NSFileProtectionKey:NSFileProtectionCompleteUntilFirstUserAuthentication} error:nil]) return nil;
-    NSNumber *dir = nil, *link = nil; [archive getResourceValue:&dir forKey:NSURLIsDirectoryKey error:nil];
-    [archive getResourceValue:&link forKey:NSURLIsSymbolicLinkKey error:nil];
-    return dir.boolValue && !link.boolValue ? archive : nil;
-}
-static NSMutableArray *journal(void) {
-    NSURL *directory = archiveDirectory();
-    if (!directory) return nil;
-    NSURL *file = [directory URLByAppendingPathComponent:@"journal.json"];
-    if (![file.URLByResolvingSymlinksInPath.path isEqual:file.path]) return nil;
-    if (![NSFileManager.defaultManager fileExistsAtPath:file.path]) return [NSMutableArray array];
-    NSNumber *bytes = nil; [file getResourceValue:&bytes forKey:NSURLFileSizeKey error:nil];
-    if (!bytes || bytes.unsignedLongLongValue > 8 * 1024 * 1024) return nil;
-    NSData *data = [NSData dataWithContentsOfURL:file];
-    if (!data.length || data.length > 8 * 1024 * 1024) return nil;
-    NSDictionary *object = [NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingMutableContainers error:nil];
-    if (![object isKindOfClass:NSDictionary.class] || ![object[@"version"] isEqual:@1] || ![object[@"entries"] isKindOfClass:NSArray.class] || [object[@"entries"] count] > 10000) return nil;
-    return [object[@"entries"] mutableCopy];
-}
-static BOOL saveJournal(NSArray *entries) {
-    NSURL *directory = archiveDirectory();
-    if (!directory || entries.count > 10000) return NO;
-    NSData *data = [NSJSONSerialization dataWithJSONObject:@{@"version":@1, @"entries":entries} options:0 error:nil];
-    if (!data || data.length > 8 * 1024 * 1024) return NO;
-    return [data writeToURL:[directory URLByAppendingPathComponent:@"journal.json"] options:NSDataWritingAtomic error:nil];
-}
-static NSURL *archiveFile(NSDictionary *entry) {
-    NSString *name = entry[@"archive"];
-    if (!safeRelative(name) || [name pathComponents].count != 1) return nil;
-    NSURL *file = [archiveDirectory() URLByAppendingPathComponent:name];
-    return file && [file.URLByResolvingSymlinksInPath.path isEqual:file.path] ? file : nil;
-}
-static NSDictionary *validKeeper(id value) {
-    if (![value isKindOfClass:NSDictionary.class] || !rowKey(value) ||
-        ![value[@"bytes"] isKindOfClass:NSNumber.class] || [value[@"bytes"] unsignedLongLongValue] < 1024 ||
-        [value[@"bytes"] unsignedLongLongValue] > libraryLimit || ![value[@"seconds"] isKindOfClass:NSNumber.class] ||
-        !isfinite([value[@"seconds"] doubleValue]) || [value[@"seconds"] doubleValue] < 1 ||
-        !strictLabel(value[@"title"]).length || !strictLabel(value[@"artist"]).length || !strictLabel(value[@"album"])) return nil;
-    return value;
-}
-NSDictionary *SGAutomaticLibraryReplacements(void) {
-    NSMutableDictionary *raw = [NSMutableDictionary dictionary];
-    NSMutableDictionary *hashes = [NSMutableDictionary dictionary];
-    NSString *(^verifiedHash)(NSURL *) = ^NSString *(NSURL *file) {
-        NSArray *stamp = fileStamp(file); if (!stamp) return nil;
-        NSArray *key = @[file.path, stamp]; id known = hashes[key];
-        if (known) return [known isKindOfClass:NSString.class] ? known : nil;
-        NSString *hash = fileHash(file, nil);
-        if (![fileStamp(file) isEqual:stamp]) hash = nil;
-        hashes[key] = hash ?: (id)NSNull.null; return hash;
-    };
-    for (NSDictionary *entry in journal()) {
-        if (![entry isKindOfClass:NSDictionary.class] || ![@[@"pending", @"archived", @"restored"] containsObject:entry[@"state"]]) continue;
-        NSDictionary *keeper = validKeeper(entry[@"keeper"]), *original = validKeeper(entry[@"original"]);
-        if (!keeper || !original) continue;
-        // A pending journal entry can mean the process stopped before or after the move.
-        if ([entry[@"state"] isEqual:@"pending"] && !regularFile(archiveFile(entry), nil)) continue;
-        // The journal also restores a mapping lost before UserDefaults was flushed.
-        NSURL *keeperFile = documentPath(entry[@"keeperRelative"], YES);
-        if ([verifiedHash(keeperFile) isEqual:keeper[@"id"]]) rememberPath(keeper, keeperFile);
-        if ([rowKey(keeper) isEqual:rowKey(original)]) continue;
-        raw[rowKey(original)] = keeper;
-    }
-    NSMutableDictionary *result = [NSMutableDictionary dictionary];
-    for (NSString *key in raw) {
-        NSDictionary *keeper = raw[key]; NSMutableSet *seen = [NSMutableSet setWithObject:key];
-        while (raw[rowKey(keeper)] && ![seen containsObject:rowKey(keeper)]) {
-            [seen addObject:rowKey(keeper)]; keeper = raw[rowKey(keeper)];
-        }
-        if ([seen containsObject:rowKey(keeper)]) continue;
-        NSURL *file = SGAutomaticLibraryFile(keeper);
-        if ([verifiedHash(file) isEqual:keeper[@"id"]]) result[key] = keeper;
-    }
-    return result;
-}
-static NSDictionary *report(NSUInteger archived, NSUInteger restored, NSUInteger skipped, NSString *message) {
-    return @{@"archived":@(archived), @"restored":@(restored), @"skipped":@(skipped),
-             @"replacements":SGAutomaticLibraryReplacements(), @"message":message};
-}
-NSDictionary *SGAutomaticLibraryClean(BOOL (^cancelled)(void), void (^progress)(NSString *)) {
-    NSMutableArray *entries = journal();
-    if (!entries) return report(0, 0, 0, @"L’archive des doublons est inaccessible. Aucun fichier déplacé.");
-    NSArray *files = scan(cancelled); BOOL partial = lastScanLimited;
-    NSMutableDictionary *groups = [NSMutableDictionary dictionary];
-    NSUInteger checked = 0, archived = 0, skipped = 0;
-    for (NSURL *file in files) {
-        if (cancelledNow(cancelled)) break;
-        if (progress) progress([NSString stringWithFormat:@"Vérification des fichiers : %lu/%lu", (unsigned long)++checked, (unsigned long)files.count]);
-        NSMutableDictionary *info = audioInfo(file, file.pathExtension.lowercaseString);
-        if (!info) { skipped++; continue; }
-        NSArray *key = identity(info); NSMutableArray *group = groups[key];
-        if (!group) groups[key] = group = [NSMutableArray array];
-        [group addObject:info];
-    }
-    for (NSMutableArray *group in groups.allValues) {
-        if (group.count < 2 || cancelledNow(cancelled)) continue;
-        [group sortUsingComparator:^NSComparisonResult(id a, id b) { return preference(a, b); }];
-        NSMutableArray *keepers = [NSMutableArray array];
-        for (NSMutableDictionary *candidate in group) {
-            if (cancelledNow(cancelled)) break;
-            NSMutableDictionary *keeper = nil;
-            for (NSMutableDictionary *current in keepers) if (equivalent(current, candidate, cancelled)) { keeper = current; break; }
-            if (!keeper) { [keepers addObject:candidate]; continue; }
-            NSDictionary *kf = fields(keeper, cancelled), *cf = fields(candidate, cancelled);
-            NSString *relative = relativePath(candidate[@"url"]);
-            NSString *keeperRelative = relativePath(keeper[@"url"]);
-            // Recheck both hashes immediately before an irreversible filesystem operation.
-            if (!kf || !cf || !relative || !keeperRelative || cancelledNow(cancelled) ||
-                ![fileHash(keeper[@"url"], cancelled) isEqual:kf[@"id"]] || ![fileHash(candidate[@"url"], cancelled) isEqual:cf[@"id"]]) { skipped++; continue; }
-            rememberPath(kf, keeper[@"url"]);
-            NSMutableDictionary *entry = [@{@"state":@"pending", @"relative":relative, @"keeperRelative":keeperRelative, @"archive":[NSUUID.UUID.UUIDString stringByAppendingPathExtension:cf[@"extension"]],
-                @"keeper":kf, @"original":cf} mutableCopy];
-            [entries addObject:entry];
-            if (!saveJournal(entries)) { [entries removeLastObject]; skipped++; continue; }
-            if (cancelledNow(cancelled)) break;
-            NSURL *destination = archiveFile(entry);
-            if (!destination || ![NSFileManager.defaultManager moveItemAtURL:candidate[@"url"] toURL:destination error:nil]) {
-                [entries removeLastObject]; saveJournal(entries); skipped++; continue;
-            }
-            entry[@"state"] = @"archived";
-            saveJournal(entries);  // The already-persisted pending record recovers a crash here.
-            archived++;
-            if (progress) progress([NSString stringWithFormat:@"%lu doublons mis à l’abri", (unsigned long)archived]);
+NSArray<NSDictionary *> *SGAutomaticLibraryItems(BOOL (^cancelled)(void)) {
+    NSMutableArray *items = [NSMutableArray array];
+    for (NSURL *file in scan(cancelled)) {
+        if (cancelledNow(cancelled)) return @[];
+        @autoreleasepool {
+            NSString *path = relativePath(file);
+            NSArray *stamp = fileStamp(file);
+            if (!path || !stamp) continue;
+            // Listing must also permit removing an incomplete/untagged local file.
+            // Never request playable tracks, image decoding or an audio digest here.
+            NSString *title = file.lastPathComponent.stringByDeletingPathExtension;
+            NSString *artist = @"", *album = @"";
+            @try {
+                AVURLAsset *asset = [AVURLAsset URLAssetWithURL:file options:nil];
+                for (AVMetadataItem *metadata in asset.commonMetadata) {
+                    if (![@[AVMetadataCommonKeyTitle, AVMetadataCommonKeyArtist, AVMetadataCommonKeyAlbumName] containsObject:metadata.commonKey ?: @""]) continue;
+                    NSString *value = strictLabel(metadata.stringValue);
+                    if (!value.length) continue;
+                    if ([metadata.commonKey isEqual:AVMetadataCommonKeyTitle]) title = value;
+                    else if ([metadata.commonKey isEqual:AVMetadataCommonKeyArtist]) artist = value;
+                    else if ([metadata.commonKey isEqual:AVMetadataCommonKeyAlbumName]) album = value;
+                }
+            } @catch (__unused NSException *exception) { }
+            if (cancelledNow(cancelled)) return @[];
+            if (![fileStamp(file) isEqual:stamp] || !documentPath(path, YES)) continue;
+            [items addObject:@{@"path":[path copy], @"title":[title copy], @"artist":[artist copy],
+                @"album":[album copy], @"bytes":stamp[0], @"extension":file.pathExtension.lowercaseString,
+                @"stamp":[stamp copy]}];
         }
     }
-    NSString *message = cancelledNow(cancelled) ? @"Nettoyage arrêté. Les déplacements terminés restent réversibles." :
-        [NSString stringWithFormat:@"%lu doublons archivés. Aucun morceau différent supprimé.", (unsigned long)archived];
-    if (partial) message = [message stringByAppendingString:@" Analyse partielle : limite de 10 000 audios ou 20 000 entrées atteinte."];
-    return report(archived, 0, skipped, message);
+    if (cancelledNow(cancelled)) return @[];
+    [items sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        NSComparisonResult order = [a[@"title"] localizedStandardCompare:b[@"title"]];
+        return order == NSOrderedSame ? [a[@"path"] compare:b[@"path"] options:NSLiteralSearch] : order;
+    }];
+    return [items copy];
 }
-NSDictionary *SGAutomaticLibraryRestore(BOOL (^cancelled)(void), void (^progress)(NSString *)) {
-    NSMutableArray *entries = journal(); NSUInteger restored = 0, skipped = 0;
-    if (!entries) return report(0, 0, 0, @"L’archive des doublons est inaccessible.");
-    for (NSMutableDictionary *entry in entries) {
-        if (cancelledNow(cancelled)) break;
-        if (![entry isKindOfClass:NSMutableDictionary.class] || ![@[@"pending", @"archived"] containsObject:entry[@"state"]]) continue;
-        NSDictionary *original = validKeeper(entry[@"original"]);
-        NSURL *source = archiveFile(entry), *target = documentPath(entry[@"relative"], NO);
-        if (!original || !source || !target || [NSFileManager.defaultManager fileExistsAtPath:target.path] ||
-            ![fileHash(source, cancelled) isEqual:original[@"id"]]) { skipped++; continue; }
-        if (cancelledNow(cancelled)) break;
-        if (![NSFileManager.defaultManager createDirectoryAtURL:target.URLByDeletingLastPathComponent withIntermediateDirectories:YES attributes:nil error:nil] ||
-            !documentPath(entry[@"relative"], NO) || ![NSFileManager.defaultManager moveItemAtURL:source toURL:target error:nil]) { skipped++; continue; }
-        entry[@"state"] = @"restored"; saveJournal(entries); restored++;
-        // Exact-byte restoration can recover a missing keeper without aliasing hashes.
-        NSURL *current = SGAutomaticLibraryFile(original);
-        if (![fileHash(current, cancelled) isEqual:original[@"id"]]) rememberPath(original, target);
-        if (progress) progress([NSString stringWithFormat:@"%lu fichiers restaurés", (unsigned long)restored]);
+static BOOL deletionError(NSError **error, NSInteger code, NSString *message) {
+    if (error) *error = [NSError errorWithDomain:@"SpotiAudioLibrary" code:code userInfo:@{NSLocalizedDescriptionKey:message}];
+    return NO;
+}
+static BOOL validStamp(id stamp) {
+    return [stamp isKindOfClass:NSArray.class] && [stamp count] == 4 &&
+        [stamp[0] isKindOfClass:NSNumber.class] && [stamp[1] isKindOfClass:NSDate.class] &&
+        [stamp[2] isKindOfClass:NSNumber.class] && [stamp[3] isKindOfClass:NSNumber.class];
+}
+static BOOL statMatchesStamp(const struct stat *status, NSArray *stamp) {
+    double modified = status->st_mtimespec.tv_sec + status->st_mtimespec.tv_nsec / 1e9;
+    return S_ISREG(status->st_mode) && status->st_size >= 1024 && status->st_size <= libraryLimit &&
+        (unsigned long long)status->st_size == [stamp[0] unsignedLongLongValue] &&
+        (unsigned long long)status->st_ino == [stamp[2] unsignedLongLongValue] &&
+        (unsigned long long)status->st_dev == [stamp[3] unsignedLongLongValue] &&
+        fabs(modified - [stamp[1] timeIntervalSince1970]) < 0.000001;
+}
+static BOOL sameStat(const struct stat *a, const struct stat *b) {
+    return S_ISREG(b->st_mode) && a->st_dev == b->st_dev && a->st_ino == b->st_ino && a->st_size == b->st_size &&
+        a->st_mtimespec.tv_sec == b->st_mtimespec.tv_sec && a->st_mtimespec.tv_nsec == b->st_mtimespec.tv_nsec &&
+        a->st_ctimespec.tv_sec == b->st_ctimespec.tv_sec && a->st_ctimespec.tv_nsec == b->st_ctimespec.tv_nsec;
+}
+BOOL SGAutomaticLibraryDelete(NSDictionary *item, NSError **error) {
+    if (error) *error = nil;
+    if (![item isKindOfClass:NSDictionary.class]) return deletionError(error, EINVAL, @"Ce fichier local n'est pas valide.");
+    NSString *path = item[@"path"];
+    NSArray *stamp = item[@"stamp"];
+    if (!safeRelative(path) || !validStamp(stamp) || ![@[@"mp3", @"m4a"] containsObject:path.pathExtension.lowercaseString])
+        return deletionError(error, EINVAL, @"Ce fichier local n'est pas valide.");
+    NSURL *file = documentPath(path, YES);
+    if (!file || ![fileStamp(file) isEqual:stamp])
+        return deletionError(error, ESTALE, @"Le fichier a changé ou a déjà été supprimé. Actualisez la liste.");
+    // Keep descriptors for the exact directory and file. Each parent component is
+    // opened without following a link; unlinkat can only remove this single leaf.
+    int parent = open(documents().fileSystemRepresentation, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (parent < 0) return deletionError(error, errno, @"Le dossier des fichiers locaux est inaccessible.");
+    NSArray<NSString *> *parts = path.pathComponents;
+    for (NSUInteger i = 0; i + 1 < parts.count; i++) {
+        int child = openat(parent, parts[i].fileSystemRepresentation, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        int failure = errno; close(parent); parent = child;
+        if (parent < 0) return deletionError(error, failure, @"Le dossier a changé. Actualisez la liste.");
     }
-    return report(0, restored, skipped, cancelledNow(cancelled) ? @"Restauration arrêtée." :
-        [NSString stringWithFormat:@"%lu fichiers restaurés · %lu conflits ou fichiers indisponibles ignorés.", (unsigned long)restored, (unsigned long)skipped]);
+    const char *leaf = parts.lastObject.fileSystemRepresentation;
+    int descriptor = openat(parent, leaf, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+    if (descriptor < 0) {
+        int failure = errno; close(parent);
+        return deletionError(error, failure, @"Le fichier est inaccessible ou a déjà été supprimé.");
+    }
+    struct stat opened, latest;
+    BOOL unchanged = fstat(descriptor, &opened) == 0 && statMatchesStamp(&opened, stamp) &&
+        [fileStamp(file) isEqual:stamp] && documentPath(path, YES) != nil &&
+        fstatat(parent, leaf, &latest, AT_SYMLINK_NOFOLLOW) == 0 && sameStat(&opened, &latest);
+    if (!unchanged) {
+        close(descriptor); close(parent);
+        return deletionError(error, ESTALE, @"Le fichier a changé. Actualisez la liste avant de le supprimer.");
+    }
+    int removed = unlinkat(parent, leaf, 0), failure = errno;
+    close(descriptor); close(parent);
+    if (removed != 0) return deletionError(error, failure, @"La suppression a échoué. Le fichier a été conservé.");
+    @synchronized(pathLock()) {
+        if (!pathSnapshot) pathSnapshot = [[preferences() dictionaryForKey:pathKey] copy] ?: @{};
+        NSMutableDictionary *paths = [pathSnapshot mutableCopy];
+        for (NSString *key in pathSnapshot) if ([pathSnapshot[key] isEqual:path]) [paths removeObjectForKey:key];
+        pathSnapshot = [paths copy];
+        [preferences() setObject:pathSnapshot forKey:pathKey];
+    }
+    [audioCache() removeAllObjects];
+    return YES;
 }
 #pragma clang diagnostic pop
 
@@ -698,6 +645,15 @@ static NSDictionary *testRequest(NSURL *file) {
     row[@"spotify"] = @"https://open.spotify.com/track/3DaGnKmAAmyZGIbC0KjmxT";
     row[@"position"] = @1; row[@"state"] = @"ready"; return row;
 }
+static NSDictionary *testItem(NSArray *items, NSString *path) {
+    for (NSDictionary *item in items) if ([item[@"path"] isEqual:path]) return item;
+    return nil;
+}
+static unsigned long long testDiskBytes(void) {
+    unsigned long long bytes = 0;
+    for (NSURL *file in scan(nil)) bytes += [fileStamp(file)[0] unsignedLongLongValue];
+    return bytes;
+}
 int main(void) { @autoreleasepool {
     NSFileManager *fm = NSFileManager.defaultManager;
     // Match documents() in production: the trusted root is canonical before any
@@ -705,7 +661,6 @@ int main(void) { @autoreleasepool {
     NSURL *temporary = [[NSURL fileURLWithPath:NSTemporaryDirectory() isDirectory:YES] URLByResolvingSymlinksInPath];
     NSURL *root = [temporary URLByAppendingPathComponent:NSUUID.UUID.UUIDString isDirectory:YES];
     testDocuments = [root URLByAppendingPathComponent:@"Documents" isDirectory:YES];
-    testSupport = [root URLByAppendingPathComponent:@"Application Support" isDirectory:YES];
     NSString *suite = [@"SGAutomaticLibraryTests." stringByAppendingString:NSUUID.UUID.UUIDString];
     testDefaults = [[NSUserDefaults alloc] initWithSuiteName:suite];
     assert([fm createDirectoryAtURL:testDocuments withIntermediateDirectories:YES attributes:nil error:nil]);
@@ -773,54 +728,69 @@ int main(void) { @autoreleasepool {
     NSMutableData *different = [bare mutableCopy]; ((uint8_t *)different.mutableBytes)[different.length - 50] ^= 1;
     NSURL *alternate = testWrite(@"Different Audio.mp3", different);
     assert(!equivalent(audioInfo(old, @"mp3"), audioInfo(alternate, @"mp3"), nil));
-    NSDictionary *cancelled = SGAutomaticLibraryClean(^BOOL{ return YES; }, nil);
-    assert([cancelled[@"archived"] unsignedIntegerValue] == 0 && [fm fileExistsAtPath:old.path]);
-    NSDictionary *clean = SGAutomaticLibraryClean(nil, nil);
-    assert([clean[@"archived"] unsignedIntegerValue] == 1);
-    assert(![fm fileExistsAtPath:old.path] && [fm fileExistsAtPath:keeper.path]);
-    for (NSURL *untouched in @[remix, edition, artist, alternate, external, link, cache, hidden]) assert([fm fileExistsAtPath:untouched.path]);
-    NSDictionary *replacement = clean[@"replacements"][rowKey(oldRow)];
-    assert([replacement[@"id"] isEqual:keeperRow[@"id"]]);
-    assert([replacement[@"title"] isEqual:keeperRow[@"title"]] && [replacement[@"album"] isEqual:keeperRow[@"album"]]);
-    // Simulate a crash after moving the duplicate, before final journal/defaults updates.
-    NSMutableArray *entries = journal(); assert(entries.count == 1);
-    entries[0][@"state"] = @"pending"; assert(saveJournal(entries));
-    [testDefaults removeObjectForKey:pathKey]; @synchronized(pathLock()) { pathSnapshot = nil; }
-    NSDictionary *recovered = SGAutomaticLibraryReplacements();
-    assert([recovered[rowKey(oldRow)][@"id"] isEqual:keeperRow[@"id"]]);
-    assert([SGAutomaticLibraryFile(keeperRow).path isEqual:keeper.path]);
-    // A conflicting restored path is never overwritten; the keeper remains untouched.
-    NSData *conflict = testTagged(@"User File", @"Other Artist", @"Album", NO); testWrite(@"Old Imports/old.mp3", conflict);
-    NSDictionary *restore = SGAutomaticLibraryRestore(nil, nil);
-    assert([restore[@"restored"] unsignedIntegerValue] == 0 && [restore[@"skipped"] unsignedIntegerValue] == 1);
-    assert([[NSData dataWithContentsOfURL:old] isEqual:conflict]);
-    assert([fm removeItemAtURL:old error:nil]);
-    restore = SGAutomaticLibraryRestore(nil, nil);
-    assert([restore[@"restored"] unsignedIntegerValue] == 1);
-    assert([[NSData dataWithContentsOfURL:old] isEqual:bare] && [[NSData dataWithContentsOfURL:keeper] isEqual:covered]);
-    assert([SGAutomaticLibraryFile(keeperRow).path isEqual:keeper.path]);
-    // Exact-byte duplicates also map to a surviving path even though the digest is unchanged.
+    // Listings describe physical paths, including identical copies and incomplete files.
     NSURL *exact = testWrite(@"Extra/exact.mp3", covered);
-    clean = SGAutomaticLibraryClean(nil, nil);
-    assert([clean[@"archived"] unsignedIntegerValue] == 2); // restored old + exact copy
-    assert(![fm fileExistsAtPath:exact.path]);
-    assert([SGAutomaticLibraryFile(keeperRow).path isEqual:keeper.path]);
-    // A directory symlink inserted before restoration cannot redirect writes outside Documents.
-    NSURL *outsideDir = [root URLByAppendingPathComponent:@"outside-dir" isDirectory:YES];
-    assert([fm createDirectoryAtURL:outsideDir withIntermediateDirectories:YES attributes:nil error:nil]);
-    NSURL *extraDir = [testDocuments URLByAppendingPathComponent:@"Extra" isDirectory:YES];
-    assert([fm removeItemAtURL:extraDir error:nil]);
-    assert([fm createSymbolicLinkAtPath:extraDir.path withDestinationPath:outsideDir.path error:nil]);
-    restore = SGAutomaticLibraryRestore(nil, nil);
-    assert([restore[@"skipped"] unsignedIntegerValue] >= 1);
-    assert(![fm fileExistsAtPath:[outsideDir URLByAppendingPathComponent:@"exact.mp3"].path]);
-    // If an exact-byte keeper is manually removed, restoring its backup recovers the mapping.
-    assert([fm removeItemAtURL:extraDir error:nil]);
-    assert([fm removeItemAtURL:keeper error:nil]);
-    restore = SGAutomaticLibraryRestore(nil, nil);
-    assert([restore[@"restored"] unsignedIntegerValue] == 1);
-    assert([SGAutomaticLibraryFile(keeperRow).path isEqual:exact.path]);
-    assert([[NSData dataWithContentsOfURL:exact] isEqual:covered]);
+    NSURL *incomplete = testWrite(@"Incomplete.mp3", [NSMutableData dataWithLength:2048]);
+    NSArray *listed = SGAutomaticLibraryItems(nil);
+    assert(listed.count == scan(nil).count);
+    assert(SGAutomaticLibraryItems(^BOOL{ return YES; }).count == 0);
+    NSDictionary *selected = testItem(listed, @"Extra/exact.mp3");
+    NSDictionary *otherCopy = testItem(listed, @"Spoti Downloads/covered.mp3");
+    assert(selected && otherCopy && [selected[@"bytes"] isEqual:otherCopy[@"bytes"]]);
+    assert([selected[@"title"] isEqual:@"Same Song"] && [selected[@"artist"] isEqual:@"Synthetic Artist"]);
+    assert([selected[@"album"] isEqual:@"Album"] && [selected[@"extension"] isEqual:@"mp3"]);
+    assert(!selected[@"id"] && validStamp(selected[@"stamp"]));
+    assert([testItem(listed, @"Incomplete.mp3")[@"title"] isEqual:@"Incomplete"]);
+    assert(!testItem(listed, @"linked.mp3") && !testItem(listed, @"Caches/cached.mp3") && !testItem(listed, @".hidden/hidden.mp3"));
+    // All references to the selected physical path are removed; unrelated references stay.
+    NSString *selectedPath = selected[@"path"], *keeperPath = otherCopy[@"path"];
+    @synchronized(pathLock()) {
+        pathSnapshot = @{rowKey(keeperRow):selectedPath, rowKey(oldRow):selectedPath, @"unrelated.mp3":keeperPath};
+        [testDefaults setObject:pathSnapshot forKey:pathKey];
+    }
+    unsigned long long beforeBytes = testDiskBytes();
+    NSError *deletion = nil;
+    assert(SGAutomaticLibraryDelete(selected, &deletion) && !deletion);
+    assert(![fm fileExistsAtPath:exact.path] && [[NSData dataWithContentsOfURL:keeper] isEqual:covered]);
+    assert(beforeBytes - testDiskBytes() == [selected[@"bytes"] unsignedLongLongValue]);
+    assert(!pathSnapshot[rowKey(keeperRow)] && !pathSnapshot[rowKey(oldRow)] && [pathSnapshot[@"unrelated.mp3"] isEqual:keeperPath]);
+    assert([[testDefaults dictionaryForKey:pathKey] isEqual:pathSnapshot]);
+    assert([fm fileExistsAtPath:exact.URLByDeletingLastPathComponent.path]); // no recursive directory removal
+    deletion = nil; assert(!SGAutomaticLibraryDelete(selected, &deletion) && deletion);
+    for (NSURL *untouched in @[old, keeper, remix, edition, artist, alternate, external, link, cache, hidden, incomplete])
+        assert([fm fileExistsAtPath:untouched.path]);
+    // In-place edits invalidate the listing even though the inode and length are unchanged.
+    NSURL *stale = testWrite(@"Stale.mp3", bare);
+    NSDictionary *staleItem = testItem(SGAutomaticLibraryItems(nil), @"Stale.mp3");
+    assert([changed writeToURL:stale atomically:NO]);
+    NSDate *later = [staleItem[@"stamp"][1] dateByAddingTimeInterval:2];
+    assert([fm setAttributes:@{NSFileModificationDate:later} ofItemAtPath:stale.path error:nil]);
+    assert(!SGAutomaticLibraryDelete(staleItem, &deletion));
+    assert([[NSData dataWithContentsOfURL:stale] isEqual:changed]);
+    // Replacing the path with another file is refused even with equal size and mtime.
+    NSURL *replaced = testWrite(@"Replaced.mp3", bare);
+    NSDictionary *replacedItem = testItem(SGAutomaticLibraryItems(nil), @"Replaced.mp3");
+    assert([changed writeToURL:replaced atomically:YES]);
+    assert([fm setAttributes:@{NSFileModificationDate:replacedItem[@"stamp"][1]} ofItemAtPath:replaced.path error:nil]);
+    assert(!SGAutomaticLibraryDelete(replacedItem, &deletion));
+    assert([[NSData dataWithContentsOfURL:replaced] isEqual:changed]);
+    // A final symlink or a parent swapped for a symlink never reaches its target.
+    NSMutableDictionary *forged = [selected mutableCopy]; forged[@"path"] = @"linked.mp3"; forged[@"stamp"] = fileStamp(external);
+    assert(!SGAutomaticLibraryDelete(forged, &deletion) && [fm fileExistsAtPath:external.path]);
+    NSURL *nested = testWrite(@"MovedParent/inside.mp3", bare);
+    NSDictionary *nestedItem = testItem(SGAutomaticLibraryItems(nil), @"MovedParent/inside.mp3");
+    NSURL *outsideDir = [root URLByAppendingPathComponent:@"moved-parent" isDirectory:YES];
+    assert([fm moveItemAtURL:nested.URLByDeletingLastPathComponent toURL:outsideDir error:nil]);
+    assert([fm createSymbolicLinkAtPath:nested.URLByDeletingLastPathComponent.path withDestinationPath:outsideDir.path error:nil]);
+    assert(!SGAutomaticLibraryDelete(nestedItem, &deletion));
+    assert([[NSData dataWithContentsOfURL:[outsideDir URLByAppendingPathComponent:@"inside.mp3"]] isEqual:bare]);
+    // Traversal, directories and malformed stamps cannot authorize any deletion.
+    forged[@"path"] = @"../outside.mp3"; assert(!SGAutomaticLibraryDelete(forged, &deletion));
+    forged[@"path"] = @"Spoti Downloads"; assert(!SGAutomaticLibraryDelete(forged, &deletion));
+    forged[@"path"] = @"Spoti Downloads/covered.mp3"; forged[@"stamp"] = @[@1];
+    assert(!SGAutomaticLibraryDelete(forged, &deletion));
+    assert(!SGAutomaticLibraryDelete(nil, &deletion));
+    assert([[NSData dataWithContentsOfURL:keeper] isEqual:covered]);
     // Registering a new verified installation replaces an obsolete manual path mapping.
     NSURL *canonical = testWrite([@"Spoti Downloads" stringByAppendingPathComponent:rowKey(keeperRow)], covered);
     SGAutomaticLibraryRegister(keeperRow, canonical);
@@ -832,6 +802,6 @@ int main(void) { @autoreleasepool {
     assert(!SGAutomaticLibraryFile(@{@"id":@"../escape", @"extension":@"mp3"}));
     [testDefaults removePersistentDomainForName:suite];
     assert([fm removeItemAtURL:root error:nil]);
-    puts("Audio library: PASS (true hashes, packet identity, covers, strict versions/albums, safe paths, cancellation, archive/recovery/restore)");
+    puts("Audio library: PASS (true hashes, packet identity, covers, strict versions/albums, listing, cancellation, exact file deletion, stale and symlink protection)");
 } return 0; }
 #endif

@@ -15,13 +15,12 @@ FOUNDATION_EXPORT void SGAutomaticLibraryRegister(NSDictionary *verifiedRow, NSU
 // prepared=nil is an exact requested id+bytes lookup only (no packet equivalence).
 FOUNDATION_EXPORT NSDictionary *SGAutomaticLibraryReuse(NSURL *prepared, NSDictionary *requested, BOOL (^cancelled)(void));
 
-// Archives proven duplicates outside Documents, preserving a crash-recoverable journal.
-// progress receives short French status strings. Results contain archived/restored/skipped,
-// replacements and message. Cancellation preserves completed individual operations.
-FOUNDATION_EXPORT NSDictionary *SGAutomaticLibraryClean(BOOL (^cancelled)(void), void (^progress)(NSString *message));
-FOUNDATION_EXPORT NSDictionary *SGAutomaticLibraryRestore(BOOL (^cancelled)(void), void (^progress)(NSString *message));
+// Run on the serial worker. Immutable display snapshots contain path (relative to
+// Documents), title, artist, album, bytes, extension and a private stat stamp.
+// Listing reads metadata only: no full-file or packet hashing. Cancellation returns [].
+FOUNDATION_EXPORT NSArray<NSDictionary *> *SGAutomaticLibraryItems(BOOL (^cancelled)(void));
 
-// Persisted, flattened oldHash.ext -> actual keeper fields (id, bytes, seconds, title,
-// artist, album, extension). Apply to history/localRows after cleaning and on startup.
-// Restoration keeps these references valid and never removes/replaces the keeper.
-FOUNDATION_EXPORT NSDictionary *SGAutomaticLibraryReplacements(void);
+// Permanently deletes only the selected physical file after checking its saved stamp.
+// The caller obtains user confirmation. Stale entries, links and directories fail;
+// an identical copy at another path remains untouched. Run on the serial worker.
+FOUNDATION_EXPORT BOOL SGAutomaticLibraryDelete(NSDictionary *item, NSError **error);
