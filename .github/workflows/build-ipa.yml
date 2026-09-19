@@ -109,7 +109,24 @@ jobs:
             tweak/Sources/Features/NowPlaying/AutomaticDownloadTransfer.m -o "$RUNNER_TEMP/automatic-transfer-test"
           "$RUNNER_TEMP/automatic-transfer-test"
 
-      - name: Download IPA
+      - name: Test paired PC discovery authentication
+        # The discovery test authenticates a PC with a cross-language HMAC
+        # fixture without broadcasting or connecting to a real network.
+        # Actual local-network permission/discovery still needs an iPhone test.
+        run: |
+          clang -fobjc-arc -fblocks -Wall -Werror -framework Foundation -DSG_AUTOMATIC_PC_DISCOVERY_TEST=1 \
+            tweak/Sources/Features/NowPlaying/AutomaticPCDiscovery.m -o "$RUNNER_TEMP/pc-discovery-test"
+          "$RUNNER_TEMP/pc-discovery-test"
+
+      - name: Test durable download intent and version replacement
+        run: |
+          clang -fobjc-arc -fblocks -Wall -Werror -framework Foundation -DSG_AUTOMATIC_STATE_TEST=1 \
+            tweak/Sources/Features/NowPlaying/AutomaticDownloadState.m \
+            tweak/Sources/Features/NowPlaying/AutomaticDownloadModel.m \
+            tweak/Sources/Features/NowPlaying/LocalDownloadManifest.m -o "$RUNNER_TEMP/download-state-test"
+          "$RUNNER_TEMP/download-state-test"
+
+      - name: Download source IPA
         run: |
           mkdir -p ipa
           curl -fsSL "$SPOTIFY_IPA_URL" -o ipa/spotify.ipa
