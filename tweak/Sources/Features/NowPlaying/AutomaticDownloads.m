@@ -3,6 +3,7 @@
 #import "AutomaticDownloadModel.h"
 #import "AutomaticDownloadTransfer.h"
 #import "AutomaticDownloadState.h"
+#import "AudioVariantsPage.h"
 #import "AutomaticPCDiscovery.h"
 #import "AutomaticAudioFile.h"
 #import "AutomaticAudioLibrary.h"
@@ -1548,7 +1549,12 @@ static void tell(NSString *message) {
             done(NO); [SGAutomaticDownloads.shared startAlternative:row];
         }];
         version.backgroundColor = UIColor.systemIndigoColor;
-        UISwipeActionsConfiguration *configuration = [UISwipeActionsConfiguration configurationWithActions:@[version]];
+        UIContextualAction *audio = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleNormal title:@"Versions audio" handler:^(UIContextualAction *action, UIView *view, void (^done)(BOOL)) {
+            done(YES);
+            dispatch_async(dispatch_get_main_queue(), ^{ SGShowPage(self, SGAudioVariantsPageCreate(row)); });
+        }];
+        audio.backgroundColor = SGGreen();
+        UISwipeActionsConfiguration *configuration = [UISwipeActionsConfiguration configurationWithActions:@[audio, version]];
         configuration.performsFirstActionWithFullSwipe = NO; return configuration;
     }
     if (path.section != 2 || path.row >= self.queuedURLs.count) return nil;
@@ -1780,6 +1786,8 @@ BOOL SGAutomaticDownloadEntity(id entity, UIView *source) {
     if (!url || ![NSUserDefaults.standardUserDefaults boolForKey:@"SGAutomaticDownloadsEnabled"]) return NO;
     dispatch_async(dispatch_get_main_queue(), ^{
         NSDictionary *saved = engine.history[url];
+        NSDictionary *local = engine.localRows[url];
+        if (!saved && [url containsString:@"/track/"] && onPhone(local)) saved = SGAutomaticSingleTrackSelection(local);
         if (engine.clearing) return;
         BOOL current = (engine.busy && [url isEqual:engine.activeCollection]) || [url isEqual:engine.pending[@"url"]] ||
             (engine.waitingForPC && [url isEqual:engine.resumeURL]);
@@ -1844,5 +1852,60 @@ void SGAutomaticDeleteLocalFile(NSDictionary *item, void (^completion)(BOOL, NSS
     if (!completion) return;
     dispatch_async(dispatch_get_main_queue(), ^{
         [SGAutomaticDownloads.shared deleteLocalFile:item completion:completion];
+    });
+}
+
+void SGAutomaticPrepareAudioToolsPC(void (^completion)(NSURL *, NSString *)) {
+    if (!completion) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        SGAutomaticDownloads *engine = SGAutomaticDownloads.shared;
+        NSURL *paired = engine.root;
+        if (!paired) { completion(nil, @"Associe ton PC dans les options des téléchargements."); return; }
+        SGAutomaticDiscoverPC(paired, ^(NSURL *found) {
+            if (![engine.root isEqual:paired]) { completion(nil, @"L’association du PC a changé. Réessaie."); return; }
+            if (!found) { completion(nil, @"PC injoignable. Allume-le et utilise le même réseau local."); return; }
+            engine.root = found; engine.pcIdentityVerified = YES;
+            [NSUserDefaults.standardUserDefaults setObject:found.absoluteString forKey:pairKey];
+            completion(found, nil);
+        });
+    });
+}
+
+void SGAutomaticImportAudioVersion(NSURL *root, NSDictionary *row,
+    BOOL (^cancelled)(void), void (^taskStarted)(NSURLSessionTask *),
+    void (^progress)(NSUInteger, NSUInteger), void (^completion)(NSDictionary *, NSString *)) {
+    if (!completion) return;
+    SGAutomaticDownloads *engine = SGAutomaticDownloads.shared;
+    NSDictionary *selection = SGAutomaticSingleTrackSelection(row);
+    NSDictionary *validated = [selection[@"items"] firstObject];
+    NSURL *endpoint = SGDownloadRoot(root.absoluteString);
+    // Use the same serial worker as normal/alternative imports: its transfer
+    // cache may prune a previous .stage only after the previous caller used it.
+    dispatch_async(engine.worker, ^{
+        NSString *error = nil;
+        NSDictionary *installed = nil;
+        BOOL (^stopped)(void) = ^BOOL { return (cancelled && cancelled()) || ![engine.root isEqual:endpoint]; };
+        if (!validated || !endpoint || stopped()) error = @"Transfert arrêté ou informations de version invalides.";
+        else if (engine.candidateFile || [engine.pending[@"kind"] isEqual:@"alternative"])
+            error = @"Termine le choix de l’autre enregistrement avant d’importer cette copie.";
+        else {
+            installed = SGAutomaticLibraryReuse(nil, validated, stopped);
+            NSURL *staging = installed ? nil : SGAutomaticTransferFile(endpoint, validated, stopped, taskStarted, progress, &error);
+            if (staging) {
+                // Bind validation and tags to the derivative, not the original
+                // catalogue duration/title. No canonical track mapping is saved.
+                NSMutableDictionary *request = [validated mutableCopy];
+                for (NSString *key in @[@"expectedArtists", @"expectedTitle", @"expectedArtist", @"expectedSeconds"])
+                    [request removeObjectForKey:key];
+                request[@"expectedTitle"] = validated[@"title"];
+                request[@"expectedArtist"] = validated[@"artist"];
+                request[@"expectedSeconds"] = validated[@"seconds"];
+                installed = SGAutomaticInstallAudioCancellable(staging, request, stopped, &error);
+                [NSFileManager.defaultManager removeItemAtURL:staging error:nil];
+            }
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            completion(installed, installed ? nil : error ?: @"La copie n’a pas pu être enregistrée. Réessaie.");
+        });
     });
 }

@@ -9,6 +9,13 @@ static inline BOOL SGAutomaticDownloadIsEnabled(void) {
 UIViewController *SGAutomaticDownloadsPageCreate(void);
 BOOL SGAutomaticDownloadEntity(id entity, UIView *source);
 void SGAutomaticDownloadObservePlayer(id player);
+// Standalone derived copies share the serial file importer, but never replace the
+// canonical downloaded recording or its playlist associations. Call from main.
+void SGAutomaticPrepareAudioToolsPC(void (^completion)(NSURL *root, NSString *error));
+void SGAutomaticImportAudioVersion(NSURL *root, NSDictionary *row,
+    BOOL (^cancelled)(void), void (^taskStarted)(NSURLSessionTask *task),
+    void (^progress)(NSUInteger received, NSUInteger total),
+    void (^completion)(NSDictionary *installedRow, NSString *error));
 // Main-thread snapshot. Green is reserved for files verified by the download engine.
 // Keys: state (idle/queued/running/ready/incomplete/error/partial/paused), completed, total, progress.
 // queuePosition is one-based for queued collections, otherwise zero.

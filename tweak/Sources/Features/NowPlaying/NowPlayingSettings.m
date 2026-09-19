@@ -114,7 +114,7 @@ UIViewController *SGNowPlayingSettingsPage(void) {
             SGWithSymbol(SGPageRow(@"Téléchargements automatiques", ^UIViewController *{ return SGAutomaticDownloadsPageCreate(); }), @"arrow.down.circle.fill"),
             SGOptionRow(@"Flèche : téléchargements locaux", @"Prépare et vérifie les copies sur cet iPhone", @"SGAutomaticDownloadsEnabled"),
             SGWithSymbol(SGPageRow(@"Importer des fichiers existants", ^UIViewController *{ return SGLocalDownloadsPageCreate(); }), @"folder"),
-            SGWithSymbol(SGActionRow(@"Vitesse native — test", @"Propose uniquement les vitesses autorisées par Spotify pour la lecture actuelle", ^{ SGPresentNativeSpeedTest(); }), @"speedometer"),
+            SGWithSymbol(SGActionRow(@"Vitesse des podcasts", @"Réglage natif, uniquement si Spotify l’autorise pour la lecture actuelle", ^{ SGPresentNativeSpeedTest(); }), @"speedometer"),
             SGWithSymbol(SGPageRow(@"Gestures", ^UIViewController *{ return SGGesturesSettingsPage(); }), @"hand.tap"),
             SGWithSymbol(SGPageRow(@"Lyrics", ^UIViewController *{ return lyricsPage(); }), @"quote.bubble"),
             SGWithSymbol(blocked, @"person.crop.circle.badge.xmark"),

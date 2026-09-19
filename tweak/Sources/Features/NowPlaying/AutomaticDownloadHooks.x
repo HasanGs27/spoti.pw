@@ -3,6 +3,7 @@
 #import "AutomaticDownloads.h"
 #import "AutomaticDownloadModel.h"
 #import "NativeDownloadPresentation.h"
+#import "TrackDownloadActions.h"
 #import "Core/SGCore.h"
 #import "Settings/SGPageStyle.h"
 #import <objc/message.h>
@@ -106,6 +107,27 @@ static BOOL customButton(id button) {
     id state = %orig;
     SGAutomaticDownloadObservePlayer(self);
     return state;
+}
+%end
+
+// These two factories and their argument encodings are present in the inspected
+// IPA. Menu construction supplies the chosen entity, even while another song is
+// playing. No download starts until the user selects our named native action.
+%hook SPTContextMenuPresenterFactoryImplementation
+- (id)contextMenuPresenterForTrackWithTrackURI:(id)uri trackName:(id)name trackMetadata:(id)metadata playable:(BOOL)playable imageURL:(id)image artists:(id)artists albumName:(id)album albumURI:(id)albumURI viewURI:(id)viewURI contextSourceURI:(id)contextURI metadataTitle:(id)metadataTitle logContext:(id)logContext options:(id)options actions:(id)actions {
+    return %orig(uri, name, metadata, playable, image, artists, album, albumURI, viewURI, contextURI, metadataTitle, logContext, options, SGTrackDownloadMenuActions(actions, uri));
+}
+- (id)contextMenuPresenterForHeaderImageURL:(id)image headerImagePlaceholder:(id)placeholder imageStyle:(NSInteger)style title:(id)title subtitle:(id)subtitle metadataTitle:(id)metadataTitle actions:(id)actions entityURL:(id)entity options:(id)options {
+    return %orig(image, placeholder, style, title, subtitle, metadataTitle, SGTrackDownloadMenuActions(actions, entity), entity, options);
+}
+%end
+
+%hook _TtC37ContextMenu_PlatformLegacyAdapterImpl16PresenterFactory
+- (id)contextMenuPresenterForTrackWithTrackURI:(id)uri trackName:(id)name trackMetadata:(id)metadata playable:(BOOL)playable imageURL:(id)image artists:(id)artists albumName:(id)album albumURI:(id)albumURI viewURI:(id)viewURI contextSourceURI:(id)contextURI metadataTitle:(id)metadataTitle logContext:(id)logContext options:(id)options actions:(id)actions {
+    return %orig(uri, name, metadata, playable, image, artists, album, albumURI, viewURI, contextURI, metadataTitle, logContext, options, SGTrackDownloadMenuActions(actions, uri));
+}
+- (id)contextMenuPresenterForHeaderImageURL:(id)image headerImagePlaceholder:(id)placeholder imageStyle:(NSInteger)style title:(id)title subtitle:(id)subtitle metadataTitle:(id)metadataTitle actions:(id)actions entityURL:(id)entity options:(id)options {
+    return %orig(image, placeholder, style, title, subtitle, metadataTitle, SGTrackDownloadMenuActions(actions, entity), entity, options);
 }
 %end
 

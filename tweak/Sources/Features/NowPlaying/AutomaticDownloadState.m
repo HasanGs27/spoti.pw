@@ -94,6 +94,18 @@ NSDictionary *SGAutomaticDownloadReplaceVersion(NSDictionary *history, NSDiction
     return @{@"history":[nextHistory copy], @"locals":[nextLocals copy]};
 }
 
+NSDictionary *SGAutomaticSingleTrackSelection(NSDictionary *verifiedRow) {
+    if (![verifiedRow isKindOfClass:NSDictionary.class] || ![verifiedRow[@"state"] isEqual:@"ready"]) return nil;
+    NSString *url = SGAutomaticSpotifyURL(verifiedRow[@"spotify"]);
+    if (![url containsString:@"/track/"]) return nil;
+    NSMutableDictionary *row = [verifiedRow mutableCopy]; row[@"position"] = @1;
+    NSDictionary *job = @{@"version":@2, @"id":@"00000000000000000000000000000000", @"url":url,
+        @"state":@"complete", @"name":row[@"title"] ?: @"Morceau", @"message":@"", @"scope":@"Un morceau déjà sur cet iPhone.",
+        @"completeMetadata":@YES, @"engine":@"device", @"items":@[row]};
+    if (![NSJSONSerialization isValidJSONObject:job]) return nil;
+    return SGAutomaticJob([NSJSONSerialization dataWithJSONObject:job options:0 error:nil]);
+}
+
 #ifdef SG_AUTOMATIC_STATE_TEST
 #include <assert.h>
 int main(void) {
@@ -120,6 +132,14 @@ int main(void) {
         assert(!SGAutomaticDownloadIntent(@{@"version":@1,@"pending":@{@"url":a,@"request_id":[@"a" stringByPaddingToLength:65 withString:@"a" startingAtIndex:0]}})[@"pending"]);
         NSString *oldHash = [@"a" stringByPaddingToLength:64 withString:@"a" startingAtIndex:0], *newHash = [@"b" stringByPaddingToLength:64 withString:@"b" startingAtIndex:0];
         NSDictionary *old = @{@"spotify":a,@"position":@1,@"title":@"Titre",@"artist":@"Artiste",@"album":@"Album",@"state":@"ready",@"id":oldHash,@"bytes":@2048,@"seconds":@180};
+        NSMutableDictionary *playlistCopy = [old mutableCopy]; playlistCopy[@"position"] = @17;
+        NSDictionary *single = SGAutomaticSingleTrackSelection(playlistCopy);
+        assert([single[@"url"] isEqual:a] && [single[@"items"] count] == 1 && [single[@"completeMetadata"] boolValue]);
+        assert([single[@"items"][0][@"position"] isEqual:@1] && [single[@"items"][0][@"id"] isEqual:oldHash]);
+        assert([playlistCopy[@"position"] isEqual:@17]);
+        playlistCopy[@"spotify"] = b; assert(!SGAutomaticSingleTrackSelection(playlistCopy));
+        playlistCopy[@"spotify"] = a; playlistCopy[@"state"] = @"waiting"; assert(!SGAutomaticSingleTrackSelection(playlistCopy));
+        playlistCopy[@"state"] = @"ready"; playlistCopy[@"id"] = @"bad"; assert(!SGAutomaticSingleTrackSelection(playlistCopy));
         NSMutableDictionary *duplicate = [old mutableCopy]; duplicate[@"position"] = @2; duplicate[@"expectedTitle"] = @"Titre catalogue";
         NSDictionary *job = @{@"items":@[old,duplicate]};
         NSMutableDictionary *replacement = [old mutableCopy]; replacement[@"id"] = newHash; replacement[@"bytes"] = @4096;
