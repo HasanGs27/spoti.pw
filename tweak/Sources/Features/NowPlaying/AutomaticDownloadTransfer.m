@@ -242,6 +242,10 @@ static NSString *SGTransferHash(NSURL *file, NSUInteger expected, BOOL (^cancell
     if (self.progress) self.progress(self.written, self.expected);
 }
 - (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task didCompleteWithError:(NSError *)error {
+#ifdef SG_AUTOMATIC_TRANSFER_TEST
+    fprintf(stderr, "transfer-test completion: accepted=%d written=%lu expected=%lu transport=%ld\n",
+        self.accepted, (unsigned long)self.written, (unsigned long)self.expected, (long)error.code);
+#endif
     if (!self.failure && error && !(self.cancelled && self.cancelled()))
         self.failure = @"Transfert interrompu. La partie reçue sera reprise au prochain essai.";
     if (!self.failure && (!self.accepted || self.written != self.expected))
@@ -366,22 +370,42 @@ static NSData *SGMockBody;
 static NSError *SGMockFailure;
 static NSURLRequest *SGMockRequest;
 static NSUInteger SGMockRequests;
+static dispatch_semaphore_t SGMockDelivered;
 
 @interface SGTransferMockProtocol : NSURLProtocol
+@property (atomic) BOOL stopped;
+@property (nonatomic, strong) dispatch_semaphore_t delivered;
 @end
 @implementation SGTransferMockProtocol
 + (BOOL)canInitWithRequest:(NSURLRequest *)request { return YES; }
 + (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request { return request; }
 - (void)startLoading {
     SGMockRequests++; SGMockRequest = self.request;
+    // Snapshot fixtures: a cancelled asynchronous producer must never read the
+    // next test's body or failure after the engine has returned to its caller.
+    NSData *body = SGMockBody;
+    NSError *failure = SGMockFailure;
+    self.delivered = SGMockDelivered;
     NSHTTPURLResponse *response = [[NSHTTPURLResponse alloc] initWithURL:self.request.URL statusCode:SGMockCode HTTPVersion:@"HTTP/1.1" headerFields:SGMockHeaders];
     [self.client URLProtocol:self didReceiveResponse:response cacheStoragePolicy:NSURLCacheStorageNotAllowed];
-    for (NSUInteger offset = 0; offset < SGMockBody.length; offset += 1024)
-        [self.client URLProtocol:self didLoadData:[SGMockBody subdataWithRange:NSMakeRange(offset, MIN((NSUInteger)1024, SGMockBody.length - offset))]];
-    if (SGMockFailure) [self.client URLProtocol:self didFailWithError:SGMockFailure];
-    else [self.client URLProtocolDidFinishLoading:self];
+    for (NSUInteger offset = 0; offset < body.length; offset += 1024)
+        [self.client URLProtocol:self didLoadData:[body subdataWithRange:NSMakeRange(offset, MIN((NSUInteger)1024, body.length - offset))]];
+    if (!failure) { [self.client URLProtocolDidFinishLoading:self]; return; }
+    // A synchronous didFail can make NSURLSession discard queued data before it
+    // asks the delegate to accept the response. Inject the connection loss only
+    // after the public progress callback confirms these bytes reached disk.
+    // Do not block NSURLProtocol's loading thread while awaiting delegate work.
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+        long timedOut = dispatch_semaphore_wait(self.delivered, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
+        if (self.stopped) return;
+        if (timedOut) fprintf(stderr, "transfer-test: mock timed out waiting for delivered prefix\n");
+        [self.client URLProtocol:self didFailWithError:failure];
+    });
 }
-- (void)stopLoading {}
+- (void)stopLoading {
+    self.stopped = YES;
+    if (self.delivered) dispatch_semaphore_signal(self.delivered);
+}
 @end
 
 @interface SGTransferTestCancellation : NSObject
@@ -402,6 +426,7 @@ static NSHTTPURLResponse *SGTransferTestResponse(NSInteger code, NSDictionary *h
 static void SGTransferMock(NSInteger code, NSDictionary *headers, NSData *body, BOOL fail) {
     SGMockCode = code; SGMockHeaders = headers; SGMockBody = body;
     SGMockFailure = fail ? [NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorNetworkConnectionLost userInfo:nil] : nil;
+    SGMockDelivered = fail ? dispatch_semaphore_create(0) : nil;
 }
 static NSURL *SGTransferTestPart(NSURL *root, NSDictionary *row) {
     return [SGTransferTestDirectory URLByAppendingPathComponent:[SGTransferKey(SGTransferRoot(root), row[@"id"], row[@"bytes"], row[@"extension"] ?: @"mp3") stringByAppendingString:@".part"]];
@@ -449,8 +474,15 @@ int main(void) {
 
         // Failure saves the exact prefix. A fresh helper call models process restart.
         SGTransferMock(200, full, [data subdataWithRange:NSMakeRange(0, 2048)], YES);
-        assert(!SGAutomaticTransferFile(root, row, nil, nil, nil, &reason) && reason.length);
+        dispatch_semaphore_t delivered = SGMockDelivered;
+        NSURL *interrupted = SGAutomaticTransferFile(root, row, nil, nil, ^(NSUInteger received, NSUInteger total) {
+            if (received == 2048) dispatch_semaphore_signal(delivered);
+        }, &reason);
         NSURL *part = SGTransferTestPart(root, row);
+        fprintf(stderr, "transfer-test interruption: reason=%s requests=%lu bytes=%lu file=%s\n",
+            reason.UTF8String ?: "(nil)", (unsigned long)SGMockRequests,
+            (unsigned long)[NSData dataWithContentsOfURL:part].length, part.lastPathComponent.UTF8String);
+        assert(!interrupted && reason.length);
         assert([[NSData dataWithContentsOfURL:part] isEqual:[data subdataWithRange:NSMakeRange(0, 2048)]]);
         SGTransferMock(206, tail, [data subdataWithRange:NSMakeRange(2048, 6144)], NO);
         NSURL *result = SGAutomaticTransferFile(root, row, nil, nil, nil, &reason);
