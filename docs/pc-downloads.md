@@ -122,6 +122,16 @@ L'entrée est ajoutée aux menus natifs identifiés dans cette version de Spotif
 
 ## Créer une version audio
 
+Dans le **grand lecteur**, les boutons **Vitesse** et **Sans voix** sont placés dans l'espace libre de la rangée inférieure. Ils conservent les commandes natives et ne déplacent pas les menus. L'icône de téléchargement du menu d'un morceau utilise désormais un gris clair explicite ; les états terminé et erreur conservent leurs couleurs.
+
+**Vitesse** propose un changement direct uniquement lorsque le lecteur natif autorise ce réglage pour la lecture actuelle. L'outil change seulement la vitesse, recontrôle le morceau avant l'envoi et annonce une réussite uniquement après avoir observé le nouveau taux dans l'état du lecteur. Il ne force pas les restrictions des titres ou de Spotify Connect. Si le changement direct n'est pas disponible, **Créer une copie à autre vitesse** utilise le PC.
+
+**Sans voix** ouvre directement la préparation d'une copie instrumentale sur le PC. Ce n'est pas un effet instantané sur le flux Spotify. Si le morceau Spotify n'a pas encore été préparé, le bouton **Préparer ce morceau** crée une demande portant uniquement sur ce titre. Seule la copie finale doit être transférée à l'iPhone. La lecture actuelle continue pendant la préparation ; le morceau original n'est pas remplacé automatiquement. Un titre introuvable doit être complété avec une source disponible.
+
+Les fichiers ajoutés avec le navigateur YouTube ou un lien audio personnel peuvent également être traités lorsque le PC possède toujours leur fichier d'origine vérifié. Un ancien fichier copié uniquement sur l'iPhone, ou un fichier à l'identité ambiguë, nécessite encore une source accessible au PC. La disponibilité sur absolument tous les morceaux n'est donc pas garantie.
+
+Quand une copie est enregistrée, toucher sa ligne puis **Écouter cette version** pour la lancer dans le lecteur Spotify. Elle reste aussi dans **Fichiers locaux**. Cette action lance explicitement la copie comme nouvelle lecture ; elle ne modifie pas l'original ni les associations des playlists.
+
 Dans **Téléchargements automatiques**, faire glisser vers la gauche un morceau enregistré, puis ouvrir **Versions audio**. Le fichier original exact doit encore être disponible sur le PC associé.
 
 - **Vitesse ×0,75, ×1,25, ×1,5 ou ×2** prépare une copie en conservant la hauteur de la voix. Il s'agit d'une préparation préalable, pas d'un curseur qui modifie instantanément la musique en cours.
