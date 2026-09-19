@@ -6,6 +6,7 @@
 #ifndef SG_TRACK_DOWNLOAD_ACTION_TEST
 #import "AutomaticDownloads.h"
 #import "Core/SGCore.h"
+#import "Settings/SGPageStyle.h"
 #endif
 
 // Required methods and encodings are taken from this IPA's Objective-C
