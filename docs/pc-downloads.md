@@ -40,7 +40,7 @@ Ces limites décrivent notre système. Elles ne garantissent pas qu'une source e
 - Le moteur choisit le meilleur flux audio disponible selon les informations de la source. Un flux AAC-LC compatible est conservé en M4A sans reconversion audio ; les autres flux sont convertis en MP3. La priorité reste le meilleur flux proposé, sans forcer une source AAC de qualité inférieure.
 - Les pochettes sont vérifiées, mises en cache et intégrées au fichier audio. La réparation d'une pochette peut réutiliser l'audio déjà préparé et vérifié, sans nouvelle conversion.
 
-Le MP3 utilise un débit adapté à la source disponible. Augmenter artificiellement ce débit ne restituerait pas les détails absents de la source. Un M4A conservé évite une perte supplémentaire liée à la reconversion ; cela ne transforme pas la source en master sans perte. La disponibilité de tous les titres et la qualité du master original ne sont pas garanties. Une sélection issue d'une page Spotify publique peut être incomplète ; la liste fournie par l'application est utilisée lorsqu'elle est disponible.
+Le MP3 utilise une compression à débit variable de haute qualité ; le fichier peut être plus volumineux qu'avec l'ancien réglage automatique. Cela ne restitue pas les détails absents de la source. Un M4A conservé évite une perte supplémentaire liée à la reconversion ; cela ne transforme pas la source en master sans perte. La disponibilité de tous les titres et la qualité du master original ne sont pas garanties. Une sélection issue d'une page Spotify publique peut être incomplète ; la liste fournie par l'application est utilisée lorsqu'elle est disponible.
 
 ## Reprendre un transfert
 
